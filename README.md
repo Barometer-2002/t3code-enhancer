@@ -6,6 +6,26 @@ T3 Code（Windows 桌面版）一体化视觉与交互强化脚本项目，提�
 
 从 [GitHub Releases](https://github.com/Barometer-2002/t3code-enhancer/releases/latest) 下载安装 ZIP。安装、卸载和界面截图见 [使用教程](使用教程.md)。
 
+## 界面预览
+
+![输入框底栏，左侧是加号和额度，右侧是上下文、模型、思考深度和发送按钮](assets/tutorial/composer.png)
+
+| 加号菜单 | 模型与 Harness |
+| :---: | :---: |
+| <img src="assets/tutorial/plus-menu.png" alt="添加文件、引用、技能与斜杠命令菜单" width="310"> | <img src="assets/tutorial/model-picker.png" alt="Harness 切换、模型搜索与选择" width="310"> |
+
+| 思考深度 | 右侧详情面板 |
+| :---: | :---: |
+| <img src="assets/tutorial/effort-slider.png" alt="思考深度滑块与恢复默认按钮" width="310"> | <img src="assets/tutorial/side-panel.png" alt="右侧详情面板的额度双环与上下文占用" width="297"> |
+
+| 额度详情 | 上下文与统计 |
+| :---: | :---: |
+| <img src="assets/tutorial/quota-details.png" alt="5 小时和 7 天剩余额度及重置时间" width="310"> | <img src="assets/tutorial/context-stats.png" alt="上下文占用、缓存命中率与 Token 明细" width="310"> |
+
+**工作过程**可以按组展开。收起上级后，再次打开时下级仍处于折叠状态。
+
+![展开工作组后显示的命令与工具列表](assets/tutorial/work-log.png)
+
 ## 包含模块
 
 1. **ChatGPT / Codex 一体化主题（`themes/chatgpt-app.json`）**
@@ -53,3 +73,4 @@ node tests/verify.cjs                # 运行自动化单元测试与 ASAR 试�
 
 - 补丁定位使用了 [T3 Code](https://github.com/pingdotgg/t3code) 的部分代码片段。 [T3 Code 许可](licenses/T3-Code.txt)
 - 部分面板图标来自 [Lucide](https://github.com/lucide-icons/lucide) 及 Feather。 [Lucide 与 Feather 许可](licenses/Lucide.txt)
+- 本项目认可并支持 [LINUX DO 社区](https://linux.do/)。
