@@ -1,0 +1,20 @@
+{
+  "name": "t3code-enhancer",
+  "version": "1.4.3",
+  "description": "T3 Code ChatGPT/Codex 主题与体验强化工具（一体化主题 + 折叠联动 + 加号多功能菜单 + 思考深度滑块与Harness快切 + 5h/7d双层圆环与上下文统计浮层，支持一键安装与卸载）",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Barometer-2002/t3code-enhancer.git"
+  },
+  "scripts": {
+    "status": "node cli.cjs status",
+    "install-enhancer": "node cli.cjs install",
+    "uninstall-enhancer": "node cli.cjs uninstall",
+    "test": "node tests/verify.cjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

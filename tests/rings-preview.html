@@ -1,0 +1,107 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { margin: 0; font: 13px/20px -apple-system, "Segoe UI", "Microsoft YaHei UI", sans-serif; color: var(--foreground, #0d0d0d); }
+  .wrap { display: grid; grid-template-columns: 290px 1fr; gap: 18px; align-items: start; }
+  .card { background: var(--card, #fff); border: 1px solid var(--border, rgba(0,0,0,0.09)); border-radius: 14px; padding: 12px; }
+  .sec-title { font-size: 11px; font-weight: 600; color: var(--muted-foreground, #787880); margin: 0 0 8px; }
+  .ring-row { display: flex; align-items: center; gap: 12px; padding: 6px 8px; border-radius: 9px; }
+  .ring-row:hover { background: rgba(0,0,0,0.035); }
+  .meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .title { font-size: 12.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub { font-size: 11.5px; color: var(--muted-foreground, #66666e); display: flex; align-items: center; gap: 10px; font-variant-numeric: tabular-nums; }
+  .dot { width: 6px; height: 6px; border-radius: 99px; display: inline-block; margin-right: 4px; }
+  .sep { border-top: 1px solid var(--border, rgba(0,0,0,0.08)); margin: 8px 0; }
+  .right-col { display: flex; flex-direction: column; gap: 14px; }
+  .popover { width: 248px; background: var(--popover, #fff); border: 1px solid var(--border, rgba(0,0,0,0.09)); border-radius: 14px; padding: 12px 14px; box-shadow: 0 8px 26px rgba(0,0,0,0.10); }
+  .pop-h { font-size: 13px; font-weight: 600; margin-bottom: 10px; }
+  .pop-row { display: flex; justify-content: space-between; align-items: center; font-size: 12px; margin: 5px 0; font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted-foreground, #66666e); }
+  .bar { position: relative; height: 5px; border-radius: 99px; background: rgba(127,127,127,0.18); overflow: hidden; margin: 6px 0 8px; }
+  .bar-fill { height: 100%; border-radius: 99px; background: var(--foreground, #0d0d0d); }
+  .bar-tick { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(0,0,0,0.55); }
+  .composer { background: var(--card, #fff); border: 1px solid var(--border, rgba(0,0,0,0.10)); border-radius: 24px; padding: 14px 14px 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.04); }
+  .composer-input { font-size: 14px; color: var(--muted-foreground, #9a9aa2); margin-bottom: 14px; padding: 0 4px; }
+  .composer-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .bar-left, .bar-right { display: flex; align-items: center; gap: 6px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px; border-radius: 99px; font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .pill:hover { background: rgba(0,0,0,0.045); }
+  .send { width: 28px; height: 28px; border-radius: 99px; background: var(--foreground, #0d0d0d); color: var(--background, #fff); display: inline-flex; align-items: center; justify-content: center; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <!-- Right Details Panel -->
+  <div class="card">
+    <div class="sec-title">右侧详情面板 · 5h / 7d 双层同心圆环</div>
+    <div id="details-rings"></div>
+  </div>
+  <!-- Composer + Hover Popover -->
+  <div class="right-col">
+    <div class="popover">
+      <div class="pop-h">用量</div>
+      <div class="pop-row"><span class="muted">上下文</span><strong>41% / 412k</strong></div>
+      <div class="bar"><div class="bar-fill" style="width:41%"></div><div class="bar-tick" style="left:80%"></div></div>
+      <div class="pop-row" style="font-size:11.5px"><span class="muted">已用 / 上限</span><span class="muted">412,000 / 1,000,000</span></div>
+      <div class="pop-row" style="font-size:11.5px"><span class="muted">自动压缩</span><span class="muted">800k</span></div>
+      <div class="sep"></div>
+      <div class="sec-title" style="margin-bottom:4px">额度窗口</div>
+      <div class="pop-row"><span>Claude & GPT</span><span><strong>100%</strong> <span class="muted">· 4h 12m</span></span></div>
+      <div class="pop-row"><span>Gemini · 5-hour</span><span><strong>70%</strong> <span class="muted">· 3h 20m</span></span></div>
+      <div class="pop-row"><span>Gemini · Weekly</span><span><strong>24%</strong> <span class="muted">· 3d 8h</span></span></div>
+      <div class="pop-row"><span>Gemini 4 Argon</span><span style="color:#D97706"><strong>16%</strong> <span class="muted">· 1h 40m</span></span></div>
+    </div>
+    <div class="composer">
+      <div class="composer-input">想问什么都可以。@ 引用文件，$ 使用技能，/ 输入命令</div>
+      <div class="composer-bar">
+        <div class="bar-left">
+          <span class="pill" style="padding:0 6px;color:#5e5e66">📎</span>
+          <span class="pill" id="comp-quota"></span>
+        </div>
+        <div class="bar-right">
+          <span class="pill" id="comp-ctx" style="padding:0 6px"></span>
+          <span class="pill" style="color:#4a4a52;font-weight:400">4 Neon High</span>
+          <span class="send">↑</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+function ringSvg({ size, outerPct, innerPct, outerColor, innerColor, stroke, trackOpacity = 0.16 }) {
+  const c = size / 2;
+  const dual = outerPct !== null && innerPct !== null;
+  const rOut = c - stroke / 2 - 0.5;
+  const rIn = dual ? Math.max(3, rOut - stroke - 2.2) : rOut;
+  const part = (r, pct, col) => {
+    const circ = 2 * Math.PI * r;
+    const dash = (pct / 100) * circ;
+    return `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${col}" stroke-opacity="${trackOpacity}" stroke-width="${stroke}"/>`
+      + (pct > 0 ? `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${col}" stroke-width="${stroke}" stroke-linecap="round" stroke-dasharray="${dash.toFixed(2)} ${circ.toFixed(2)}" transform="rotate(-90 ${c} ${c})"/>` : "");
+  };
+  return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" style="flex-shrink:0">`
+    + (outerPct !== null ? part(rOut, outerPct, outerColor) : "")
+    + (innerPct !== null ? part(dual ? rIn : rOut, innerPct, innerColor) : "")
+    + `</svg>`;
+}
+document.getElementById("details-rings").innerHTML = `
+  <div class="ring-row">${ringSvg({ size: 36, outerPct: 100, innerPct: 100, outerColor: "#D4714E", innerColor: "#2F855A", stroke: 3.3 })}
+    <div class="meta"><div class="title">Claude & GPT (shared)</div><div class="sub"><span><i class="dot" style="background:#2F855A"></i>5h <strong>100%</strong></span><span><i class="dot" style="background:#D4714E"></i>7d <strong>100%</strong></span></div></div>
+  </div>
+  <div class="ring-row">${ringSvg({ size: 36, outerPct: 24, innerPct: 70, outerColor: "#D4714E", innerColor: "#2F855A", stroke: 3.3 })}
+    <div class="meta"><div class="title">Gemini</div><div class="sub"><span><i class="dot" style="background:#2F855A"></i>5h <strong>70%</strong></span><span><i class="dot" style="background:#D4714E"></i>7d <strong>24%</strong></span></div></div>
+  </div>
+  <div class="ring-row"><span style="width:36px;display:inline-flex;justify-content:center;flex-shrink:0">${ringSvg({ size: 32, outerPct: 16, innerPct: null, outerColor: "#D97706", stroke: 3.2 })}</span>
+    <div class="meta"><div style="display:flex;justify-content:space-between;align-items:center"><span class="title">Gemini 4 Argon</span><strong style="color:#D97706;font-size:12px">16%</strong></div></div>
+  </div>
+  <div class="sep"></div>
+  <div class="ring-row"><span style="width:36px;display:inline-flex;justify-content:center;flex-shrink:0">${ringSvg({ size: 32, outerPct: 41, innerPct: null, outerColor: "currentColor", stroke: 3.2, trackOpacity: 0.18 })}</span>
+    <div class="meta"><div style="display:flex;justify-content:space-between"><span class="title">上下文</span><strong style="font-size:12px">41%</strong></div><div class="sub">412k / 1m</div></div>
+  </div>`;
+document.getElementById("comp-quota").innerHTML = ringSvg({ size: 18, outerPct: 24, innerPct: 70, outerColor: "#D4714E", innerColor: "#2F855A", stroke: 2.1 }) + `<span>70%</span>`;
+document.getElementById("comp-ctx").innerHTML = ringSvg({ size: 16, outerPct: 41, innerPct: null, outerColor: "currentColor", stroke: 2.3, trackOpacity: 0.22 });
+</script>
+</body>
+</html>
