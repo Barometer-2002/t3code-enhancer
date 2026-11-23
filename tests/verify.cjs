@@ -87,7 +87,10 @@ assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired2, "gpt-6.2-sol").key
 console.log("   OK");
 
 console.log("4. Full dry-run ASAR build (timeline-collapse + usage-rings) + syntax & integrity check...");
-const source = path.join(process.env.LOCALAPPDATA, "Programs", "t3code", "resources", "server.asar");
+const source = process.argv[2] || (
+  process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Programs", "t3code", "resources", "server.asar")
+);
+assert(source, "请提供原版 ASAR：node tests/verify.cjs <app.asar>");
 const baseline = resolvePristineBaseline({
   source,
   backup: source + ".before-t3code-enhancer",

@@ -1,8 +1,8 @@
 # t3code-enhancer
 
-T3 Code（Windows 桌面版）一体化视觉与交互强化脚本项目，提供**一键安装、状态检测、完整卸载还原**能力。
+T3 Code 桌面版的主题与界面增强工具，提供安装、状态检测和卸载命令。
 
-适用于 Windows 桌面版 T3 Code 0.1.11。界面补丁会校验本机安装包中的目标文件，具体兼容性以 `status.cmd` 的结果为准。
+适用于 T3 Code **0.1.11** 的 **Windows 桌面版**和 **Linux x86_64 官方 AppImage**。Linux 版会安装一个独立的增强版副本。
 
 从 [GitHub Releases](https://github.com/Barometer-2002/t3code-enhancer/releases/latest) 下载安装 ZIP。安装、卸载和界面截图见 [使用教程](使用教程.md)。
 
@@ -47,12 +47,14 @@ T3 Code（Windows 桌面版）一体化视觉与交互强化脚本项目，提�
 
 ## 使用方法
 
-### 方式一：双击一键脚本（推荐）
+### Windows 一键脚本
+
 - **查看状态**：双击 `status.cmd`
 - **一键安装**：先关闭所有 T3 Code 窗口 → 双击 `install.cmd` → 重新打开 T3 Code
 - **一键卸载**：先关闭所有 T3 Code 窗口 → 双击 `uninstall.cmd` → 重新打开 T3 Code
 
-### 方式二：命令行
+### Windows 命令行
+
 ```powershell
 node cli.cjs status                  # 查看安装状态与备份完整性
 node cli.cjs install                 # 安装全部模块（主题 + 两项前端补丁）
@@ -61,6 +63,19 @@ node cli.cjs uninstall               # 完整卸载并逐字节还原原版 serv
 node cli.cjs uninstall --keep-theme  # 仅卸载前端补丁，保留主题
 node tests/verify.cjs                # 运行自动化单元测试与 ASAR 试构建校验
 ```
+
+### Linux x86_64
+
+准备 Node.js 20 或更新版本，以及 [T3 Code 0.1.11 官方 x86_64 AppImage](https://github.com/pingdotgg/t3code/releases/tag/v0.1.11)。在增强包解压目录中以桌面用户执行：
+
+```bash
+node linux.cjs install ~/Downloads/T3-Code-x86_64.AppImage
+"${XDG_DATA_HOME:-$HOME/.local/share}/t3code-enhancer/launch.sh"
+```
+
+安装器校验官方 AppImage 的 SHA-256 后解包，原 AppImage 可继续单独使用。增强版默认使用本地端口 `3774`，可在启动命令前用 `T3CODE_PORT=3775` 指定空闲端口。首次启动后可在「设置 → 外观」选择 **ChatGPT App**。
+
+`node linux.cjs status` 查看状态。退出增强版后执行 `node linux.cjs uninstall` 可以移除它，增强版的会话和偏好保存在同级的 `t3code-enhancer-profile`。安装和卸载已在 Omarchy x86_64 上验证。
 
 ## 安全保障
 - 安装前自动备份纯净原版为 `server.asar.before-t3code-enhancer`（若此前已安装过旧版 `patch-timeline-collapse.cjs`，会自动继承其纯净原版备份，绝不覆盖原版）。
