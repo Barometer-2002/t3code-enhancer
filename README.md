@@ -6,8 +6,6 @@ T3 Code 桌面版的主题与界面增强工具，提供安装、状态检测和
 
 从 [GitHub Releases](https://github.com/Barometer-2002/t3code-enhancer/releases/latest) 下载安装 ZIP。安装、卸载和界面截图见 [使用教程](使用教程.md)。
 
-增强包的公开试用版从 **v0.1.0** 起编号。
-
 ## 界面预览
 
 ![输入框底栏，左侧是加号和额度，右侧是上下文、模型、思考深度和发送按钮](assets/tutorial/composer.png)
