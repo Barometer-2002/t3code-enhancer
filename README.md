@@ -2,7 +2,7 @@
 
 T3 Code 桌面版的主题与界面增强工具，提供安装、状态检测和卸载命令。
 
-适用于 T3 Code **0.1.11** 的 **Windows 桌面版**和 **Linux x86_64 官方 AppImage**。Linux 版会安装一个独立的增强版副本。
+适用于 T3 Code **0.1.11** 的 **Windows 桌面版**、**Linux x86_64 官方 AppImage** 和 **macOS 官方版**。Linux 和 macOS 版会安装一个独立的增强版副本。
 
 从 [GitHub Releases](https://github.com/Barometer-2002/t3code-enhancer/releases/latest) 下载安装 ZIP。安装、卸载和界面截图见 [使用教程](使用教程.md)。
 
@@ -76,6 +76,19 @@ node linux.cjs install ~/Downloads/T3-Code-x86_64.AppImage
 安装器校验官方 AppImage 的 SHA-256 后解包，原 AppImage 可继续单独使用。增强版默认使用本地端口 `3774`，可在启动命令前用 `T3CODE_PORT=3775` 指定空闲端口。首次启动后可在「设置 → 外观」选择 **ChatGPT App**。
 
 `node linux.cjs status` 查看状态。退出增强版后执行 `node linux.cjs uninstall` 可以移除它，增强版的会话和偏好保存在同级的 `t3code-enhancer-profile`。安装和卸载已在 Omarchy x86_64 上验证。
+
+### macOS
+
+准备 Node.js 20 或更新版本，以及安装在「应用程序」中的 T3 Code 0.1.11 官方版。在增强包解压目录中执行：
+
+```bash
+node macos.cjs install
+open "$HOME/Applications/T3 Code Enhancer.app"
+```
+
+官方版不在 `/Applications/T3 Code (Beta).app` 时，把实际路径加在 `install` 后面。安装器校验官方签名和版本后，复制出 `~/Applications/T3 Code Enhancer.app` 并打补丁，再用本机 ad-hoc 签名。官方版保持不变，两者可以同时运行。增强版使用本地端口 `3774`，关闭自动更新，会话和偏好保存在 `~/Library/Application Support/t3code-enhancer-profile`。首次启动后可在「设置 → 外观」选择 **ChatGPT App**。
+
+`node macos.cjs status` 查看状态。退出增强版后执行 `node macos.cjs uninstall` 可以移除它，独立配置会保留。两个版本启动时都会登记 `t3code://` 登录回调，最后启动的那个生效；要在官方版里登录 T3 账号，先重启官方版。安装和卸载已在 Apple Silicon 上验证，Intel 机型未验证。
 
 ## 安全保障
 - 安装前自动备份纯净原版为 `server.asar.before-t3code-enhancer`（若此前已安装过旧版 `patch-timeline-collapse.cjs`，会自动继承其纯净原版备份，绝不覆盖原版）。

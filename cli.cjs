@@ -30,9 +30,9 @@ function assertT3Closed() {
   assert(!isT3Running(), "请先关闭所有 T3 Code 窗口（彻底退出进程），然后再执行安装或卸载。");
 }
 
-function inspectArchive(asarPath) {
+function inspectArchive(asarPath, patches = ALL_PATCHES) {
   const asar = readAsar(asarPath);
-  const modules = ALL_PATCHES.map((p) => {
+  const modules = patches.map((p) => {
     const entry = findUniqueEntry(asar, p.targetRegex, p.id);
     const text = entry.content.toString("utf8");
     const installed = text.includes(p.marker);
