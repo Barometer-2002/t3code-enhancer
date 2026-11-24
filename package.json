@@ -1,6 +1,6 @@
 {
   "name": "t3code-enhancer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "T3 Code ChatGPT/Codex 主题与体验强化工具（一体化主题 + 折叠联动 + 加号多功能菜单 + 思考深度滑块与Harness快切 + 5h/7d双层圆环与上下文统计浮层，支持一键安装与卸载）",
   "private": true,
   "license": "MIT",
