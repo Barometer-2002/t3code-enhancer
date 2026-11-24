@@ -1,0 +1,80 @@
+name: Verify macOS upgrade
+on:
+  push:
+    branches: [verify/macos-upgrade]
+permissions:
+  contents: read
+jobs:
+  upgrade:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Upgrade real signed T3 Code in both data modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ $(uname -m) == arm64 ]]
+          node --version
+          workspace=$(mktemp -d "$RUNNER_TEMP/t3-upgrade.XXXXXX")
+          mkdir "$workspace/official" "$workspace/legacy"
+          curl --fail --location --retry 2 --max-time 180 --output "$workspace/t3.zip" \
+            https://github.com/pingdotgg/t3code/releases/download/v0.1.11/T3-Code-0.1.11-arm64.zip
+          printf '%s  %s\n' 2e92454031dbffac45f9dc5e43481ed3d29d891fae9fd580ceeeaf28efe5f230 "$workspace/t3.zip" | shasum -a 256 -c
+          ditto -x -k "$workspace/t3.zip" "$workspace/official"
+          official_app=$(find "$workspace/official" -type d -name '*.app' -prune -print | head -n 1)
+          [[ -n $official_app ]]
+          official_asar="$official_app/Contents/Resources/app.asar"
+          original_hash=$(shasum -a 256 "$official_asar")
+          git archive b70ebe66d364127c8525ddd29a23276ab735f752 | tar -x -C "$workspace/legacy"
+          node tests/verify.cjs "$official_asar"
+          for mode in isolated shared; do
+            echo "=== $mode mode ==="
+            export HOME="$workspace/$mode"
+            mkdir "$HOME"
+            installed="$HOME/Applications/T3 Code Enhancer.app"
+            profile="$HOME/Library/Application Support/t3code-enhancer-profile/t3-home"
+            if [[ $mode == shared ]]; then
+              profile="$HOME/.t3"
+            fi
+            xattr -w com.apple.quarantine '0081;00000000;Upgrade test;' "$official_app"
+            if [[ $mode == shared ]]; then
+              node "$workspace/legacy/macos.cjs" install --shared-data "$official_app"
+            else
+              node "$workspace/legacy/macos.cjs" install "$official_app"
+            fi
+            xattr -d com.apple.quarantine "$official_app"
+            installed_asar="$installed/Contents/Resources/app.asar"
+            before=$(shasum -a 256 "$installed_asar")
+            node macos.cjs status | grep '已安装旧版'
+            mkdir -p "$profile/userdata"
+            printf '%s\n' '{"upgradeTest":true}' > "$profile/userdata/settings.json"
+            printf '%s\n' 'retained session fixture' > "$profile/upgrade-session-fixture"
+            settings=$(shasum -a 256 "$profile/userdata/settings.json" "$profile/upgrade-session-fixture")
+            /usr/libexec/PlistBuddy -x -c 'Print :LSEnvironment' "$installed/Contents/Info.plist" > "$workspace/$mode.env.before"
+            bad_app="$workspace/unsigned-$mode.app"
+            mkdir -p "$bad_app/Contents"
+            cp "$official_app/Contents/Info.plist" "$bad_app/Contents/Info.plist"
+            if node macos.cjs install "$bad_app"; then
+              echo 'Unsigned source was accepted.' >&2
+              exit 1
+            fi
+            [[ $(shasum -a 256 "$installed_asar") == "$before" ]]
+            node macos.cjs install "$official_app"
+            node macos.cjs status | grep '已是最新版'
+            [[ $(shasum -a 256 "$installed_asar") != "$before" ]]
+            [[ $(shasum -a 256 "$profile/userdata/settings.json" "$profile/upgrade-session-fixture") == "$settings" ]]
+            /usr/libexec/PlistBuddy -x -c 'Print :LSEnvironment' "$installed/Contents/Info.plist" > "$workspace/$mode.env.after"
+            diff -u "$workspace/$mode.env.before" "$workspace/$mode.env.after"
+            node -e 'const {inspectArchive}=require("./cli.cjs");if(!inspectArchive(process.argv[1]).modules.every(x=>x.installed)) process.exit(1)' "$installed_asar"
+            codesign --verify --deep --strict "$installed"
+            node macos.cjs install "$workspace/absent.app" | grep '已是最新版'
+            node macos.cjs uninstall
+            [[ ! -e $installed && -f "$profile/upgrade-session-fixture" ]]
+            echo "$mode passed: legacy status, invalid source isolation, upgrade, profile retention, signature, re-run and uninstall"
+          done
+          [[ $(shasum -a 256 "$official_asar") == "$original_hash" ]]
+          codesign --verify --deep --strict "$official_app"
