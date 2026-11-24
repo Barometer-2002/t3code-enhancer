@@ -90,6 +90,8 @@ open "$HOME/Applications/T3 Code Enhancer.app"
 
 `node macos.cjs status` 查看状态。退出增强版后执行 `node macos.cjs uninstall` 可以移除它，独立配置会保留。两个版本启动时都会登记 `t3code://` 登录回调，最后启动的那个生效；要在官方版里登录 T3 账号，先重启官方版。安装和卸载已在 Apple Silicon 上验证，Intel 机型未验证。
 
+想直接使用官方版已有的会话和项目，改用 `node macos.cjs install --shared-data`。这时增强版和官方版共用 `~/.t3` 与 Electron 用户数据，两者不能同时运行，切换前先退出另一个。增强版第一次读取钥匙串时，选择「始终允许」。官方版自动更新到新版本后可能升级数据格式，而增强版仍是 0.1.11，这时先停用增强版。已经按独立配置安装过的，先执行 `uninstall` 再重新安装。
+
 ## 安全保障
 - 安装前自动备份纯净原版为 `server.asar.before-t3code-enhancer`（若此前已安装过旧版 `patch-timeline-collapse.cjs`，会自动继承其纯净原版备份，绝不覆盖原版）。
 - 写入前自动进行 ESM 语法检查、SHA-256 块完整性重算、以及所有未修改文件的逐字节一致性校验。

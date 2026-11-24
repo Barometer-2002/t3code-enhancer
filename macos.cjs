@@ -8,7 +8,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { ALL_PATCHES, inspectArchive, buildPatchedArchive } = require("./cli.cjs");
 const { digest, readAsar } = require("./lib/asar.cjs");
-const { SOURCE_THEME_PATH } = require("./lib/theme-manager.cjs");
+const { SOURCE_THEME_PATH, TARGET_THEME_PATH } = require("./lib/theme-manager.cjs");
 
 const T3_VERSION = "0.1.11";
 const T3_TEAM_ID = "ARK85ZXQ4Z";
@@ -54,9 +54,22 @@ function isManagedInstall() {
     && readPlist(installDirectory, "CFBundleShortVersionString") === T3_VERSION;
 }
 
+// --shared-data 安装不设置 T3CODE_HOME，和官方版一样使用 ~/.t3。
+function usesSharedData() {
+  return !("T3CODE_HOME" in readPlist(installDirectory, "LSEnvironment", "json"));
+}
+
 function isRunning() {
-  const processes = execFileSync("ps", ["-axww", "-o", "args="], { encoding: "utf8" });
-  return processes.split("\n").some(line => line.startsWith(installDirectory + path.sep));
+  // 按可执行文件的 inode 查找进程；命令行里的路径写法取决于启动方式，符号链接下不可靠。
+  const executable = path.join(installDirectory, "Contents", "MacOS", readPlist(installDirectory, "CFBundleExecutable"));
+  // 文件不存在时 lsof 同样返回 1，必须先排除，否则会误判为未运行。
+  assert(fs.existsSync(executable), `找不到增强版的可执行文件，无法判断是否在运行：${executable}`);
+  try {
+    return execFileSync("lsof", ["-t", executable], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() !== "";
+  } catch (error) {
+    if (error.status === 1) return false;
+    throw error;
+  }
 }
 
 function verifyOfficialSignature(app) {
@@ -79,7 +92,13 @@ function writeIfMissing(file, content) {
   }
 }
 
-function prepareProfile() {
+function prepareProfile(sharedData) {
+  if (sharedData) {
+    // 只放入主题文件，不改官方版的设置。
+    fs.mkdirSync(path.dirname(TARGET_THEME_PATH), { recursive: true });
+    writeIfMissing(TARGET_THEME_PATH, fs.readFileSync(SOURCE_THEME_PATH));
+    return;
+  }
   const userdata = path.join(profileDirectory, "t3-home", "userdata");
   const themes = path.join(userdata, "themes");
   fs.mkdirSync(themes, { recursive: true, mode: 0o700 });
@@ -96,14 +115,17 @@ function status() {
     return;
   }
   assert(isManagedInstall(), `安装位置已被其他应用占用：${installDirectory}`);
-  const { modules } = inspectArchive(path.join(installDirectory, APP_ASAR), PATCHES);
+  const sharedData = usesSharedData();
+  const { modules } = inspectArchive(path.join(installDirectory, APP_ASAR), sharedData ? ALL_PATCHES : PATCHES);
   assert(modules.every(module => module.installed), "安装目录中的补丁不完整");
   console.log(`T3 Code ${T3_VERSION} macOS 增强版已安装，${isRunning() ? "运行中" : "未运行"}。`);
   console.log(`启动：open "${installDirectory}"`);
-  console.log(`独立配置：${profileDirectory}`);
+  console.log(sharedData ? "数据：与官方版共用 ~/.t3，两者不能同时运行" : `独立配置：${profileDirectory}`);
 }
 
-function install(input = DEFAULT_SOURCE) {
+function install(input = DEFAULT_SOURCE, sharedData = false) {
+  // 共用数据时不改 userData 目录，和官方版共用单实例锁，避免两个进程同时写同一份数据。
+  const patches = sharedData ? ALL_PATCHES : PATCHES;
   if (fs.lstatSync(installDirectory, { throwIfNoEntry: false })) return status();
   const source = path.resolve(input);
   console.log("校验官方 T3 Code 的版本与签名…");
@@ -120,7 +142,7 @@ function install(input = DEFAULT_SOURCE) {
     console.log("构建并校验补丁…");
     const target = path.join(app, APP_ASAR);
     const patched = target + ".patched";
-    buildPatchedArchive(inspectArchive(target, PATCHES).asar, PATCHES, patched);
+    buildPatchedArchive(inspectArchive(target, patches).asar, patches, patched);
     fs.chmodSync(patched, fs.statSync(target).mode & 0o777);
     fs.renameSync(patched, target);
     // Electron 的 ASAR 完整性值是头部 JSON 的 SHA-256。
@@ -132,15 +154,14 @@ function install(input = DEFAULT_SOURCE) {
     writePlist(app, "CFBundleDisplayName", DISPLAY_NAME);
     writePlist(app, "LSEnvironment", {
       ...readPlist(app, "LSEnvironment", "json"),
-      T3CODE_HOME: path.join(profileDirectory, "t3-home"),
-      T3CODE_PORT: "3774",
+      ...(sharedData ? {} : { T3CODE_HOME: path.join(profileDirectory, "t3-home"), T3CODE_PORT: "3774" }),
       T3CODE_DISABLE_AUTO_UPDATE: "1",
     });
     // 修改后官方签名失效，改用本机 ad-hoc 签名；不带官方 entitlements，其中部分需要官方描述文件。
     console.log("本机重新签名…");
     execFileSync("codesign", ["--force", "--deep", "--sign", "-", app], { stdio: "pipe" });
     execFileSync("codesign", ["--verify", "--deep", "--strict", app], { stdio: "pipe" });
-    prepareProfile();
+    prepareProfile(sharedData);
     fs.renameSync(app, installDirectory);
   } finally {
     fs.rmSync(staging, { recursive: true, force: true });
@@ -152,19 +173,24 @@ function uninstall() {
   if (!fs.lstatSync(installDirectory, { throwIfNoEntry: false })) return status();
   assert(isManagedInstall(), `无法确认是本工具安装的应用：${installDirectory}`);
   assert(!isRunning(), "请先退出 macOS 增强版，再运行卸载命令");
+  const sharedData = usesSharedData();
   fs.rmSync(installDirectory, { recursive: true });
-  console.log(`已卸载 macOS 增强版。独立配置和会话保存在 ${profileDirectory}`);
+  console.log(sharedData
+    ? "已卸载 macOS 增强版。会话和项目仍在 ~/.t3，官方版可以继续使用"
+    : `已卸载 macOS 增强版。独立配置和会话保存在 ${profileDirectory}`);
 }
 
 try {
-  const [command, input, ...extra] = process.argv.slice(2);
+  const args = process.argv.slice(2);
+  const sharedData = args.includes("--shared-data");
+  const [command, input, ...extra] = args.filter(arg => arg !== "--shared-data");
   if (!command || command === "--help") {
-    console.log(`用法：node macos.cjs install [T3 Code (Beta).app，默认 ${DEFAULT_SOURCE}] | status | uninstall`);
+    console.log(`用法：node macos.cjs install [--shared-data] [T3 Code (Beta).app，默认 ${DEFAULT_SOURCE}] | status | uninstall`);
   } else {
     assert(process.platform === "darwin", "仅支持 macOS");
     assert(process.getuid() !== 0, "请以桌面用户运行");
-    assert(extra.length === 0 && (command === "install" || input === undefined), "命令参数不正确");
-    if (command === "install") install(input);
+    assert(extra.length === 0 && (command === "install" || (input === undefined && !sharedData)), "命令参数不正确");
+    if (command === "install") install(input, sharedData);
     else if (command === "status") status();
     else if (command === "uninstall") uninstall();
     else throw new Error(`未知命令：${command}`);
