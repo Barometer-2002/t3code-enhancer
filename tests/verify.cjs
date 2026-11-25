@@ -4,9 +4,11 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
-const { runInNewContext } = require("node:vm");
+const { runInNewContext, createContext, runInContext } = require("node:vm");
 
-const { readAsar, findUniqueEntry } = require("../lib/asar.cjs");
+const { readAsar, findUniqueEntry, getAsarAppVersion, writePatchedAsar, validateScriptSyntax, digest } = require("../lib/asar.cjs");
+const { verifyInjectedScope, findPatchTarget, createPatchContext } = require("../lib/resolver.cjs");
+const { collectTopLevelBindings, findUndeclaredIdentifiers } = require("../lib/js-ast.cjs");
 const { ALL_PATCHES, selectPatches, applicablePatchesForArchive, inspectArchive, summarizeModuleStates, resolvePristineBaseline, buildPatchedArchive, getLinuxAsarCandidates, isLinuxAppRunning, parseCliArgs } = require("../cli.cjs");
 const { PACKS, PRESETS, resolveInstallPlan } = require("../lib/packs.cjs");
 const { withInstallDirectoryLock } = require("../lib/install-state.cjs");
@@ -24,6 +26,79 @@ const filesChangesExplorer = require("../lib/patches/files-changes-explorer.cjs"
 const workspaceFloatingPanels = require("../lib/patches/workspace-floating-panels.cjs");
 const { workspaceFloatFrame, workspaceSnapFrame, defaultChatFloatFrame, chatPillFrame, placeSurfaceFloat } = workspaceFloatingPanels;
 const { SOURCE_THEME_PATH, extractOfficialTheme } = require("../lib/theme-manager.cjs");
+
+// Runtime modules under lib/runtime are plain ESM without imports. Load them the way the
+// ASAR does (as a standalone script) so tests exercise the real shipped source, and hand
+// back the exports plus the sandbox so tests can stub or spy on module-level helpers.
+function loadRuntimeModule(name, globals = {}) {
+  const file = path.join(__dirname, "..", "lib", "runtime", name + ".mjs");
+  const src = fs.readFileSync(file, "utf8");
+  assert(!/^\s*import\s/m.test(src), `${name}.mjs must stay import-free`);
+  const names = [...src.matchAll(/^export\s+(?:async\s+)?(?:function|const|let)\s+([\w$]+)/gm)].map((m) => m[1]);
+  const sandbox = { ...globals };
+  runInNewContext(src.replace(/^export\s+/gm, "") + "\nthis.__t3exports = { " + names.join(", ") + " };", sandbox, { filename: file });
+  return { exports: sandbox.__t3exports, sandbox };
+}
+
+function entryText(asar, rec) {
+  const offset = Number(rec.entry.offset);
+  return asar.body.toString("utf8", offset, offset + rec.entry.size);
+}
+
+// Resolve a patched host chunk together with every external t3e-*.js runtime asset it imports.
+function hostWithRuntime(asar, patch, label) {
+  const entry = findUniqueEntry(asar, patch.targetRegex, label || patch.id);
+  const text = entry.content.toString("utf8");
+  const assets = [];
+  for (const [, name] of text.matchAll(/from\s*"\.\/(t3e-[\w.-]+\.js)"/g)) {
+    const key = path.posix.join(path.posix.dirname(entry.key), name);
+    if (assets.some((asset) => asset.key === key)) continue;
+    const rec = asar.byKey.get(key);
+    assert(rec, `Host ${entry.key} imports missing runtime asset ${key}`);
+    assets.push({ key, text: entryText(asar, rec) });
+  }
+  return { key: entry.key, text, assets, combined: [text, ...assets.map((asset) => asset.text)].join("\n") };
+}
+
+const BROWSER_GLOBALS = [
+  "window", "document", "navigator", "requestAnimationFrame", "cancelAnimationFrame", "ResizeObserver", "IntersectionObserver",
+  "MutationObserver", "CustomEvent", "Event", "EventTarget", "HTMLElement", "Element", "Node", "getComputedStyle", "localStorage",
+  "sessionStorage", "crypto", "performance", "queueMicrotask", "matchMedia", "DOMRect", "KeyboardEvent", "PointerEvent", "MouseEvent",
+  "AbortController", "fetch", "URL", "URLSearchParams", "structuredClone", "Intl", "console", "Symbol", "WeakMap", "WeakSet", "setTimeout",
+  "clearTimeout", "setInterval", "clearInterval",
+];
+
+// Every external runtime asset must be a content-hashed, byte-exact copy of lib/runtime/*.mjs, valid ESM, self-contained
+// (zero minified host identifiers) and resolvable from every host chunk that imports it.
+function verifyRuntimeAssets(asar, expectedNames = []) {
+  const found = new Set();
+  const assetDir = "apps/server/dist/client/assets/";
+  for (const rec of asar.entries) {
+    if (!rec.key.startsWith(assetDir) || rec.key.includes("/", assetDir.length) || !rec.key.endsWith(".js")) continue;
+    const base = rec.key.slice(assetDir.length);
+    if (base.startsWith("t3e-")) {
+      const match = /^t3e-([\w-]+)-([0-9a-f]{8})\.js$/.exec(base);
+      assert(match, `Unexpected runtime asset name: ${rec.key}`);
+      const text = entryText(asar, rec);
+      assert.equal(match[2], digest(Buffer.from(text, "utf8")).slice(0, 8), `${rec.key} must carry its content hash`);
+      assert.equal(text, fs.readFileSync(path.join(__dirname, "..", "lib", "runtime", match[1] + ".mjs"), "utf8"), `${rec.key} must ship lib/runtime/${match[1]}.mjs byte-for-byte`);
+      assert(!/^\s*import\s/m.test(text) && !/\bfrom\s*"\.\//.test(text), `${rec.key} must be self-contained`);
+      assert(/^export\s/m.test(text), `${rec.key} must be an ES module with exports`);
+      validateScriptSyntax(Buffer.from(text, "utf8"), rec.key, rec.key);
+      const leaks = findUndeclaredIdentifiers(text, collectTopLevelBindings(text), BROWSER_GLOBALS);
+      assert.equal(leaks.length, 0, `${rec.key} leaks undeclared host identifiers: ${[...leaks].join(", ")}`);
+      found.add(match[1]);
+      continue;
+    }
+    const offset = Number(rec.entry.offset);
+    if (!asar.body.subarray(offset, offset + rec.entry.size).includes("./t3e-")) continue;
+    for (const [, name] of entryText(asar, rec).matchAll(/from\s*"\.\/(t3e-[\w.-]+\.js)"/g)) {
+      assert(asar.byKey.has(assetDir + name), `${rec.key} imports missing runtime asset ${name}`);
+    }
+  }
+  for (const name of expectedNames) assert(found.has(name), `Missing external runtime asset for ${name}`);
+  return found;
+}
 
 console.log("1. Validating bundled theme JSON & 3-layer separation...");
 const themeRaw = fs.readFileSync(SOURCE_THEME_PATH, "utf8");
@@ -232,13 +307,39 @@ assert.equal(placeSurfaceFloat(floatBounds, [], true, { x: 10, y: 10 }).x, 8);
 assert(workspaceFloatingPanels.legacyMarkers.includes("T3_WORKSPACE_FLOATING_PANELS_V22"));
 console.log("   OK");
 
+function floatingRuntimeIsExternal(asar) {
+  return hostWithRuntime(asar, workspaceFloatingPanels).assets.some((a) => /\/t3e-floating-panels-ui-[0-9a-f]{8}\.js$/.test(a.key));
+}
+
+// Once workspace-floating-panels ships its UI as external t3e-*.js assets (floating-panels-ui + tab-bar-ui), the host chunks
+// only hold the generated bridges, so the legacy inline-source extraction in Suites 5-8 and 10 no longer applies.
+function verifyExternalFloatingRuntime(asar) {
+  const host = hostWithRuntime(asar, workspaceFloatingPanels);
+  const tabHost = hostWithRuntime(asar, workspaceFloatingPanels.tabBarPatch);
+  assert(host.assets.some((a) => /\/t3e-floating-panels-ui-[0-9a-f]{8}\.js$/.test(a.key)), "Host must import the floating-panels runtime asset");
+  assert(tabHost.assets.some((a) => /\/t3e-tab-bar-ui-[0-9a-f]{8}\.js$/.test(a.key)), "Tab bar chunk must import the tab-bar runtime asset");
+  assert(host.text.includes(workspaceFloatingPanels.marker) && /\bcreateFloatingPanelsRuntime\b/.test(host.text), "Host must emit the createFloatingPanelsRuntime bridge");
+  assert(tabHost.text.includes(workspaceFloatingPanels.tabBarPatch.marker) && /\bcreateTabBarRuntime\b/.test(tabHost.text), "Tab bar chunk must emit the createTabBarRuntime bridge");
+  verifyRuntimeAssets(asar, ["floating-panels-ui", "tab-bar-ui"]);
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+  const ui = loadRuntimeModule("floating-panels-ui").exports;
+  const tabs = loadRuntimeModule("tab-bar-ui").exports;
+  assert.deepEqual(plain(ui.workspaceFloatFrame({ x: 120, y: 80, width: 360, height: 240 }, { width: 800, height: 600 }, "move", 1000, -1000)), { x: 432, y: 8, width: 360, height: 240 });
+  assert.deepEqual(plain(ui.workspaceSnapFrame({ x: 20, y: 200, width: 300, height: 200 }, { width: 800, height: 600 })), { x: 8, y: 200, width: 300, height: 200 });
+  assert.deepEqual(plain(ui.defaultChatFloatFrame({ width: 1100, height: 700 })), { x: 688, y: 208, width: 396, height: 476 });
+  assert.equal(tabs.tabDroppedOutside({ top: 32, bottom: 64 }, 48, 96), true);
+  assert.equal(tabs.tabDroppedOutside({ top: 32, bottom: 64 }, 48, 74), false);
+}
+
 function verifyFloatingPanelPortal(asar) {
+  if (floatingRuntimeIsExternal(asar)) return verifyExternalFloatingRuntime(asar);
   const chunk = findUniqueEntry(asar, workspaceFloatingPanels.targetRegex, workspaceFloatingPanels.id);
   const source = chunk.content.toString("utf8");
-  const reactDomImport = source.match(/import\{[^}]*\bas Mc\b[^}]*\}from"(\.\/react-dom-[\w-]+\.js)"/);
+  const rolldownImport = source.match(/import\{i as e\}from"(\.\/rolldown-runtime-[\w-]+\.js)"/);
+  const reactDomImport = source.match(/import\{[^}]*\br\b[^}]*\}from"(\.\/with-selector-[\w-]+\.js)"/);
   const surfaceEqHelpers = source.match(/^function t3ShallowObjEqual\([\s\S]+?^function t3SurfaceMountPropsEqual\([\s\S]+?^\}/m);
   const surfaceMount = source.match(/^const T3SurfaceMount = Z\.memo\([\s\S]+?^\}, t3SurfaceMountPropsEqual\);/m);
-  assert(reactDomImport && surfaceEqHelpers && surfaceMount, "Missing native React DOM binding or injected surface mount");
+  assert(rolldownImport && reactDomImport && surfaceEqHelpers && surfaceMount, "Missing native React DOM binding or injected surface mount");
 
   // Verify T3SurfaceMount prop comparator bails out when ChatView rebuilds shallow-equal panelProps
   const { t3SurfaceMountPropsEqual } = runInNewContext(
@@ -289,15 +390,18 @@ function verifyFloatingPanelPortal(asar) {
     for (const [, dependency] of text.matchAll(/from"\.\/([\w.-]+\.js)"/g)) copyModule(dependency);
   }
   try {
+    copyModule(path.posix.basename(rolldownImport[1]));
     copyModule(path.posix.basename(reactDomImport[1]));
     writeFile("package.json", '{"type":"module"}');
     writeFile("portal.mjs", [
       'import assert from "node:assert/strict";',
+      rolldownImport[0] + ";",
       reactDomImport[0] + ";",
+      'const aF = e(r(), 1);',
       'const Z = { memo: (render) => render, useState: (init) => [init()], useLayoutEffect: () => {}, useMemo: (fn) => fn() };',
       'const host = { nodeType: 1 };',
       'const document = { createElement: () => host };',
-      'const gM = () => null;',
+      'const aN = () => null;',
       'const $ = { jsx: (type, props) => ({ type, props }) };',
       surfaceEqHelpers[0],
       surfaceMount[0],
@@ -315,6 +419,7 @@ function verifyFloatingPanelPortal(asar) {
 }
 
 function verifyWorkspaceToolbar(asar) {
+  if (floatingRuntimeIsExternal(asar)) return verifyExternalFloatingRuntime(asar);
   const patch = workspaceFloatingPanels;
   const source = findUniqueEntry(asar, patch.targetRegex, patch.id).content.toString("utf8");
   const toolbar = source.match(/^function T3DividerSwapButton\([\s\S]+?(?=^function T3ChatColumnShell\()/m);
@@ -328,9 +433,9 @@ function verifyWorkspaceToolbar(asar) {
     {
       Z: { useContext: () => context },
       T3FloatContext: {},
-      jn: "Tooltip",
-      an: "TooltipTrigger",
-      Zt: "TooltipPopup",
+      fr: "Tooltip",
+      bt: "TooltipTrigger",
+      se: "TooltipPopup",
       $: { jsx, jsxs: jsx },
     }
   );
@@ -338,7 +443,7 @@ function verifyWorkspaceToolbar(asar) {
   const toggle = { kind: "workspace" };
   const maximize = { kind: "maximize" };
   assert.equal(T3ChatToolbar({ controls }).props.children.filter(Boolean).length, 1);
-  assert(source.includes("showRightPanelControl:!ka"), "Right panel toggle must join chat header toolbar when panel is closed");
+  assert(source.includes("showRightPanelControl:!Ga"), "Right panel toggle must join chat header toolbar when panel is closed");
   assert(!source.includes("data-t3e-fixed-actions"), "Top-right fixed actions overlay should be removed");
   const dividerSwap = T3DividerSwapButton();
   assert.equal(dividerSwap.type, "Tooltip");
@@ -376,12 +481,12 @@ function verifyWorkspaceToolbar(asar) {
   assert.match(source, /\.t3e-divider-swap-btn \{[\s\S]*opacity: 0; pointer-events: none;/, "Divider swap button must stay hidden until divider hover");
   assert.match(source, /\[data-preview-panel-mode=\\?"inline\\?"\] > \[role=\\?"separator\\?"\]:hover:not\(:active\) ~ \.t3e-divider-swap-btn[\s\S]*opacity: 1; pointer-events: auto;/, "Hovering vertical separator must reveal swap button");
   const plc = findUniqueEntry(asar, patch.tabBarPatch.targetRegex, patch.tabBarPatch.id).content.toString("utf8");
-  assert(plc.includes("children:[W,e.enhancerDividerSlot,ie]"), "Panel divider must host enhancerDividerSlot");
-  const pwMatch = source.match(/function pW\(e\)\{[\s\S]+?\}(?=function mW\()/);
-  const ecMatch = plc.match(/function Ec\(e\)\{[\s\S]+?\}(?=function Dc\()/);
-  const kcMatch = plc.match(/function kc\(e\)\{[\s\S]+?\}(?=function Ac\()/);
-  const hhMatch = plc.match(/function Hh\(e\)\{[\s\S]+?\}(?=function Uh\()/);
-  assert(pwMatch && ecMatch && kcMatch && hhMatch, "Missing pW/Hh/Ec/kc in patched bundle");
+  assert(plc.includes("children:[U,e.enhancerDividerSlot,re]"), "Panel divider must host enhancerDividerSlot");
+  const pwMatch = source.match(/function oG\(e\)\{[\s\S]+?\}(?=function sG\()/);
+  const ecMatch = plc.match(/function Wo\(e\)\{[\s\S]+?\}(?=function Go\()/);
+  const kcMatch = plc.match(/function qo\(e\)\{[\s\S]+?\}(?=function Jo\()/);
+  const hhMatch = plc.match(/function kp\(e\)\{[\s\S]+?\}(?=function Ap\(\))/);
+  assert(pwMatch && ecMatch && kcMatch && hhMatch, "Missing oG/kp/Wo/qo in patched bundle");
   const sentinel = Symbol.for("react.memo_cache_sentinel");
   const slotSentinel = { $$typeof: "swap-btn-slot" };
   let capturedResizeEdge = null;
@@ -396,7 +501,7 @@ function verifyWorkspaceToolbar(asar) {
     return arr;
   };
   const HhTree = runInNewContext(
-    `${ecMatch[0]}\n${kcMatch[0]}\n${hhMatch[0]}\n${pwMatch[0]}\n({ pW, Hh, Ec, kc })`,
+    `${ecMatch[0]}\n${kcMatch[0]}\n${hhMatch[0]}\n${pwMatch[0]}\n({ oG, kp, Wo, qo })`,
     {
       Q: {
         c: getMemo,
@@ -415,53 +520,52 @@ function verifyWorkspaceToolbar(asar) {
         jsx: (type, props) => ({ type, props }),
         jsxs: (type, props) => ({ type, props }),
       },
-      V: () => (s) => s,
-      z: () => (s) => s,
+      B: () => (s) => s,
+      R: () => (s) => s,
       a: (s) => s,
-      J: (...args) => args.filter(Boolean).join(" "),
-      Ia: () => ({ profiles: [] }),
-      Cr: () => ({ resolvedTheme: "light" }),
-      Ta: () => {},
-      Sn: (fn) => fn,
-      xa: () => ({}),
-      Bo: () => {},
-      Do: () => {},
-      jo: () => {},
-      Th: () => "Changes",
-      mh: () => null,
-      Oh: () => ({ url: "", capturedUrl: "" }),
-      gh: () => null,
-      zh: "SurfaceTab",
-      Da: "Da",
-      Oa: "--panel-width",
-      ai: (u) => {
+      Y: (...args) => args.filter(Boolean).join(" "),
+      ua: () => ({ profiles: [] }),
+      pn: () => ({ resolvedTheme: "light" }),
+      Yi: () => ({}),
+      gn: (fn) => fn,
+      io: () => {},
+      ao: () => {},
+      _o: () => {},
+      fp: () => "Changes",
+      tp: () => null,
+      hp: () => ({ url: "", capturedUrl: "" }),
+      rp: () => null,
+      Ep: "SurfaceTab",
+      ta: "ta",
+      na: "--panel-width",
+      Ay: (u) => {
         capturedResizeEdge = u.edge;
         return { width: 420, handlers: {}, observeRow: () => () => {} };
       },
-      si: (props) => {
-        currentComponent = "Hh";
-        return HhTree.Hh(props);
+      My: (props) => {
+        currentComponent = "kp";
+        return HhTree.kp(props);
       },
-      Ec: (props) => {
-        currentComponent = "Ec";
-        return HhTree.Ec(props);
+      Wo: (props) => {
+        currentComponent = "Wo";
+        return HhTree.Wo(props);
       },
-      _a: "ScrollArea",
-      Ih: "TabStrip",
-      K: "Tooltip",
-      G: "TooltipTrigger",
-      M: "Button",
-      ze: "ChevronLeft",
-      U: "TooltipPopup",
-      x: "Kbd",
-      me: "ChevronRight",
+      Gi: "ScrollArea",
+      Cp: "TabStrip",
+      re: "Tooltip",
+      P: "TooltipTrigger",
+      A: "Button",
+      He: "ChevronLeft",
+      b: "TooltipPopup",
+      W: "Kbd",
+      ge: "ChevronRight",
       T3NewTabStripControl: "NewTabStrip",
       T3ChatGptSurfaceLauncher: "Launcher",
-      Se: "B", ct: "T", De: "F", Xe: "D", la: { pullRequest: "P", link: "L" }, st: "M", Oo: "S",
-      ch: {}, lh: "", dh: 2, te: true,
+      we: "B", ft: "T", ke: "F", $e: "D", Li: { pullRequest: "P", link: "L" }, dt: "M", ho: "S",
+      Yf: {}, Xf: "", Qf: 2, H: true,
     }
   );
-  // Intercept Hh's local `let pe = Ec` call cleanly via renderComponentTree
+  // Intercept kp's local `let ve = Wo` call cleanly via renderComponentTree
   const renderComponentTree = (node) => {
     let cur = node;
     while (cur && typeof cur.type === "function") {
@@ -471,8 +575,8 @@ function verifyWorkspaceToolbar(asar) {
     return cur;
   };
   const renderInlinePanel = (enhancerDividerSlot, enhancerResizeEdge = "right") => renderComponentTree((() => {
-    currentComponent = "pW";
-    return HhTree.pW({
+    currentComponent = "oG";
+    return HhTree.oG({
       sheet: false,
       workspaceLayoutElement: null,
       widthStorageKey: "k",
@@ -494,12 +598,12 @@ function verifyWorkspaceToolbar(asar) {
   const firstRender = renderInlinePanel(slotSentinel, "right");
   assert.equal(capturedResizeEdge, "right");
   assert.equal(firstRender.props["data-preview-panel-mode"], "inline");
-  assert.equal(firstRender.props.children[1], slotSentinel, "pW -> Hh -> Ec -> kc must preserve enhancerDividerSlot on inline divider");
+  assert.equal(firstRender.props.children[1], slotSentinel, "oG -> kp -> Wo -> qo must preserve enhancerDividerSlot on inline divider");
   const secondRender = renderInlinePanel(null, "left");
   assert.equal(capturedResizeEdge, "left");
-  assert.equal(secondRender.props.children[1], null, "Memo cache invalidation in Hh/kc must hide divider slot when enhancerDividerSlot becomes null");
+  assert.equal(secondRender.props.children[1], null, "Memo cache invalidation in kp/qo must hide divider slot when enhancerDividerSlot becomes null");
   const thirdRender = renderInlinePanel(slotSentinel, "left");
-  assert.equal(thirdRender.props.children[1], slotSentinel, "Memo cache invalidation in Hh/kc must restore divider slot when reopened");
+  assert.equal(thirdRender.props.children[1], slotSentinel, "Memo cache invalidation in kp/qo must restore divider slot when reopened");
 
   // Fullscreen Main Chat <-> floating tab scroll pinning (suppress smooth scroll & hide intermediate reflow until ResizeObserver settles)
   const shellMatch = source.match(/^function T3ChatColumnShell\([\s\S]+?(?=^function T3FloatButton\()/m);
@@ -630,6 +734,7 @@ function verifyWorkspaceToolbar(asar) {
 }
 
 function verifyTabDrag(asar) {
+  if (floatingRuntimeIsExternal(asar)) return verifyExternalFloatingRuntime(asar);
   const patch = workspaceFloatingPanels.tabBarPatch;
   const code = findUniqueEntry(asar, patch.targetRegex, patch.id).content.toString("utf8");
   const anchor = "\nfunction tabDroppedOutside(";
@@ -676,9 +781,10 @@ function verifyTabDrag(asar) {
 }
 
 function verifyNativePreviewPosition(asar) {
+  if (floatingRuntimeIsExternal(asar)) return verifyExternalFloatingRuntime(asar);
   const patch = workspaceFloatingPanels;
   const source = findUniqueEntry(asar, patch.targetRegex, patch.id).content.toString("utf8");
-  const nativeSurface = source.match(/function _D\(e\)\{[\s\S]+?(?=function vD\()/);
+  const nativeSurface = source.match(/function eO\(e\)\{[\s\S]+?(?=function tO\()/);
   const syncPreview = source.match(/^function t3SyncNativePreview\(container\) \{[\s\S]+?^\}/m);
   const movePreview = source.match(/^const t3PanelMovesPending = new WeakSet\(\);[\s\S]+?(?=^function t3SyncNativePreview)/m);
   assert(nativeSurface && syncPreview && movePreview, "Missing preview position sync in patched archive");
@@ -687,15 +793,15 @@ function verifyNativePreviewPosition(asar) {
   const window = new EventTarget();
   const pendingFrames = [];
   const [render, sync, movePanelHost] = runInNewContext(
-    nativeSurface[0] + "\n" + syncPreview[0] + "\n" + movePreview[0] + "\n[_D, t3SyncNativePreview, t3MovePanelHost]", {
+    nativeSurface[0] + "\n" + syncPreview[0] + "\n" + movePreview[0] + "\n[eO, t3SyncNativePreview, t3MovePanelHost]", {
     Q: { c: (size) => Array(size).fill(Symbol.for("react.memo_cache_sentinel")) },
     Z: { useRef: (value) => ({ current: value }), useLayoutEffect() {} },
     $: { jsx: (_type, props) => props },
-    Wv: (_tabId, fit) => {
+    Gd: (_tabId, fit) => {
       fits.push(fit);
       return { present: (rect, visible, cornerRadius, zIndex) => (reports.push({ rect, visible, cornerRadius, zIndex }), true), release() {} };
     },
-    Am: () => () => {},
+    sx: () => () => {},
     t3BrowserLayoutMode: workspaceFloatingPanels.t3BrowserLayoutMode,
     document: { querySelectorAll: () => [] },
     requestAnimationFrame: (callback) => pendingFrames.push(callback),
@@ -756,34 +862,34 @@ function verifyNativePreviewPosition(asar) {
 function verifyResponsiveBrowserLayout(asar) {
   const patch = workspaceFloatingPanels.responsivePreviewPatch;
   const main = findUniqueEntry(asar, patch.targetRegex, patch.id).content.toString("utf8");
-  const store = main.match(/sD=Zn\(\)\(e=>\(\{activityByTabId:[\s\S]+?(?=var uD=)/);
+  const store = main.match(/Yw=gn\(\)\(e=>\(\{activityByTabId:[\s\S]+?(?=var Qw=)/);
   const layoutMode = main.match(/const T3ResponsiveViewport=[^;]+;/);
   const layoutSelector = main.match(/C=e=>\{let t=e\.byTabId\[i\];return\{[^}]+\}\}/);
   const layoutOverride = main.match(/if\(w\.responsive\)o=T3ResponsiveViewport;/);
   assert(store && layoutMode && layoutSelector && layoutOverride, "Missing responsive browser viewport wiring");
   const defaults = findUniqueEntry(asar, /\/browserDefaults-[\w-]+\.js$/, "browser layout").content.toString("utf8");
-  const layout = defaults.match(/function Z\(e,t,n=1\)\{[\s\S]+?(?=function Je\()/);
+  const layout = defaults.match(/function it\(e,t,n=1\)\{[\s\S]+?(?=function ot\()/);
   assert(layout, "Missing native browser viewport calculation");
   const { claim, state, viewportFor, size } = runInNewContext(
     "let " + store[0] + "\n" + layoutMode[0] + "\n" + layout[0] + `
     ({
-      claim: lD,
-      state: sD.getState,
+      claim: Zw,
+      state: Yw.getState,
       viewportFor(i, o) {
         let C;
         ${layoutSelector[0]};
-        const w = C(sD.getState());
+        const w = C(Yw.getState());
         ${layoutOverride[0]}
         return o;
       },
-      size: Z
+      size: it
     })`, {
-      Zn: () => (init) => {
+      gn: () => (init) => {
         let state = init((update) => { state = { ...state, ...update(state) }; });
         return { getState: () => state };
       },
-      aD: (tabs, tab) => tabs[tab]?.rect ?? null,
-      Y: (zoom) => zoom,
+      qw: (tabs, tab) => tabs[tab]?.rect ?? null,
+      X: (zoom) => zoom,
     }
   );
   const tab = "browser";
@@ -810,13 +916,12 @@ function verifyResponsiveBrowserLayout(asar) {
 
 function verifyInlineEditDetail(asar) {
   const code = findUniqueEntry(asar, inlineFileDiff.targetRegex, inlineFileDiff.id).content.toString("utf8");
-  const detailHook = code.match(/function t_\(e,t,n,r\)\{[\s\S]+?(?=function n_\()/);
-  const inlineComponents = code.match(/^function t3RenderFileChangeStats\([\s\S]+?(?=^const t3DiffMemo)/m);
-  const checkpointHelpers = code.match(/^function t3CheckpointPath\([\s\S]+?(?=^function t3EnsureDiffStyles)/m);
-  assert(detailHook && inlineComponents && checkpointHelpers, "Missing timeline detail hook or inline file diff components");
-  assert.match(code, /&&j&&\(F\|\|R\|\|n\.projectedItem&&L===void 0\)\?[^;]*?\(o_,\{/);
-  assert.match(code, /T3FileChangeRowLabelMemo,\{projectedItem:n\.projectedItem,workspaceRoot:r,cwd:a\.markdownCwd,environmentId:a\.activeThreadEnvironmentId,source:a\.turnItemSource,expanded:b\}/);
-  assert.match(code, /wd\(i\|\|s\.pending,e\.onInitialOutputReady\);if\(o\.type===`file_change`\)return\(0,\$\.jsx\)\(T3InlineFileDiffCardMemo/);
+  const detailHook = code.match(/function bm\(e,t,n,r\)\{[\s\S]+?(?=function xm\()/);
+  assert(detailHook, "Missing timeline detail hook");
+  assert.match(code, /createInlineDiffRuntime\(\{\s*React:\s*[\w$]+,\s*jsx:\s*[\w$]+\.jsx,\s*jsxs:\s*[\w$]+\.jsxs,\s*resolveRelPath:\s*[\w$]+,\s*useCheckpointSummaries:/, "Missing inline diff runtime bridge");
+  assert.match(code, /&&L&&\(B\|\|W\|\|n\.projectedItem&&U===void 0\)\?[^;]*?\(Tm,\{/);
+  assert.match(code, /T3FileChangeRowLabelMemo,\{projectedItem:n\.projectedItem,workspaceRoot:r,cwd:a\.markdownCwd,environmentId:a\.activeThreadEnvironmentId,source:a\.turnItemSource,expanded:x\}/);
+  assert.match(code, /cu\(i\|\|s\.pending,e\.onInitialOutputReady\);if\(o\.type===`file_change`\)return\(0,Q\.jsx\)\(T3InlineFileDiffCardMemo/);
 
   const summary = { type: "file_change", fileName: "README.md", updatedAt: "r1" };
   const projected = { sourceThreadId: "source-thread", sourceItemId: "edit-1", item: summary };
@@ -834,53 +939,58 @@ function verifyInlineEditDetail(asar) {
   let rowVisible = false;
   let observeRow;
   const rowElement = {};
-  const { t_, T3InlineFileDiffCard, T3FileChangeRowLabel } = runInNewContext(
-    detailHook[0] + "\n" + checkpointHelpers[0] + "\n" + inlineComponents[0] +
-    "\n({ t_, T3InlineFileDiffCard, T3FileChangeRowLabel })", {
-      Q: { c: () => memo },
-      J: () => (text) => text,
-      Fa: () => false,
-      Ua: (item) => item.updatedAt,
-      wa: (key, customSource) => { request = key; source = customSource; return reply; },
-      Wa: () => null,
-      Ha: () => [],
-      Z: {
-        useState: (init) => renderRow ? [rowVisible, (visible) => { rowVisible = visible; }] : [init, () => {}],
-        useRef: (init) => ({ current: renderRow ? rowElement : init }),
-        useEffect: (effect) => { if (renderRow) effect(); },
-        useMemo: (create) => create(),
-      },
-      $: { jsx, jsxs: jsx },
-      crypto: { randomUUID: () => `rev-${++uuidSeq}` },
-      Xr: (path) => path,
-      t3IsZhLocale: () => false,
-      t3ShortFileName: (path) => path,
-      t3EnsureDiffStyles() {},
-      t3ParseUnifiedDiff: (...args) => {
-        parseLimits.push(args[3]);
-        return inlineFileDiff.t3ParseUnifiedDiff(...args);
-      },
-      T3ObserveIntersection: (node, callback) => {
-        assert.equal(node, rowElement);
-        observeRow = callback;
-        return () => {};
-      },
-      T3UseCheckpointSummaries: (ref) => ref ? [{ runId: "turn-9", checkpointTurnCount: 9 }] : [],
-      T3UseCheckpointDiff: (input, options) => {
-        checkpointRequest = options.enabled ? input : null;
-        return options.enabled ? checkpointReply : {};
-      },
-      T3ParseCheckpointDiff: (patch) => ({
-        kind: "files", files: [{ name: /^\+\+\+ b\/(.*)$/m.exec(patch)?.[1] }]
-      }),
-      T3DiffCopyIcon: () => null,
-      T3DiffSideIcon: () => null,
-      io: String,
-    }
-  );
+  const React = {
+    useState: (init) => renderRow ? [rowVisible, (visible) => { rowVisible = visible; }] : [init, () => {}],
+    useRef: (init) => ({ current: renderRow ? rowElement : init }),
+    useEffect: (effect) => { if (renderRow) effect(); },
+    useMemo: (create) => create(),
+  };
+  const useTurnItemDetail = (key, customSource) => { request = key; source = customSource; return reply; };
+  const getItemRevision = (item) => item.updatedAt;
+  // The native detail hook (bm) lives in the host bundle and is extracted from the patched chunk.
+  const { bm } = runInNewContext(detailHook[0] + "\n({ bm })", {
+    Z: { c: () => memo },
+    we: () => (text) => text,
+    bo: () => false,
+    go: getItemRevision,
+    pi: useTurnItemDetail,
+    mo: () => null,
+    So: () => [],
+    $: React,
+    Q: { jsx, jsxs: jsx },
+  });
+  // The inline diff UI is the shipped runtime module, wired up exactly like the generated bridge.
+  const runtime = loadRuntimeModule("inline-diff-ui", { crypto: { randomUUID: () => `rev-${++uuidSeq}` } });
+  const parseUnifiedDiff = runtime.sandbox.t3ParseUnifiedDiff;
+  runtime.sandbox.t3ParseUnifiedDiff = (...args) => {
+    parseLimits.push(args[3]);
+    return parseUnifiedDiff(...args);
+  };
+  const { T3InlineFileDiffCard, T3FileChangeRowLabel } = runtime.exports.createInlineDiffRuntime({
+    React,
+    jsx,
+    jsxs: jsx,
+    resolveRelPath: (path) => path,
+    useCheckpointSummaries: (ref) => ref ? [{ runId: "turn-9", checkpointTurnCount: 9 }] : [],
+    useCheckpointDiff: (input, options) => {
+      checkpointRequest = options.enabled ? input : null;
+      return options.enabled ? checkpointReply : {};
+    },
+    parseCheckpointDiff: (patch) => ({
+      kind: "files", files: [{ name: /^\+\+\+ b\/(.*)$/m.exec(patch)?.[1] }]
+    }),
+    observeIntersection: (node, callback) => {
+      assert.equal(node, rowElement);
+      observeRow = callback;
+      return () => {};
+    },
+    useTurnItemDetail,
+    getItemRevision,
+    formatCompact: String,
+  });
   let sideRequest;
   const cardTree = () => {
-    const result = t_(projected, "env", { detail: customDetailSource }, false);
+    const result = bm(projected, "env", { detail: customDetailSource }, false);
     return T3InlineFileDiffCard({
       item: result.item, projectedItem: projected, detail: result.output, workspaceRoot: "C:\\Work\\project",
       onOpenToolDiff: (request) => { sideRequest = request; },
@@ -979,26 +1089,20 @@ function verifyInlineEditDetail(asar) {
 
   // Verify DiffPanel sideRevealPatch for single-file, multi-file, and blank tool-call -> turn/unstaged fallback
   const diffPanel = findUniqueEntry(asar, inlineFileDiff.sideRevealPatch.targetRegex, inlineFileDiff.id + "-side").content.toString("utf8");
-  const helpersMatch = diffPanel.match(/function t3NormDiffPath[\s\S]+?function t3PickToolDiffFallback\([\s\S]+?\n(?=\s*export\{)/);
+  assert.match(diffPanel, /createSideRevealHelpers\(\{\s*extractToolPatch:\s*[\w$]+,\s*parsePatch:\s*[\w$]+,\s*getFileName:\s*[\w$]+,?\s*\}\)/, "Missing side-reveal runtime bridge");
   const revealMatch = diffPanel.match(
-    /\/\* T3_INLINE_FILE_DIFF_SIDE_REVEAL_V\d+ \*\/let t3RawZ=z,t3Fb=[\s\S]+?;[\s\S]*?(Fn=t3RawZ\?\.revealRequestId[\s\S]+?,In=t3RawZ\?\.revealRequestId\?\?\([^)]+\)),[\s\S]*?(li=e=>\{[^}]+\}),t\[76\][\s\S]*?(let path=\(\(\)=>\{[\s\S]+?\}\)\(\);if\(!path\)\{Mi\.current=null;return\}let e=JSON\.stringify\(\[K,path,In\]\);Mi\.current!==e&&ji\(path\)&&\(Mi\.current=e\))/
+    /\/\* T3_INLINE_FILE_DIFF_SIDE_REVEAL_V\d+ \*\/let t3RawZ=V,t3Fb=[\s\S]+?;[\s\S]*?(vr=t3RawZ\?\.revealRequestId[\s\S]+?,yr=t3RawZ\?\.revealRequestId\?\?\([^)]+\)),[\s\S]*?(Qi=e=>\{[^}]+\}),t\[76\][\s\S]*?(let path=\(\(\)=>\{[\s\S]+?\}\)\(\);if\(!path\)\{xa\.current=null;return\}let e=JSON\.stringify\(\[K,path,yr\]\);xa\.current!==e&&ba\(path\)&&\(xa\.current=e\))/
   );
-  assert(helpersMatch && revealMatch, "Missing updated DiffPanel sideRevealPatch injection");
-  const fallbackFns = runInNewContext(
-    `(function(Ut, it, M) {
-      ${helpersMatch[0]}
-      return { t3NormDiffPath, t3DiffMatchesTarget, t3PatchHasFile, t3PickToolDiffFallback };
-    })`,
-    {}
-  )(
-    (cn) => ({ patch: cn.diffStr, truncated: Boolean(cn.truncated) }),
-    (patch) => {
+  assert(revealMatch, "Missing updated DiffPanel sideRevealPatch injection");
+  const fallbackFns = loadRuntimeModule("inline-diff-ui").exports.createSideRevealHelpers({
+    extractToolPatch: (cn) => ({ patch: cn.diffStr, truncated: Boolean(cn.truncated) }),
+    parsePatch: (patch) => {
       if (!patch || !patch.includes("diff --git")) return null;
       const files = [...patch.matchAll(/diff --git a\/([^\s]+) b\/([^\s]+)/g)].map((m) => ({ name: m[2] }));
       return files.length ? { kind: "files", files } : { kind: "raw" };
     },
-    (fd) => fd.name
-  );
+    getFileName: (fd) => fd.name,
+  });
   assert.equal(fallbackFns.t3DiffMatchesTarget("nested/src/app.ts", "src/app.ts", "/repo"), false);
   assert.equal(fallbackFns.t3DiffMatchesTarget("src/App.ts", "src/app.ts", "/repo"), false);
   assert.equal(fallbackFns.t3DiffMatchesTarget("src/App.ts", "src/app.ts", "C:\\repo"), true);
@@ -1045,26 +1149,25 @@ function verifyInlineEditDetail(asar) {
   const uncollapsed = [];
   const scrolled = [];
   const revealRunner = runInNewContext(
-    `(function(t3RawZ, z, R, k, ai, K, Mi, ji, yt, M, t3GitMode) {
-      ${helpersMatch[0]}
-      const f = "/repo";
+    `(function(t3RawZ, V, B, ze, Ji, K, xa, ba, Ye, A, t3GitMode) {
+      const g = "/repo";
       let ${revealMatch[1]};
       let ${revealMatch[2]};
       ${revealMatch[3]};
-      return { Fn, In, path, li };
+      return { vr, yr, path, Qi };
     })`,
-    {}
+    { ...fallbackFns }
   );
-  const ai = [
+  const Ji = [
     { fileKey: "k1", fileDiff: { name: "src/a.ts" } },
     { fileKey: "k2", fileDiff: { name: "tests/b.test.ts" } },
   ];
-  const Mi = { current: null };
-  const ji = (e) => {
-    const idx = ai.findIndex((item) => item.fileDiff.name === e);
+  const xa = { current: null };
+  const ba = (e) => {
+    const idx = Ji.findIndex((item) => item.fileDiff.name === e);
     if (idx < 0) return false;
-    uncollapsed.push(ai[idx].fileKey);
-    scrolled.push(ai[idx].fileKey);
+    uncollapsed.push(Ji[idx].fileKey);
+    scrolled.push(Ji[idx].fileKey);
     return true;
   };
   const dpOut = revealRunner(
@@ -1072,17 +1175,17 @@ function verifyInlineEditDetail(asar) {
     null,
     { kind: "tool-call" },
     true,
-    ai,
+    Ji,
     "scope:1",
-    Mi,
-    ji,
+    xa,
+    ba,
     (p) => p.endsWith(".test.ts"),
     (fd) => fd.name,
     "turn"
   );
-  assert.equal(dpOut.Fn, "tests/b.test.ts");
+  assert.equal(dpOut.vr, "tests/b.test.ts");
   assert.equal(dpOut.path, "tests/b.test.ts");
-  assert.equal(dpOut.li(ai[1].fileDiff), true, "Revealed test file must not be hidden when diffHideTestFiles is enabled");
+  assert.equal(dpOut.Qi(Ji[1].fileDiff), true, "Revealed test file must not be hidden when diffHideTestFiles is enabled");
   assert.deepEqual(uncollapsed, ["k2"]);
   assert.deepEqual(scrolled, ["k2"]);
   // Single-file fallback even if filePath differs from git diff header name (non-fallback mode)
@@ -1091,10 +1194,10 @@ function verifyInlineEditDetail(asar) {
     { kind: "tool-call" },
     { kind: "tool-call" },
     false,
-    [ai[0]],
+    [Ji[0]],
     "scope:2",
     { current: null },
-    ji,
+    ba,
     () => false,
     (fd) => fd.name,
     null
@@ -1104,11 +1207,11 @@ function verifyInlineEditDetail(asar) {
 
   // Verify background review.* RPCs (review.getDiffPreview etc.) do not trigger the 15s slow-request warning toast
   const rtCode = findUniqueEntry(asar, inlineFileDiff.quietReviewToastPatch.targetRegex, inlineFileDiff.quietReviewToastPatch.id).content.toString("utf8");
-  const filterMatch = rtCode.match(/function b_\(e\)\{\/\* T3_QUIET_REVIEW_SLOW_TOAST_V1 \*\/[^}]+\}/);
+  const filterMatch = rtCode.match(/function vS\(e\)\{\/\* T3_QUIET_REVIEW_SLOW_TOAST_V1 \*\/[^}]+\}/);
   assert(filterMatch, "Missing quietReviewToastPatch filter in runtime bundle");
   const shouldWarnSlow = runInNewContext(
-    `${filterMatch[0]}\nb_`,
-    { h_: new Set(["server.getUsageSummary"]) }
+    `${filterMatch[0]}\nvS`,
+    { pS: new Set(["server.getUsageSummary"]) }
   );
   assert.equal(shouldWarnSlow("review.getDiffPreview"), false);
   assert.equal(shouldWarnSlow("review.getBranchCommits"), false);
@@ -1117,6 +1220,7 @@ function verifyInlineEditDetail(asar) {
 }
 
 function verifyLauncherAddress(asar) {
+  if (floatingRuntimeIsExternal(asar)) return verifyExternalFloatingRuntime(asar);
   const patch = workspaceFloatingPanels;
   const chat = findUniqueEntry(asar, patch.targetRegex, patch.id).content.toString("utf8");
   const openAddress = chat.match(/^function T3NavigateBrowser\([\s\S]+?^\}/m);
@@ -1127,9 +1231,9 @@ function verifyLauncherAddress(asar) {
     .replace(/export\{[^}]+\}[\s\S]*$/, "");
   const fakeSchema = () => {};
   const { C: resolve, S: template } = runInNewContext(resolver + "\n({ C, S })", {
-    URL, e: () => false,
-    a: () => () => class extends Error {},
-    i: null, t: fakeSchema, r: fakeSchema, n: fakeSchema, s: null, o: fakeSchema,
+    URL, s: () => false,
+    o: () => () => class extends Error {},
+    i: null, a: null, e: fakeSchema, t: fakeSchema, r: fakeSchema, n: fakeSchema,
   });
   const navigate = runInNewContext(openAddress[0] + "\nT3NavigateBrowser", {
     T3ResolveBrowserAddress: resolve,
@@ -1141,7 +1245,7 @@ function verifyLauncherAddress(asar) {
   assert.deepEqual(navigate("localhost:5173", open), [undefined, "http://localhost:5173/"]);
   assert.deepEqual(navigate(" 搜索 文件 ", open), [undefined, "https://search.example/?q=%E6%90%9C%E7%B4%A2%20%E6%96%87%E4%BB%B6"]);
   assert.throws(() => navigate("javascript:alert(1)", open));
-  assert.match(chat, /Kk\(\{threadRef:r,openPreview:k,url,\.\.\./);
+  assert.match(chat, /DA\(\{threadRef:r,openPreview:D,url,\.\.\./);
   assert.match(chat, /openPreview:e\.openPreview,threadRef:e\.threadRef,url:e\.url/);
 }
 
@@ -1158,19 +1262,39 @@ function findNodes(node, pred, out = []) {
 
 function verifyUsageRingsUX(asar) {
   const chat = findUniqueEntry(asar, usageRings.targetRegex, usageRings.id).content.toString("utf8");
-  assert.match(chat, /T3ComposerCtxProvider,\{canAttach:go,[^}]*providerInstanceId:Br,/);
-  assert.match(chat, /T3RingsCtxProvider,\{providerInstanceId:vs,/);
-  assert.match(chat, /providerTurns:Y\?\.providerTurns,activeProviderThreadId:Y\?\.thread\?\.activeProviderThreadId/);
-  assert.match(chat, /\.t3e-slider-fill \{[\s\S]*?z-index: 1;/);
-  assert.match(chat, /\.t3e-effort-tick \{[\s\S]*?z-index: 2;/);
-  assert.match(chat, /\.t3e-effort-tick\[data-filled="true"\]/);
-  assert.match(chat, /\.t3e-slider-thumb \{[\s\S]*?z-index: 3;/);
+  assert.match(chat, /T3ComposerCtxProvider,\{canAttach:Io,[^}]*providerInstanceId:oi,/);
+  assert.match(chat, /T3RingsCtxProvider,\{providerInstanceId:tc,/);
+  assert.match(chat, /providerTurns:q\?\.providerTurns,activeProviderThreadId:q\?\.thread\?\.activeProviderThreadId/);
+  const runtimeSource = fs.readFileSync(path.join(__dirname, "..", "lib", "runtime", "usage-rings-ui.mjs"), "utf8");
+  assert.match(runtimeSource, /\.t3e-slider-fill \{[\s\S]*?z-index: 1;/);
+  assert.match(runtimeSource, /\.t3e-effort-tick \{[\s\S]*?z-index: 2;/);
+  assert.match(runtimeSource, /\.t3e-effort-tick\[data-filled="true"\]/);
+  assert.match(runtimeSource, /\.t3e-slider-thumb \{[\s\S]*?z-index: 3;/);
 
-  const runtimeIdx = chat.indexOf(`/* ${usageRings.marker} */`);
-  const controlsStart = chat.indexOf("function T3UnifiedModelControls(", runtimeIdx);
-  const controlsEnd = chat.indexOf("\n}\n", controlsStart);
-  assert(runtimeIdx >= 0 && controlsStart > runtimeIdx && controlsEnd > controlsStart, "Missing usage-rings runtime module in patched _chat bundle");
-  const runtimeCode = chat.slice(runtimeIdx, controlsEnd + 2);
+  // The generated bridge must hand every host binding to the runtime. A missing or stale alias
+  // silently turns into `undefined` (or a wrong host export) only inside the user's app.
+  const bridgeMatch = chat.match(/\} = createUsageRingsRuntime\(\{([\s\S]*?)\n\}\);/);
+  assert(bridgeMatch, "Missing usage-rings runtime bridge in patched ThreadRouteView bundle");
+  const bridgeBindings = Object.fromEntries([...bridgeMatch[1].matchAll(/^\s*([\w$]+):\s*([\w$.]+),?$/gm)].map((m) => [m[1], m[2]]));
+  const hostDestructure = runtimeSource.match(/export function createUsageRingsRuntime\(host\) \{\s*const \{([\s\S]*?)\} = host;/);
+  assert(hostDestructure, "Could not read the usage-rings host contract");
+  const hostKeys = hostDestructure[1].split(",").map((s) => s.trim()).filter((s) => s && !s.includes("="));
+  assert(hostKeys.length > 40, "Host contract unexpectedly small");
+  for (const key of hostKeys) assert(bridgeBindings[key], `Usage-rings bridge does not bind host key ${key}`);
+  const paceTable = chat.match(/\b(?:var|let|const)\s+([\w$]+)=\{ahead:[^{}]*?`Ahead of pace`/);
+  assert(paceTable, "Missing the host pace label table");
+  assert.equal(bridgeBindings.paceLabels, paceTable[1], "paceLabels must be the host pace label table");
+  assert.notEqual(bridgeBindings.paceLabels, bridgeBindings.getLimitsUnavailable, "paceLabels and getLimitsUnavailable are different host bindings");
+  const { tokenize, parseImports } = require("../lib/js-ast.cjs");
+  const runtimeChunkLocals = new Set(
+    parseImports(tokenize(chat))
+      .filter((imp) => /(?:^|\/)runtime-[\w-]+\.js$/.test(imp.specifier))
+      .flatMap((imp) => imp.specifiers.map((s) => s.local))
+  );
+  for (const key of ["resolveAccountLimits", "getWindowLeftPct", "getWindowPace", "getWindowTimeLeft", "SkillIcon"]) {
+    assert(runtimeChunkLocals.has(bridgeBindings[key]), `${key} must be imported from the host runtime chunk, not a stale fallback name`);
+  }
+
   const jsx = (type, props) => ({ type, props: props || {} });
   let activeRingsCtx = null;
   let activeComposerCtx = null;
@@ -1181,59 +1305,81 @@ function verifyUsageRingsUX(asar) {
   let openArg = true;
   const memoSlots = [];
   let memoCursor = 0;
+  let paceMock = null;
+  let timeLeftMock = null;
 
+  // Globals the runtime module reads directly (the shipped asset runs in the page).
   const sandbox = {
     document: { getElementById: () => null, head: { appendChild() {} }, querySelector: () => ({}), createElement: () => ({ style: {}, set textContent(v) {} }) },
     window: { requestAnimationFrame: () => {} },
     navigator: {},
-    Z: {
-      Fragment: Symbol("Fragment"),
-      createContext: (def) => ({ _def: def }),
-      useContext: (ctx) => {
-        if (ctx === sandbox.T3ComposerCtx) return activeComposerCtx;
-        if (ctx === sandbox.T3ContextWindowCtx) return activeContextWindow;
-        if (ctx === sandbox.T3ThreadStatsCtx) return activeThreadStats;
-        return activeRingsCtx;
-      },
-      useState: (init) => {
-        const idx = stateCursor++;
-        if (!(idx in states)) states[idx] = typeof init === "function" ? init() : init;
-        return [states[idx], (v) => { states[idx] = typeof v === "function" ? v(states[idx]) : v; }];
-      },
-      useRef: (init) => ({ current: init }),
-      useEffect: () => {},
-      useMemo: (fn, deps) => {
-        const idx = memoCursor++;
-        const prev = memoSlots[idx];
-        const same = prev && Array.isArray(deps) && prev.deps && deps.length === prev.deps.length && deps.every((d, i) => Object.is(d, prev.deps[i]));
-        if (same) return prev.val;
-        const val = fn();
-        memoSlots[idx] = { deps, val };
-        return val;
-      },
-      useCallback: (fn, deps) => sandbox.Z.useMemo(() => fn, deps),
-    },
-    $: { jsx, jsxs: jsx },
-    U: () => null,
-    AU: null, Ip: () => () => "", kt: () => (v) => String(v), zt: () => (v) => v, Ny: () => "2026-11-25T00:00", Ye: () => "en-US",
-    TC: () => null,
-    U_: (w) => Math.max(0, 100 - (w.usedPercent ?? 0)),
-    Y_: () => null, K_: () => null, wC: () => "2h", zp: () => "",
-    J_: () => null,
-    fr: () => ({ selectDescriptors: [], booleanDescriptors: [], selectValue: () => "high" }),
-    rz: () => ({ effort: { kind: "select", descriptor: { id: "reasoning", defaultValue: "medium" } } }),
-    nz: () => ({ speedSelect: null, fastToggle: null }),
-    Jr: () => [{ id: "low", label: "Low" }, { id: "medium", label: "Medium" }, { id: "high", label: "High" }, { id: "max", label: "Max" }],
-    Xn: () => true, px: "px", el: "PopoverRoot", Qc: "PopoverTrigger", Zc: "PopoverContent", tp: "Link",
-    SH: "Section", jU: "Row", jn: "TipRoot", an: "TipTrig", Zt: "TipContent", za: "PlusIcon",
-    GP: String,
-    qI: () => {},
   };
-
-  runInNewContext(
-    runtimeCode + "\nObject.assign(globalThis, { T3RingsCtx, T3ComposerCtx, T3ContextWindowCtx, T3ThreadStatsCtx, T3RingsCtxProvider, T3ComposerCtxProvider, T3ComposerPlusMenu, T3EffortSlider, T3ComposerQuotaRing, T3QuotaPopoverCard, T3ComposerContextRing, T3ContextPopoverCard, T3UnifiedModelControls });",
-    sandbox
-  );
+  const React = {
+    createContext: (def) => ({ _def: def }),
+    useContext: (ctx) => {
+      if (ctx === sandbox.T3ComposerCtx) return activeComposerCtx;
+      if (ctx === sandbox.T3ContextWindowCtx) return activeContextWindow;
+      if (ctx === sandbox.T3ThreadStatsCtx) return activeThreadStats;
+      return activeRingsCtx;
+    },
+    useState: (init) => {
+      const idx = stateCursor++;
+      if (!(idx in states)) states[idx] = typeof init === "function" ? init() : init;
+      return [states[idx], (v) => { states[idx] = typeof v === "function" ? v(states[idx]) : v; }];
+    },
+    useRef: (init) => ({ current: init }),
+    useEffect: () => {},
+    useMemo: (fn, deps) => {
+      const idx = memoCursor++;
+      const prev = memoSlots[idx];
+      const same = prev && Array.isArray(deps) && prev.deps && deps.length === prev.deps.length && deps.every((d, i) => Object.is(d, prev.deps[i]));
+      if (same) return prev.val;
+      const val = fn();
+      memoSlots[idx] = { deps, val };
+      return val;
+    },
+    useCallback: (fn, deps) => React.useMemo(() => fn, deps),
+  };
+  const host = {
+    React,
+    jsx,
+    jsxs: jsx,
+    Fragment: Symbol("Fragment"),
+    useI18n: () => (v) => v,
+    useFormatMessage: () => (v) => String(v),
+    useLocale: () => "en-US",
+    useMinuteNow: () => "2026-11-25T00:00",
+    useSettingsSelector: () => () => "",
+    timestampFormatSelector: null,
+    formatCompactTokens: String,
+    formatDuration: () => "2h",
+    formatTimestamp: () => "",
+    paceLabels: { ahead: "Ahead of pace", on: "On pace", under: "Under pace" },
+    resolveAccountLimits: () => null,
+    getLimitsUnavailable: () => null,
+    getWindowLeftPct: (w) => Math.max(0, 100 - (w.usedPercent ?? 0)),
+    getWindowPace: () => paceMock,
+    getWindowTimeLeft: () => timeLeftMock,
+    DetailsSection: "Section",
+    DetailsRow: "Row",
+    Link: "Link",
+    Tooltip: "TipRoot",
+    TooltipTrigger: "TipTrig",
+    TooltipPopup: "TipContent",
+    Popover: "PopoverRoot",
+    PopoverTrigger: "PopoverTrigger",
+    PopoverPopup: "PopoverContent",
+    PlusIcon: "PlusIcon",
+    ProviderIcon: "Yd",
+    composerDraftStore: () => null,
+    useModelTraits: () => ({ selectDescriptors: [], booleanDescriptors: [], selectValue: () => "high" }),
+    findEffortTrait: () => ({ effort: { kind: "select", descriptor: { id: "reasoning", defaultValue: "medium" } } }),
+    findSpeedTrait: () => ({ speedSelect: null, fastToggle: null }),
+    getSelectChoices: () => [{ id: "low", label: "Low" }, { id: "medium", label: "Medium" }, { id: "high", label: "High" }, { id: "max", label: "Max" }],
+    isProviderReady: () => true,
+    preventDefault: () => {},
+  };
+  Object.assign(sandbox, loadRuntimeModule("usage-rings-ui", sandbox).exports.createUsageRingsRuntime(host));
 
   // 0) Context providers keep stable === value references across unrelated renders, and closed popovers omit heavy body JSX
   memoCursor = 0;
@@ -1561,20 +1707,20 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
   // 1) Verify no-telemetry across all 4 targets
   const rl = findUniqueEntry(verifiedAsar, noTelemetry.targetRegex, noTelemetry.id).content.toString("utf8");
   assert(rl.includes(noTelemetry.marker), "Missing T3_NO_TELEMETRY_V1 marker in runtimeLayer");
-  assert(!rl.includes('enabled: Boolean$2("T3CODE_TELEMETRY_ENABLED").pipe(withDefault(true))'));
-  assert(rl.includes('enabled: Boolean$2("T3CODE_TELEMETRY_ENABLED").pipe(withDefault(false))'));
-  assert(!rl.includes("upsertAnonymousId.pipe("), "getTelemetryIdentityForHome must not invoke upsertAnonymousId");
-  assert(!rl.includes('path.join(homeDirectory, ".claude.json")'), "readProviderLogins must not read .claude.json");
-  assert(!rl.includes('path.join(homeDirectory, ".codex", "auth.json")'), "readProviderLogins must not read .codex/auth.json");
+  assert(!rl.includes('enabled: Boolean$1("T3CODE_TELEMETRY_ENABLED").pipe(option)'));
+  assert(rl.includes('enabled: Boolean$1("T3CODE_TELEMETRY_ENABLED").pipe(withDefault(false))'));
+  assert(!rl.includes("writeFileStringAtomically({\n\t\tfilePath: anonymousIdPath"), "getTelemetryIdentity must not persist anonymousId");
+  assert(!rl.includes("Failed to read the linked T3 Connect account for telemetry"), "getServerOwners must not read linked connect account");
 
   // Run patched Identify + AnalyticsService generator stubs in VM to verify zero side effects
-  const idStart = rl.indexOf('const readProviderLogins = fn("TelemetryIdentity.readProviderLogins")');
-  const idEnd = rl.indexOf("\nconst getServerOwners = ", idStart);
-  const asStart = rl.indexOf("const make$32 = gen$1(function* () {\n\t/* T3_NO_TELEMETRY_V1 */");
-  const asEnd = rl.indexOf("\nconst layer$49 = ", asStart);
-  assert(idStart >= 0 && idEnd > idStart && asStart >= 0 && asEnd > asStart, "Missing patched telemetry blocks");
-  assert(!rl.slice(asStart, asEnd).includes("httpClient.execute"), "AnalyticsService make$32 must not retain sendBatch httpClient execution");
-  assert(!rl.slice(asStart, asEnd).includes("posthogHost"), "AnalyticsService make$32 must not reference posthogHost");
+  const idStart = rl.indexOf("const getTelemetryIdentity = gen$1(function* () {");
+  const ownersStart = rl.indexOf("const getServerOwners = gen$1(function* () {");
+  const ownersEnd = rl.indexOf("});", ownersStart) + 3;
+  const asStart = rl.indexOf("const make$44 = gen$1(function* () {\n\t/* T3_NO_TELEMETRY_V1 */");
+  const asEnd = rl.indexOf("\nconst layer$56 = ", asStart);
+  assert(idStart >= 0 && ownersStart > idStart && asStart >= 0 && asEnd > asStart, "Missing patched telemetry blocks");
+  assert(!rl.slice(asStart, asEnd).includes("httpClient.execute"), "AnalyticsService make$44 must not retain sendBatch httpClient execution");
+  assert(!rl.slice(asStart, asEnd).includes("posthogHost"), "AnalyticsService make$44 must not reference posthogHost");
   let secretReads = 0;
   const runGen = (g) => {
     const it = g();
@@ -1582,25 +1728,24 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
     while (!step.done) step = it.next();
     return step.value;
   };
+  const voidIdent = rl.slice(asStart, asEnd).match(/flush:\s*(void_[\w$]*)/)?.[1];
+  assert(voidIdent, "Patched AnalyticsService must expose a void flush effect");
   const telemetrySandbox = {
-    fn: () => (genFn) => () => runGen(genFn),
     gen$1: (genFn) => () => runGen(genFn),
-    none$1: () => ({ _tag: "None" }),
-    flatMap: () => () => [],
-    HomeDirectory: "HOME",
-    void_: { _tag: "Void" },
+    [voidIdent]: { _tag: "Void" },
     AnalyticsService: { of: (impl) => impl },
     ServerSecretStore: { get: () => { secretReads++; return []; } },
   };
   runInNewContext(
-    rl.slice(idStart, idEnd) + "\n" + rl.slice(asStart, asEnd) + "\nObject.assign(globalThis, { readProviderLogins, getTelemetryIdentityForHome, getServerOwnersForHome, make$32 });",
+    rl.slice(idStart, rl.indexOf("});", idStart) + 3) + "\n" +
+    rl.slice(ownersStart, ownersEnd) + "\n" +
+    rl.slice(asStart, asEnd) + "\nObject.assign(globalThis, { getTelemetryIdentity, getServerOwners, make$44 });",
     telemetrySandbox
   );
-  assert.equal(JSON.stringify(telemetrySandbox.readProviderLogins()), JSON.stringify({ codexTokens: { _tag: "None" }, claudeJson: { _tag: "None" } }));
-  assert.equal(JSON.stringify(telemetrySandbox.getTelemetryIdentityForHome()), JSON.stringify({ distinctId: null, installId: null }));
-  assert.equal(JSON.stringify(telemetrySandbox.getServerOwnersForHome()), "[]");
+  assert.equal(JSON.stringify(telemetrySandbox.getTelemetryIdentity()), JSON.stringify({ distinctId: null, installId: null }));
+  assert.equal(JSON.stringify(telemetrySandbox.getServerOwners()), "[]");
   assert.equal(secretReads, 0);
-  const svc = telemetrySandbox.make$32();
+  const svc = telemetrySandbox.make$44();
   assert.equal(svc.record("any.event", {})._tag, "Void");
   assert.equal(svc.flush._tag, "Void");
   assert.equal(svc.recordOwners([], "server")._tag, "Void");
@@ -1611,7 +1756,7 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
 
   // Client Axiom exporter disabled
   const utils = findUniqueEntry(verifiedAsar, noTelemetry.clientPatch.targetRegex, noTelemetry.clientPatch.id).content.toString("utf8");
-  assert(utils.includes("function CE(){/* T3_NO_TELEMETRY_CLIENT_V1 */return Co(hE,lr())}"));
+  assert(utils.includes("function jE(){/* T3_NO_TELEMETRY_CLIENT_V1 */return wt(SE,uc())}"));
   assert(!utils.includes("headers:{Authorization:`Bearer ${e.tracesToken}`"), "Axiom OTLP exporter body must be stripped");
 
   // Settings UI privacy description updated
@@ -1629,12 +1774,15 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
 
   const cleanPlan = resolveInstallPlan(ALL_PATCHES, { preset: "clean" });
   assert.deepEqual(cleanPlan.packIds, ["theme", "privacy"]);
-  assert.equal(cleanPlan.selectedPatches.length, 4);
+  const privacyPatchIds = PACKS.find((p) => p.id === "privacy").patchIds;
+  assert(privacyPatchIds.includes("no-telemetry-desktop"), "Privacy pack must cover the desktop main-process telemetry patch");
+  for (const id of privacyPatchIds) assert(ALL_PATCHES.some((p) => p.id === id), `Privacy pack references unknown patch ${id}`);
+  assert.equal(cleanPlan.selectedPatches.length, privacyPatchIds.length);
   assert.equal(cleanPlan.includeTheme, true);
 
   const privOnlyPlan = resolveInstallPlan(ALL_PATCHES, { preset: "privacy-only" });
   assert.equal(privOnlyPlan.includeTheme, false);
-  assert.equal(privOnlyPlan.selectedPatches.length, 4);
+  assert.equal(privOnlyPlan.selectedPatches.length, privacyPatchIds.length);
 
   const themeOnlyPlan = resolveInstallPlan(ALL_PATCHES, { preset: "theme-only" });
   assert.equal(themeOnlyPlan.includeTheme, true);
@@ -1658,16 +1806,16 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
   // Verify new-chat-layout preserves trailing permissions when usage-rings is NOT applied
   const baselineChat = findUniqueEntry(baselineAsar, newChatLayout.targetRegex, "chat-base").content.toString("utf8");
   const layoutWithoutComposer = newChatLayout.apply(baselineChat);
-  assert(layoutWithoutComposer.includes("trailing:(0,$.jsx)(sF,"), "new-chat-layout must preserve trailing permissions when usage-rings is omitted");
+  assert(layoutWithoutComposer.includes("trailing:(0,$.jsx)(BF,"), "new-chat-layout must preserve trailing permissions when usage-rings is omitted");
 
   // Verify sidebar-new-chat guards null/negative activeSearchResultIndex
   const mainJs = findUniqueEntry(verifiedAsar, sidebarNewChat.targetRegex, sidebarNewChat.id).content.toString("utf8");
   assert(mainJs.includes('typeof g === "number" && g >= 0 && g < h'));
 
   // Verify workspace-floating-panels Alt+S uses ev.code === "KeyS" (macOS Option+S compatibility)
-  const patchedChat = findUniqueEntry(verifiedAsar, newChatLayout.targetRegex, "chat-patched").content.toString("utf8");
+  const patchedChat = hostWithRuntime(verifiedAsar, newChatLayout, "chat-patched").combined;
   assert(patchedChat.includes('ev.code === "KeyS"'));
-  const patchedTabBar = findUniqueEntry(verifiedAsar, workspaceFloatingPanels.tabBarPatch.targetRegex, "tab-bar-patched").content.toString("utf8");
+  const patchedTabBar = hostWithRuntime(verifiedAsar, workspaceFloatingPanels.tabBarPatch, "tab-bar-patched").combined;
   assert(patchedTabBar.includes("rootRef.current.getClientRects().length === 0"));
 
   // 3) Verify macOS helper functions cross-platform (no Mac hardware required)
@@ -1711,53 +1859,58 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
 }
 
 function verifySameFileFolding(asar) {
-  // 1) Patched session-logic Be/ce deduplicates repeated reads (including Windows backslash/Path keys) & edits
+  // 1) Patched session-logic We/ce deduplicates repeated reads (including Windows backslash/Path keys) & edits
   const slCode = findUniqueEntry(asar, timelineCollapse.summaryPatch.targetRegex, timelineCollapse.summaryPatch.id).content.toString("utf8");
-  const ceMatch = slCode.match(/function y\(e\)\{[\s\S]+?function w\(e\)\{[\s\S]+?\}/);
-  const beMatch = slCode.match(/function Be\(e,t\)\{\/\* T3_TIMELINE_SUMMARY_V\d+ \*\/[\s\S]+?\n?\}(?=function Ve\()/);
-  assert(ceMatch && beMatch, "Missing patched session-logic path extractor or Be counter");
+  const ceMatch = slCode.match(/var ce=\[[^\]]+\];function w\(e,t,n,r\)\{[\s\S]+?function T\(e\)\{[\s\S]+?\}/);
+  const beMatch = slCode.match(/function We\(e,t\)\{\/\* T3_TIMELINE_SUMMARY_V\d+ \*\/[\s\S]+?\n?\}(?=function Ge\()/);
+  assert(ceMatch && beMatch, "Missing patched session-logic path extractor or We counter");
   const slCtx = runInNewContext(
-    ceMatch[0] + "\n" + beMatch[0] + "\n({ w, Be })",
+    ceMatch[0] + "\n" + beMatch[0] + "\n({ T, We })",
     {
-      se: (x) => Boolean(x && Object.keys(x).length > 0),
+      x: (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : null),
+      S: (v) => (typeof v === "string" && v.trim() ? v.trim() : null),
       V: (x) => x.toolData?.input ?? x.structuredPayload?.input,
-      Le: (x) => x.detail ?? null,
+      Be: (x) => x.detail ?? null,
     }
   );
-  assert.deepEqual([...slCtx.w({ input: { Path: "C:\\proj\\foo.js" } })], ["C:\\proj\\foo.js"]);
-  const readCount = slCtx.Be("read", [
+  assert.deepEqual([...slCtx.T({ input: { Path: "C:\\proj\\foo.js" } })], ["C:\\proj\\foo.js"]);
+  const readCount = slCtx.We("read", [
     { toolData: { input: { Path: "C:\\proj\\foo.js", StartLine: 1, EndLine: 50 } } },
     { toolData: { input: { file_path: "c:/proj/foo.js", StartLine: 51, EndLine: 100 } } },
     { detail: "C:\\proj\\bar.js" },
   ]);
   assert.equal(readCount, 2, "Repeated reads of the same file must count as 1 unique file");
-  const editCount = slCtx.Be("edit", [
+  const editCount = slCtx.We("edit", [
     { changedFiles: ["src\\a.ts"] },
     { changedFiles: ["./src/a.ts"] },
   ]);
   assert.equal(editCount, 1);
 
-  // 2) Patched useTimelineFollow T3SameFileGroup renders collapsed row and expands child D_ entries on click
-  const utCode = findUniqueEntry(asar, timelineCollapse.targetRegex, timelineCollapse.id).content.toString("utf8");
+  // 2) Patched ReadOnlyThreadTimeline T3SameFileGroup renders collapsed row and expands child Ch entries on click
+  const utHost = hostWithRuntime(asar, timelineCollapse, timelineCollapse.id);
+  const utCode = utHost.text;
+  const timelineAsset = utHost.assets.find((a) => /\/t3e-timeline-ui-[0-9a-f]{8}\.js$/.test(a.key));
+  assert(timelineAsset, "Patched timeline host must import the external timeline runtime asset");
+  assert(/import\s*\{[^}]*\bcreateTimelineRuntime\b[^}]*\}\s*from\s*"\.\/t3e-timeline-ui-[0-9a-f]{8}\.js"/.test(utCode), "Host must import createTimelineRuntime from the t3e asset");
+  assert(/createTimelineRuntime\(\{\s*React:/.test(utCode), "Host must emit the createTimelineRuntime bridge");
+  assert(!utCode.includes("function disclosureIds("), "Timeline runtime helpers must live in the external asset, not the host chunk");
+  assert(timelineAsset.text.includes("function disclosureIds("), "Timeline asset must define the disclosure helpers");
   assert(
-    utCode.includes("t3RenderSameFileChildren(i,o)") && utCode.includes("var R_=(0,Z.memo)(") && utCode.includes("(0,Z.useMemo)(()=>t3RenderSameFileChildren(i,o),[i,o])"),
-    "Patched R_ must memoize t3RenderSameFileChildren"
+    utCode.includes("t3RenderSameFileChildren(i,o)") && utCode.includes("var Ph=(0,$.memo)(") && utCode.includes("(0,$.useMemo)(()=>t3RenderSameFileChildren(i,o),[i,o])"),
+    "Patched Ph must memoize t3RenderSameFileChildren"
   );
-  const helperStart = utCode.indexOf("function disclosureIds(");
-  assert(helperStart >= 0, "Missing timeline-collapse helper functions");
-  const helperCode = utCode.slice(helperStart);
   const expandedSet = new Set();
   const toggledCalls = [];
   let expandedState = false;
   const jsx = (type, props) => ({ type, props: props || {} });
-  const tlSandbox = {
+  const tlGlobals = {
     document: { documentElement: { lang: "zh-CN" } },
     navigator: { language: "zh-CN" },
-    Cd: { _id: "cd" },
-    xd: { _id: "xd" },
-    Z: {
+    su: { _id: "su" },
+    au: { _id: "au" },
+    $: {
       Fragment: Symbol("Fragment"),
-      use: (ctx) => (ctx._id === "cd"
+      use: (ctx) => (ctx._id === "su"
         ? { state: { expandedEntries: expandedSet }, onToggleEntry: (wasOpen, id) => toggledCalls.push({ wasOpen, id }) }
         : { timestampFormat: "short" }),
       useState: (init) => {
@@ -1765,20 +1918,40 @@ function verifySameFileFolding(asar) {
         return [expandedState, (v) => { expandedState = typeof v === "function" ? v(expandedState) : v; }];
       },
     },
-    $: { jsx, jsxs: jsx },
-    J: () => (s) => s,
-    ws: () => false,
-    fs: (e) => e.action,
-    ym: () => [],
-    ds: () => null,
-    Xr: (p) => String(p).replaceAll("\\", "/"),
-    Zf: "WorkRow",
-    Vp: "WorkIcon",
-    Nt: "ChevronRight",
-    uc: "Timestamp",
-    D_: "WorkEntryRow",
+    Q: { Fragment: Symbol("Fragment"), jsx, jsxs: jsx },
+    we: () => (s) => s,
+    Ln: () => false,
+    Dn: (e) => e.action,
+    Wn: () => [],
+    Mn: () => null,
+    Ur: (p) => String(p).replaceAll("\\", "/"),
+    Xl: "WorkRow",
+    fu: "WorkIcon",
+    oa: "ChevronRight",
+    xi: "Timestamp",
+    Ch: "WorkEntryRow",
   };
-  runInNewContext(helperCode + "\nObject.assign(globalThis, { t3RenderSameFileChildren, T3SameFileGroup });", tlSandbox);
+  // The runtime is the shipped asset source, wired exactly like the generated createTimelineRuntime bridge.
+  assert.equal(timelineAsset.text, fs.readFileSync(path.join(__dirname, "..", "lib", "runtime", "timeline-ui.mjs"), "utf8"));
+  const tlSandbox = loadRuntimeModule("timeline-ui", { document: tlGlobals.document, navigator: tlGlobals.navigator }).exports.createTimelineRuntime({
+    React: tlGlobals.$,
+    jsx: tlGlobals.Q.jsx,
+    jsxs: tlGlobals.Q.jsxs,
+    Fragment: tlGlobals.Q.Fragment,
+    workGroupCtx: tlGlobals.su,
+    timelineCtx: tlGlobals.au,
+    useI18n: tlGlobals.we,
+    isEntryFailed: tlGlobals.Ln,
+    getAction: tlGlobals.Dn,
+    extractPaths: tlGlobals.Wn,
+    extractReadDetailPath: tlGlobals.Mn,
+    resolveRelPath: tlGlobals.Ur,
+    WorkRow: tlGlobals.Xl,
+    WorkIcon: tlGlobals.fu,
+    ChevronRight: tlGlobals.oa,
+    Timestamp: tlGlobals.xi,
+    WorkEntryRow: tlGlobals.Ch,
+  });
 
   const rawReads = [
     { id: "r1", action: "read", createdAt: "2026-11-25T05:00:00Z", toolLifecycleStatus: "completed", structuredPayload: { type: "dynamic_tool", input: { Path: "src\\a.ts", StartLine: 1, EndLine: 80 } } },
@@ -1791,7 +1964,7 @@ function verifySameFileFolding(asar) {
   assert.equal(nodes[1].type, "WorkEntryRow");
 
   let groupTree = tlSandbox.T3SameFileGroup(nodes[0].props);
-  assert.equal(groupTree.props["aria-expanded"], false);
+  assert.equal(groupTree.props.toggle["aria-expanded"], false);
   assert.equal(groupTree.props.children, null);
   assert.match(JSON.stringify(groupTree.props.label), /已读取 src\/a\.ts.*2 次读取.*L1-80, L81-160/);
 
@@ -1799,7 +1972,7 @@ function verifySameFileFolding(asar) {
   assert.equal(expandedSet.has("r1:file-fold"), true);
   assert.deepEqual(toggledCalls, [{ wasOpen: false, id: "r1:file-fold" }]);
   groupTree = tlSandbox.T3SameFileGroup(nodes[0].props);
-  assert.equal(groupTree.props["aria-expanded"], true);
+  assert.equal(groupTree.props.toggle["aria-expanded"], true);
   assert.equal(groupTree.props.children.props.children.length, 2);
 
   // Clicking or pointer-pressing inside a child row must never bubble up and collapse T3SameFileGroup
@@ -1952,12 +2125,15 @@ function verifyDesktopTray(desktopAsar) {
 }
 
 function verifyFilesChangesExplorer(asar) {
-  const feCode = findUniqueEntry(asar, filesChangesExplorer.targetRegex, filesChangesExplorer.id).content.toString("utf8");
-  assert(feCode.includes(filesChangesExplorer.marker), "Missing files-changes-explorer marker");
+  const feHost = hostWithRuntime(asar, filesChangesExplorer, filesChangesExplorer.id);
+  const feAsset = feHost.assets.find((a) => /\/t3e-files-explorer-ui-[0-9a-f]{8}\.js$/.test(a.key));
+  assert(feAsset, "files-changes-explorer host must import the external files-explorer runtime asset");
+  assert(/import\s*\{\s*createFilesExplorerRuntime\s*\}\s*from\s*"\.\/t3e-files-explorer-ui-[0-9a-f]{8}\.js"/.test(feHost.text), "Host must import createFilesExplorerRuntime");
+  assert(!feHost.text.includes("function T3FilesChangesLayout("), "Layout component must live in the external asset");
+  const feCode = feHost.combined;
+  assert(feHost.text.includes(filesChangesExplorer.marker), "Missing files-changes-explorer marker");
   assert(feCode.includes('style: showChangesSplit && !allFilesOpen ? { display: "none" } : undefined'), "All files tree must stay mounted when collapsed");
   assert(feCode.includes('className: "t3e-fe-file-main"'), "Changed file row must expose native button separate from diff badge");
-  const idx = feCode.indexOf(`/* ${filesChangesExplorer.marker} */`);
-  assert(idx >= 0);
   let gitCalls = 0;
   let treeScans = 0;
   let changesOpen = true;
@@ -1967,22 +2143,22 @@ function verifyFilesChangesExplorer(asar) {
     treeScans++;
     return Array.prototype[Symbol.iterator].call(this);
   };
-  const { t3BuildChangedFileTree, T3FeChangedTreeNodes, T3FilesChangesLayout } = runInNewContext(
-    feCode.slice(idx) + "\n({ t3BuildChangedFileTree, T3FeChangedTreeNodes, T3FilesChangesLayout })",
-    {
-      $: { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) },
-      Z: {
-        Fragment: Symbol("Fragment"),
-        useState: (i) => [stateCursor++ === 0 ? changesOpen : i, () => {}],
-        useEffect() {},
-        useMemo: (f) => f()
-      },
-      t3GitQueries: { status: () => { gitCalls++; return true; } },
-      t3UseQuery: (atom) => ({ data: atom ? { workingTree: { files } } : null }),
-      t3DiffPanelStore: { getState: () => ({ selectGitScope() {} }) },
-      t3RightPanelStore: { getState: () => ({ open() {} }) },
-    }
-  );
+  assert.equal(feAsset.text, fs.readFileSync(path.join(__dirname, "..", "lib", "runtime", "files-explorer-ui.mjs"), "utf8"));
+  const feJsx = (type, props) => ({ type, props });
+  const { t3BuildChangedFileTree, T3FeChangedTreeNodes, T3FilesChangesLayout } = loadRuntimeModule("files-explorer-ui").exports.createFilesExplorerRuntime({
+    React: {
+      Fragment: Symbol("Fragment"),
+      useState: (i) => [stateCursor++ === 0 ? changesOpen : i, () => {}],
+      useEffect() {},
+      useMemo: (f) => f(),
+    },
+    jsx: feJsx,
+    jsxs: feJsx,
+    gitQueries: { status: () => { gitCalls++; return true; } },
+    useQuery: (atom) => ({ data: atom ? { workingTree: { files } } : null }),
+    diffPanelStore: { getState: () => ({ selectGitScope() {} }) },
+    rightPanelStore: { getState: () => ({ open() {} }) },
+  });
   const tree = t3BuildChangedFileTree([
     { path: "./src\\a.ts", insertions: 2, deletions: 0 },
     { path: "src/a.ts", insertions: 2, deletions: 0 },
@@ -2017,6 +2193,335 @@ function verifyFilesChangesExplorer(asar) {
   assert.equal(treeScans, 1, "A collapsed changes pane skips rebuilding its file tree");
 }
 
+function verifyNoTelemetryDesktop(desktopAsar) {
+  const patch = noTelemetry.desktopPatch;
+  const main = findUniqueEntry(desktopAsar, patch.targetRegex, patch.id).content.toString("utf8");
+  const start = main.indexOf(`/* ${patch.marker} */`);
+  assert(start >= 0, "Missing no-telemetry-desktop marker in main.cjs");
+  assert(main.indexOf(`/* ${desktopTray.marker} */`) > start, "no-telemetry-desktop must coexist with desktop-tray in the same main.cjs");
+  const end = main.indexOf("})();", start) + "})();".length;
+  assert(end > start + 10, "Could not isolate the injected no-telemetry-desktop IIFE");
+  const snippet = main.slice(start, end);
+  const env = {};
+  const registrations = [];
+  let requires = 0;
+  const electron = {
+    app: { whenReady: () => ({ then(fn) { fn(); return { catch() {} }; } }) },
+    session: { defaultSession: { webRequest: { onBeforeRequest: (filter, handler) => registrations.push({ filter, handler }) } } },
+  };
+  const context = createContext({
+    process: { env },
+    require: (id) => {
+      assert.equal(id, "electron");
+      requires++;
+      return electron;
+    },
+  });
+  runInContext(snippet, context);
+  assert.equal(env.T3CODE_TELEMETRY_ENABLED, "false");
+  assert.equal(env.T3CODE_OTEL_SDK_DISABLED, "true");
+  assert.equal(registrations.length, 1, "onBeforeRequest must be registered exactly once");
+  const urls = [...registrations[0].filter.urls];
+  assert(urls.some((u) => u.includes("posthog.com")), "PostHog URL filter missing");
+  assert(urls.some((u) => u.includes("axiom.co")), "Axiom URL filter missing");
+  let verdict = null;
+  registrations[0].handler({ url: "https://us.i.posthog.com/e/" }, (result) => { verdict = result; });
+  assert.deepEqual({ ...verdict }, { cancel: true }, "Telemetry requests must be cancelled");
+  runInContext(snippet, context);
+  assert.equal(registrations.length, 1, "The IIFE must be idempotent");
+  assert.equal(requires, 1);
+  const standalone = patch.apply(`"use strict";\nconst x = 1;\n`);
+  assert(standalone.startsWith(`"use strict";`) && standalone.includes(patch.marker) && standalone.endsWith("const x = 1;\n"), "Standalone apply must keep the use-strict directive first");
+}
+
+// ---------------------------------------------------------------------------
+// Suite 17: synthetic v0.1.99 mutants of the pristine v0.1.12 archives.
+// ---------------------------------------------------------------------------
+const MUTANT_VERSION = "0.1.99";
+const DESKTOP_MAIN_KEY = "apps/desktop/dist-electron/main.cjs";
+// Patches without a semantic targetSpec pin one exact build hash and can never auto-adapt to a new T3 Code version.
+// They are excluded from the per-module checks below and reported as one explicit failure at the end of Suite 17.
+const hashOnlyPatchIds = new Set(ALL_PATCHES.filter((p) => !p.targetSpec || p.crossVersion === false).map((p) => p.id));
+const adaptablePatches = (patches) => patches.filter((p) => !hashOnlyPatchIds.has(p.id));
+
+function packAsarHeader(header) {
+  const json = Buffer.from(JSON.stringify(header));
+  const padded = Math.ceil(json.length / 4) * 4;
+  const prefix = Buffer.alloc(16 + padded);
+  [4, 8 + padded, 4 + padded, json.length].forEach((size, i) => prefix.writeUInt32LE(size, i * 4));
+  json.copy(prefix, 16);
+  return prefix;
+}
+
+function moveHeaderEntry(header, fromKey, toKey) {
+  const dirOf = (key) => key.split("/").slice(0, -1).reduce((node, seg) => node.files[seg], header);
+  const fromDir = dirOf(fromKey);
+  const toDir = dirOf(toKey);
+  const fromName = fromKey.split("/").pop();
+  const toName = toKey.split("/").pop();
+  assert(fromDir.files[fromName] && !toDir.files[toName], `Cannot rename ASAR entry ${fromKey}`);
+  toDir.files[toName] = fromDir.files[fromName];
+  delete fromDir.files[fromName];
+}
+
+function scanIdentifier(text, name, replacement) {
+  const isIdent = (ch) => ch !== undefined && /[\w$]/.test(ch);
+  let out = "";
+  let pos = 0;
+  let count = 0;
+  for (let i = text.indexOf(name); i >= 0; i = text.indexOf(name, i + name.length)) {
+    if (isIdent(text[i - 1]) || isIdent(text[i + name.length])) continue;
+    out += text.slice(pos, i) + (replacement ?? name);
+    pos = i + name.length;
+    count++;
+  }
+  return { text: out + text.slice(pos), count };
+}
+
+function renameIdentifier(text, from, to) {
+  assert.equal(scanIdentifier(text, to).count, 0, `Mutation target ${to} must not already exist`);
+  const result = scanIdentifier(text, from, to);
+  assert(result.count > 0, `Identifier ${from} not found for mutation`);
+  return result.text;
+}
+
+function replaceAllLiteral(text, from, to) {
+  assert(text.includes(from), `Missing literal ${from} for mutation`);
+  return text.split(from).join(to);
+}
+
+const bumpVersion = (text) => text.replace(/("(?:version|buildVersion)"\s*:\s*")0\.1\.12(")/g, (m, head, tail) => head + MUTANT_VERSION + tail);
+// Keep a leading shebang first so the mutated chunk stays valid.
+const addBanner = (text) => {
+  const banner = `/* t3code v${MUTANT_VERSION} build banner */\n`;
+  if (!text.startsWith("#!")) return banner + text;
+  const lineEnd = text.indexOf("\n") + 1;
+  return text.slice(0, lineEnd) + banner + text.slice(lineEnd);
+};
+
+// Rebuild an archive with edited entries (all other bytes verified identical) and renamed chunk files.
+// Renamed chunks also get every importer rewritten so the mutant stays internally consistent.
+function writeMutatedAsar(baseAsar, outputPath, { edits, renames = [] }) {
+  const texts = new Map();
+  const current = (key) => {
+    if (!texts.has(key)) {
+      const rec = baseAsar.byKey.get(key);
+      assert(rec, `Missing ASAR entry to mutate: ${key}`);
+      texts.set(key, entryText(baseAsar, rec));
+    }
+    return texts.get(key);
+  };
+  for (const [key, transforms] of edits) {
+    for (const transform of transforms) texts.set(key, transform(current(key)));
+    assert.notEqual(texts.get(key), entryText(baseAsar, baseAsar.byKey.get(key)), `Mutation must change ${key}`);
+  }
+  for (const [fromKey, toKey] of renames) {
+    const oldName = path.posix.basename(fromKey);
+    const newName = path.posix.basename(toKey);
+    const needle = Buffer.from(oldName);
+    for (const rec of baseAsar.entries) {
+      if (!/\.(?:m?js|cjs)$/.test(rec.key) || rec.key === fromKey) continue;
+      const offset = Number(rec.entry.offset);
+      if (!texts.has(rec.key) && !baseAsar.body.subarray(offset, offset + rec.entry.size).includes(needle)) continue;
+      texts.set(rec.key, current(rec.key).split(oldName).join(newName));
+    }
+  }
+  const replacements = [...texts].map(([key, text]) => ({ key, replacement: Buffer.from(text, "utf8") }));
+  const staging = `${outputPath}.stage`;
+  const staged = writePatchedAsar(baseAsar, replacements, staging);
+  try {
+    const header = JSON.parse(JSON.stringify(staged.header));
+    for (const [fromKey, toKey] of renames) moveHeaderEntry(header, fromKey, toKey);
+    fs.writeFileSync(outputPath, Buffer.concat([packAsarHeader(header), staged.body]), { flag: "wx" });
+  } finally {
+    fs.rmSync(staging, { force: true });
+  }
+  return readAsar(outputPath);
+}
+
+function createServerMutant(baseAsar, outputPath) {
+  const patches = applicablePatchesForArchive(baseAsar, ALL_PATCHES);
+  const target = (patch) => findPatchTarget(baseAsar, patch).key;
+  const edits = new Map();
+  const add = (key, transform) => edits.set(key, [...(edits.get(key) || []), transform]);
+  add("package.json", bumpVersion);
+  // Every patch target drifts to a new content hash, so no module can be recognised through originalHash.
+  for (const key of new Set(patches.map(target))) add(key, addBanner);
+  const runtimeLayer = target(noTelemetry);
+  const workflow = target(noTelemetry.relayPatch);
+  const settings = target(noTelemetry.uiPatch);
+  const threadRoute = target(usageRings);
+  add(runtimeLayer, (t) => renameIdentifier(renameIdentifier(t, "make$44", "make$999"), "Boolean$1", "BoolCfg$99"));
+  add(workflow, (t) => `${t}\n// t3code v${MUTANT_VERSION} content-hash drift\n`);
+  add(threadRoute, (t) => {
+    let out = renameIdentifier(t, "hW", "hW_v99");
+    out = renameIdentifier(out, "_W", "_W_v99");
+    out = replaceAllLiteral(out, "t[1220]", "t[1299]");
+    out = replaceAllLiteral(out, "(0,Q.c)(1221)", "(0,Q.c)(1300)");
+    for (const slot of [716, 717, 718]) out = replaceAllLiteral(out, `t[${slot}]`, `t[${slot + 100}]`);
+    return out;
+  });
+  const sibling = (key, name) => `${path.posix.dirname(key)}/${name}`;
+  const renames = [
+    [runtimeLayer, sibling(runtimeLayer, "runtimeLayer-MUT99999.mjs")],
+    [workflow, sibling(workflow, "WorkflowStore-MUT99999.mjs")],
+    [settings, sibling(settings, "SettingsPanels-MUT99999.js")],
+  ];
+  return { asar: writeMutatedAsar(baseAsar, outputPath, { edits, renames }), path: outputPath, patches, renames };
+}
+
+function createDesktopMutant(baseAsar, outputPath) {
+  const patches = applicablePatchesForArchive(baseAsar, ALL_PATCHES);
+  const edits = new Map([
+    ["package.json", [bumpVersion]],
+    [DESKTOP_MAIN_KEY, [
+      addBanner,
+      (t) => renameIdentifier(t, "make$93", scanIdentifier(t, "make$91").count === 0 ? "make$91" : "make$93_v99"),
+    ]],
+  ]);
+  return { asar: writeMutatedAsar(baseAsar, outputPath, { edits }), path: outputPath, patches };
+}
+
+// Break one anchor in an already-mutated desktop archive.
+function createDesktopVariant(baseAsar, outputPath, transform) {
+  const patches = applicablePatchesForArchive(baseAsar, ALL_PATCHES);
+  return { asar: writeMutatedAsar(baseAsar, outputPath, { edits: new Map([[DESKTOP_MAIN_KEY, [transform]]]) }), path: outputPath, patches };
+}
+
+function assertAutoAdapted(inspected, expectedCount, label) {
+  assert.equal(inspected.appVersion, MUTANT_VERSION, `${label}: appVersion`);
+  assert.equal(inspected.modules.length, expectedCount, `${label}: module count`);
+  const adaptableModules = inspected.modules.filter((m) => !hashOnlyPatchIds.has(m.id));
+  const explain = (id) => {
+    const patch = ALL_PATCHES.find((p) => p.id === id);
+    try {
+      const entry = findPatchTarget(inspected.asar, patch);
+      const text = entry.content.toString("utf8");
+      const ctx = createPatchContext(inspected.asar, entry, text);
+      const next = ctx.getInjectedImports().join("") + patch.apply(text, ctx);
+      validateScriptSyntax(Buffer.from(next, "utf8"), entry.key, id);
+      verifyInjectedScope(next, ctx.getInjectedCodeSnippets(), id, patch.allowedGlobals || []);
+      return `${id}: apply(), syntax and scope gate all succeeded`;
+    } catch (error) {
+      return `${id}: ${error.message.split("\n")[0]}`;
+    }
+  };
+  assert.deepEqual(adaptableModules.filter((m) => !m.pristine).map((m) => explain(m.id)), [], `${label}: modules that failed auto-adaptation`);
+  const summary = summarizeModuleStates(adaptableModules);
+  assert.equal(summary.allRecognized, true, `${label}: allRecognized`);
+  assert.equal(summary.autoAdapted, true, `${label}: autoAdapted`);
+  for (const m of adaptableModules) {
+    assert.equal(m.pristine, true, `${label}: ${m.id} must be recognised as pristine`);
+    assert.equal(m.compat, "auto-adapted", `${label}: ${m.id} must be auto-adapted, not verified`);
+    assert.equal(m.installed, false, `${label}: ${m.id} must not report installed`);
+    assert.equal(m.appVersion, MUTANT_VERSION, `${label}: ${m.id} appVersion`);
+  }
+}
+
+function verifyCrossVersionMutation(serverBaseline, desktopBaseline) {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "t3e-suite17-"));
+  const absent = path.join(tmpRoot, "absent.backup");
+  try {
+    // 17.1 Mutated v0.1.99 server archive: renamed chunks, renamed minified identifiers, shifted memo slots.
+    const serverMutant = createServerMutant(serverBaseline.asar, path.join(tmpRoot, "server-0.1.99.asar"));
+    const mutantInspected = inspectArchive(serverMutant.path);
+    assertAutoAdapted(mutantInspected, 17, "server mutant");
+    const byId = new Map(mutantInspected.modules.map((m) => [m.id, m]));
+    assert(byId.get("no-telemetry").key.endsWith("/runtimeLayer-MUT99999.mjs"), "runtimeLayer must be found through its semantic fingerprint after a hash rename");
+    assert(byId.get("no-telemetry-relay").key.endsWith("/WorkflowStore-MUT99999.mjs"));
+    assert(byId.get("no-telemetry-ui").key.endsWith("/SettingsPanels-MUT99999.js"));
+    assert(/\/ThreadRouteView-[\w-]+\.js$/.test(byId.get("usage-rings").key));
+
+    const patchedServerPath = path.join(tmpRoot, "server-0.1.99.patched.asar");
+    const serverReport = buildPatchedArchive(serverMutant.asar, adaptablePatches(serverMutant.patches), patchedServerPath);
+    assert.equal(serverReport.length, adaptablePatches(serverMutant.patches).length);
+    assert(serverReport.every((r) => r.compat === "auto-adapted" && r.appVersion === MUTANT_VERSION), "Every mutated module must be built through auto-adaptation");
+    const patchedServer = inspectArchive(patchedServerPath);
+    assert.equal(patchedServer.appVersion, MUTANT_VERSION);
+    assert.equal(summarizeModuleStates(patchedServer.modules.filter((m) => !hashOnlyPatchIds.has(m.id))).allInstalled, true, "Patched v0.1.99 server must report allInstalled");
+    verifyRuntimeAssets(patchedServer.asar, ["timeline-ui", "inline-diff-ui", "usage-rings-ui", "files-explorer-ui"]);
+    const telemetryChunk = findUniqueEntry(patchedServer.asar, /\/runtimeLayer-MUT99999\.mjs$/, "mutated runtimeLayer").content.toString("utf8");
+    assert(telemetryChunk.includes("const make$999 = gen$1(function* () {\n\t/* T3_NO_TELEMETRY_V1 */"), "Renamed AnalyticsService make$999 must be stubbed");
+    assert(telemetryChunk.includes("BoolCfg$99(\"T3CODE_TELEMETRY_ENABLED\").pipe(withDefault(false))"), "Renamed Boolean$1 config helper must keep the default-off telemetry flag");
+
+    // 17.1 Mutated v0.1.99 desktop archive (make$93 -> make$91).
+    const desktopMutant = createDesktopMutant(desktopBaseline.asar, path.join(tmpRoot, "app-0.1.99.asar"));
+    assertAutoAdapted(inspectArchive(desktopMutant.path), 2, "desktop mutant");
+    const patchedDesktopPath = path.join(tmpRoot, "app-0.1.99.patched.asar");
+    const desktopReport = buildPatchedArchive(desktopMutant.asar, desktopMutant.patches, patchedDesktopPath);
+    assert.deepEqual(desktopReport.map((r) => r.id), ["no-telemetry-desktop", "desktop-tray"]);
+    assert(desktopReport.every((r) => r.compat === "auto-adapted"));
+    const patchedDesktop = inspectArchive(patchedDesktopPath);
+    assert.equal(summarizeModuleStates(patchedDesktop.modules).allInstalled, true, "Patched v0.1.99 desktop must report allInstalled");
+    verifyNoTelemetryDesktop(patchedDesktop.asar);
+    verifyDesktopTray(patchedDesktop.asar);
+
+    // 17.2 A different-version backup must never be restored over a newer app version.
+    const mismatchPaths = (source, backup) => ({ source, backup, legacyBackup: absent });
+    // (Hash-pinned patches would make a whole mutant archive unrecognisable, so only adaptable patches are inspected here.)
+    const serverPatchSet = adaptablePatches(ALL_PATCHES);
+    const pristineServer = resolvePristineBaseline(mismatchPaths(serverMutant.path, serverBaseline.path), serverPatchSet);
+    assert.equal(pristineServer.path, serverMutant.path, "A pristine v0.1.99 source is its own baseline");
+    assert.equal(pristineServer.appVersion, MUTANT_VERSION);
+    assert.throws(() => resolvePristineBaseline(mismatchPaths(patchedServerPath, serverBaseline.path), serverPatchSet), /找不到未修改的原版 T3 Code 0\.1\.99/, "A patched v0.1.99 source must not fall back to the v0.1.12 backup");
+    const pristineDesktop = resolvePristineBaseline(mismatchPaths(desktopMutant.path, desktopBaseline.path));
+    assert.equal(pristineDesktop.path, desktopMutant.path);
+    assert.throws(() => resolvePristineBaseline(mismatchPaths(patchedDesktopPath, desktopBaseline.path)), /找不到未修改的原版 T3 Code 0\.1\.99/);
+    const matchingBackup = resolvePristineBaseline(mismatchPaths(patchedDesktopPath, desktopMutant.path));
+    assert.equal(matchingBackup.path, desktopMutant.path, "A same-version v0.1.99 backup is the correct baseline");
+    assert.equal(matchingBackup.appVersion, MUTANT_VERSION);
+
+    // 17.3 AST static scope gate.
+    assert.throws(
+      () => verifyInjectedScope("const a = 1;\n", ["const x = FAKE_UNDECLARED_VAR_999();"], "suite17 undeclared"),
+      /Static scope check failed for suite17 undeclared: undeclared reference\(s\): FAKE_UNDECLARED_VAR_999/
+    );
+    verifyInjectedScope("import{q as r}from\"./x.js\";const a = 1;function b(){return a}\n", ["const y = r(a) + b() + Math.max(1, 2);"], "suite17 declared");
+    verifyInjectedScope("const a = 1;\n", ["const z = t3Extra(a);"], "suite17 allowed", ["t3Extra"]);
+    const rogueOut = path.join(tmpRoot, "rogue.asar");
+    const rogue = {
+      id: "rogue-undeclared",
+      name: "rogue",
+      marker: "T3_ROGUE_V1",
+      legacyMarkers: [],
+      targetRegex: noTelemetry.desktopPatch.targetRegex,
+      targetSpec: noTelemetry.desktopPatch.targetSpec,
+      originalHash: "0".repeat(64),
+      apply(source, ctx) {
+        const snippet = "/* T3_ROGUE_V1 */\nconst t3Rogue = FAKE_UNDECLARED_VAR_999();\n";
+        ctx.recordInjectedCode(snippet);
+        return snippet + source;
+      },
+    };
+    assert.throws(() => buildPatchedArchive(desktopMutant.asar, [rogue], rogueOut), /Static scope check failed.*FAKE_UNDECLARED_VAR_999/);
+    assert(!fs.existsSync(rogueOut), "A failed scope gate must not leave a patched archive behind");
+
+    // 17.3 Fail closed when a semantic anchor disappears (spec no longer matches any chunk).
+    const noAnchor = createDesktopVariant(desktopMutant.asar, path.join(tmpRoot, "app-no-anchor.asar"), (t) => replaceAllLiteral(t, "whenReady", "whenRdy"));
+    assert.throws(() => inspectArchive(noAnchor.path), /Could not uniquely identify no-telemetry-desktop/);
+    const noAnchorOut = path.join(tmpRoot, "app-no-anchor.out.asar");
+    assert.throws(() => buildPatchedArchive(noAnchor.asar, noAnchor.patches, noAnchorOut), /Could not uniquely identify no-telemetry-desktop/);
+    assert(!fs.existsSync(noAnchorOut));
+    assert.throws(() => resolvePristineBaseline(mismatchPaths(noAnchor.path, absent)), /语义锚点不兼容/);
+
+    // 17.3 Fail closed when the chunk is found but an apply() anchor is gone (module stays unrecognised, build aborts).
+    const brokenApply = createDesktopVariant(desktopMutant.asar, path.join(tmpRoot, "app-broken-apply.asar"), (t) => replaceAllLiteral(t, "mainClosedDuringStartup = true;", "mainClosedDuringStartupX = true;"));
+    const brokenInspected = inspectArchive(brokenApply.path);
+    const trayModule = brokenInspected.modules.find((m) => m.id === "desktop-tray");
+    assert.equal(trayModule.pristine, false, "A patch whose apply() fails must not be auto-adapted");
+    assert.equal(summarizeModuleStates(brokenInspected.modules).allRecognized, false);
+    const brokenOut = path.join(tmpRoot, "app-broken-apply.out.asar");
+    assert.throws(() => buildPatchedArchive(brokenApply.asar, brokenApply.patches, brokenOut), /Could not find target snippet/);
+    assert(!fs.existsSync(brokenOut));
+    assert.throws(() => resolvePristineBaseline(mismatchPaths(brokenApply.path, absent)), /未识别的版本内容/);
+
+    // Every shipped patch must be able to follow a new T3 Code build (semantic targetSpec instead of a pinned hash).
+    assert.deepEqual([...hashOnlyPatchIds], [], "These patches still pin one build hash (no targetSpec) and cannot auto-adapt to a new T3 Code version");
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+}
+
 if (process.argv[2] === "--unit") {
   console.log("\nUNIT TESTS PASSED.");
   return;
@@ -2048,12 +2553,20 @@ const baseline = resolvePristineBaseline({
 const siblingAppAsar = path.basename(source) === "server.asar"
   ? path.join(path.dirname(source), "app.asar")
   : null;
+// Cross-version architecture: 19 patches = 17 server + 2 desktop (no-telemetry-desktop in privacy, desktop-tray in workspace).
+const desktopPatches = [noTelemetry.desktopPatch, desktopTray];
+assert(noTelemetry.desktopPatch, "no-telemetry must export the desktopPatch");
+assert.equal(ALL_PATCHES.length, 19, "ALL_PATCHES must contain 17 server + 2 desktop patches");
+assert.deepEqual(ALL_PATCHES.filter((p) => p.targetRegex.test("apps/desktop/dist-electron/main.cjs")).map((p) => p.id), ["no-telemetry-desktop", "desktop-tray"]);
+assert.equal(ALL_PATCHES.filter((p) => !p.targetRegex.test("apps/desktop/dist-electron/main.cjs")).length, 17);
+assert.deepEqual(PACKS.find((p) => p.id === "privacy").patchIds, ["no-telemetry", "no-telemetry-relay", "no-telemetry-client", "no-telemetry-ui", "no-telemetry-desktop"]);
+assert.equal(applicablePatchesForArchive(baseline.asar, ALL_PATCHES).length, 17, "server.asar must receive exactly the 17 server patches");
 const desktopBaseline = siblingAppAsar && fs.existsSync(siblingAppAsar)
   ? resolvePristineBaseline({
       source: siblingAppAsar,
       backup: siblingAppAsar + ".before-t3code-enhancer",
       legacyBackup: siblingAppAsar + ".before-timeline-collapse",
-    }, [desktopTray])
+    }, desktopPatches)
   : null;
 const tmpOut = path.join(os.tmpdir(), `t3code-enhancer-test-${Date.now()}.asar`);
 const tmpDesktopOut = desktopBaseline ? path.join(os.tmpdir(), `t3code-enhancer-desktop-test-${Date.now()}.asar`) : null;
@@ -2067,10 +2580,17 @@ try {
   }
   let verifiedDesktop = verified.entries.some((e) => desktopTray.targetRegex.test(e.key)) ? verified : null;
   if (desktopBaseline && tmpDesktopOut) {
-    const desktopReport = buildPatchedArchive(desktopBaseline.asar, [desktopTray], tmpDesktopOut);
+    const desktopReport = buildPatchedArchive(desktopBaseline.asar, desktopPatches, tmpDesktopOut);
+    assert.deepEqual(desktopReport.map((r) => r.id), ["no-telemetry-desktop", "desktop-tray"]);
     report.push(...desktopReport);
     verifiedDesktop = readAsar(tmpDesktopOut);
+    for (const p of desktopPatches) {
+      assert(findUniqueEntry(verifiedDesktop, p.targetRegex, p.id).content.toString("utf8").includes(p.marker), `Marker missing for ${p.id}`);
+    }
   }
+  // External ESM runtime assets: content-hashed t3e-*.js files shipped inside the patched ASAR and imported by host chunks.
+  const runtimeAssets = verifyRuntimeAssets(verified, ["timeline-ui", "inline-diff-ui", "usage-rings-ui", "files-explorer-ui"]);
+  console.log("   runtime assets:", [...runtimeAssets].sort().join(", "));
   console.log("   OK -> built & verified:", report.map((r) => `${r.id}(${r.patched.slice(0, 10)})`).join(", "));
   console.log("5. Creating a workspace panel portal through the archive's native React DOM loader...");
   verifyFloatingPanelPortal(verified);
@@ -2107,8 +2627,15 @@ try {
   assert(verifiedDesktop, "Missing desktop main.cjs target to verify desktop-tray");
   verifyDesktopTray(verifiedDesktop);
   console.log("   OK");
+  console.log("15.5. Verifying no-telemetry-desktop env hardening and PostHog/Axiom request cancellation in a sandboxed Electron mock...");
+  verifyNoTelemetryDesktop(verifiedDesktop);
+  console.log("   OK");
   console.log("16. Verifying files-changes-explorer tree normalization, search expand, and DOM structure...");
   verifyFilesChangesExplorer(verified);
+  console.log("   OK");
+  console.log("17. Cross-Version Mutation & Auto-Adaptation Stress Test (synthetic v0.1.99 server + desktop archives)...");
+  assert(desktopBaseline, "Suite 17 needs the sibling app.asar next to server.asar");
+  verifyCrossVersionMutation(baseline, desktopBaseline);
   console.log("   OK");
 } finally {
   if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
