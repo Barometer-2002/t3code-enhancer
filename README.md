@@ -1,10 +1,10 @@
 # t3code-enhancer
 
-T3 Code 桌面版的主题与界面增强工具，提供安装、状态检测和卸载命令。
+T3 Code 0.1.11 的全功能体验增强、去遥测与 ChatGPT 风格主题工具，支持分块自由搭配安装、原地修复与逐字节还原卸载。
 
-适用于 T3 Code **0.1.11** 的 **Windows 桌面版**、**Linux x86_64 官方 AppImage** 和 **macOS 官方版**。Linux 和 macOS 版会安装一个独立的增强版副本。
+适用平台：**Windows 桌面版**（含 `server.asar` 与系统托盘 `app.asar`）、**Linux x86_64**（官方 AppImage / `.deb` 与解压版）以及 **macOS 官方版**（注：macOS 脚本为基于既有 PR 的适配迁移，核心逻辑已通过跨平台单元测试，**尚未在 Mac 真机上实机验证**）。
 
-从 [GitHub Releases](https://github.com/Barometer-2002/t3code-enhancer/releases/latest) 下载安装 ZIP。安装、卸载和界面截图见 [使用教程](使用教程.md)。
+从 [GitHub Releases](https://github.com/Barometer-2002/t3code-enhancer/releases/latest) 下载安装 ZIP，详细说明与常见问题见 [使用教程](使用教程.md)。
 
 ## 界面预览
 
@@ -12,7 +12,7 @@ T3 Code 桌面版的主题与界面增强工具，提供安装、状态检测和
 
 | 加号菜单 | 模型与 Harness |
 | :---: | :---: |
-| <img src="assets/tutorial/plus-menu.png" alt="添加文件、引用、技能与斜杠命令菜单" width="310"> | <img src="assets/tutorial/model-picker.png" alt="Harness 切换、模型搜索与选择" width="310"> |
+| <img src="assets/tutorial/plus-menu.png" alt="添加本地文件、引用、技能与历史对话菜单" width="310"> | <img src="assets/tutorial/model-picker.png" alt="Harness 切换、模型搜索与选择" width="310"> |
 
 | 思考深度 | 右侧详情面板 |
 | :---: | :---: |
@@ -22,82 +22,76 @@ T3 Code 桌面版的主题与界面增强工具，提供安装、状态检测和
 | :---: | :---: |
 | <img src="assets/tutorial/quota-details.png" alt="5 小时和 7 天剩余额度及重置时间" width="310"> | <img src="assets/tutorial/context-stats.png" alt="上下文占用、缓存命中率与 Token 明细" width="310"> |
 
-**工作过程**可以按组展开。收起上级后，再次打开时下级仍处于折叠状态。
-
 ![展开工作组后显示的命令与工具列表](assets/tutorial/work-log.png)
 
-## 包含模块
+## 5 大可选模块（可自由搭配）
 
-1. **ChatGPT / Codex 一体化主题（`themes/chatgpt-app.json`）**
-   - 明暗双模统一设计 Token（`768px` 主阅读栏 / `296px` 右侧面板 / `10px` 根圆角 / 4 级墨色与字号阶梯）。
-   - 全局 `vector-effect: non-scaling-stroke`（`1.35px` 固定物理线宽）+ 分区锁定图标尺寸，彻底消除图标发虚与粗细不一。
-   - 主对话区 `0px → 7px → 22px` 左轴对齐、侧栏统一 `10px` 基准线、无顶栏硬线、丝滑鼠标悬停交互。
-2. **多层级折叠联动补丁（`lib/patches/timeline-collapse.cjs`）**
-   - 收起上级菜单（回合折叠 / 尝试折叠 / 工具组折叠）时，自动清空该分支下所有下级展开状态，同级其他回合不受影响。
-3. **加号多功能菜单、思考深度滑块/Harness 快切 & 悬停双浮层卡（`lib/patches/usage-rings.cjs`）**
-   - **底部输入框 `+` 多功能菜单**：将原回形针附件按钮升级为 ChatGPT 风格 `32×32px` 圆形 `+` 按钮（`17px` 图标，带常驻/悬停/按压分阶圆底纹），点击展开分组菜单（`添加`：文件和图片 / `@` 引用工作区文件 / `$` 技能与扩展；`模式与命令`：`/btw` 侧边对话 / 压缩上下文 / 新建干净上下文 / `/` 全部斜杠命令），菜单图标统一锁定 `15px` / `1.35px` 线宽。
-   - **完全替换原生三栏模型面板（ChatGPT 双面板一体设计）**：
-     - **模型 & Harness 按钮（`[ 图标 模型名 ]`）**：点击展开 ChatGPT 风格 `288px`「选择模型」卡片——顶部为严格过滤后的**仅已开启可用 Harness 2 列网格**（默认展示 4 个，超出可点「展开 +N / 收起」）、中段为简洁单列模型列表（多模型自动出现搜索框）、底部集成 T3 原生访问权限切换与「思考深度 ›」直达入口。
-     - **独立思考深度按钮（`[ ▂▄▆ High ]`）**：不再与模型按钮重复显示，点击展开纯正 ChatGPT 风格推理强度滑块卡片（`⚡` 快速模式开关、`↺` 恢复默认、点击/拖拽/键盘吸附的靛蓝分段滑块、以及模型名直达入口），两张面板设计语言完全统一且一键互通。
-   - **底部双胶囊（悬停直接展开 + 同款 `8px` 圆角灰底纹响应）**：
-     - 左下角 `◎ 84%` 额度双环：**实时联动当前选中模型**（多模型独立额度池下自动匹配如 `Gemini` / `Gemini 4 Argon` / `Claude & GPT (shared)`，低额文字与圆环同步变橙/红），悬停展开「**用量**」卡片（当前模型额度行标有「当前」徽标 + 5h/7d 各自独立换行重置倒计时 + 「查看完整用量 →」跳转）。
-     - 右下角 `19% · 204k ◔` 上下文直显（支持费用自动拼接）：悬停展开「**上下文与统计**」卡片（上下文进度条与自动压缩刻度线、会话费用/缓存命中/回合与步骤统计、本轮耗时与输入输出、Token 细分统计）。
-   - **右侧详情面板**：自动配对同一模型的 `5h` / `7d` 窗口为双层同心圆环（外环 7d 陶土橙、内环 5h 翡翠绿，低额度自动变警告橙/红），统一 `px-2.5` 左对齐，上下文圆环悬停同步展开「上下文与统计」浮层。
-   - **自动激活与还原**：`install.cmd` 会自动在 `settings.json` 中激活 `chatgpt-app` 主题，`uninstall.cmd` 会同步还原默认主题与纯净原版 `server.asar`。
+| 模块 ID | 名称 | 包含能力 |
+|---|---|---|
+| `theme` | ChatGPT 外观主题 | `themes/chatgpt-app.json` 明暗双模主题（768px 阅读栏 / 296px 侧栏 / `1.35px` 物理图标线宽 / 自动激活与还原；支持 `--official` 仅安装 Layer 1 官方稳定层） |
+| `privacy` | 隐私与去遥测 | `lib/patches/no-telemetry.cjs`：禁用 PostHog 上报、禁读 `~/.claude.json` 与 `~/.codex/auth.json`、切断 Relay 与前端 Axiom OTLP 追踪、更新设置页隐私声明并默认禁用遥测环境变量 |
+| `composer` | 输出框与额度圈 | `lib/patches/usage-rings.cjs`：`+` 附加菜单（本地文件/文件夹、当前标签页、工作区文件、PR、联机环境、技能、历史对话，完整键盘导航）、常驻权限、合一模型/Harness 卡片、思考深度渐变滑块、5h/7d 双层额度圈与上下文/费用/统计浮层 |
+| `chat` | 聊天分级与 Diff 优化 | `timeline-collapse.cjs` + `inline-file-diff.cjs` + `files-changes-explorer.cjs`：收起上级联动收起下级、同文件连续读/改折叠与摘要去重、对话内按需 Diff 与侧栏跳转定位、屏蔽 Diff 慢请求弹窗、文件侧栏三段分层联动浏览 |
+| `workspace` | 整体界面与小窗交互 | `sidebar-new-chat.cjs` + `new-chat-layout.cjs` + `workspace-floating-panels.cjs` + `desktop-tray.cjs`：侧栏搜索快捷键、新建对话吸底居中、工作区标签小窗拖拽缩放与浏览器自适应排版、左右主侧互换（`⇄` / `Alt+S`）、全屏主对话浮窗与迷你胶囊（无跳动切换定位）、后台最小化到系统托盘 |
+
+### 预设版本（`--preset` / `--interactive` 菜单）
+
+- `full`（默认，**完整强化版**）：`theme + privacy + composer + chat + workspace`
+- `chat-lite`（**轻量对话增强版**）：`theme + privacy + composer + chat`（保留原版分栏布局与窗口行为）
+- `clean`（**主题 + 去遥测纯净版**）：`theme + privacy`
+- `privacy-only`（**纯去遥测版**）：仅 `privacy`（100% 保留官方界面）
+- `theme-only`（**纯主题版**）：仅 `theme`（无需关闭 T3 Code）
 
 ## 使用方法
 
-### Windows 一键脚本
+### 一键脚本（Windows / Linux / macOS）
 
-- **查看状态**：双击 `status.cmd`
-- **一键安装**：先关闭所有 T3 Code 窗口 → 双击 `install.cmd` → 重新打开 T3 Code
-- **一键卸载**：先关闭所有 T3 Code 窗口 → 双击 `uninstall.cmd` → 重新打开 T3 Code
+- **Windows**：关闭 T3 Code 后双击 `install.cmd`（支持交互式版本/模块选择）、`repair.cmd`、`status.cmd`、`uninstall.cmd`。
+- **Linux / macOS**：赋予执行权限后运行 `./install.sh`（无参数进入交互菜单，或直接透传子命令与参数，如 `./install.sh repair`、`./install.sh uninstall`）。
 
-### Windows 命令行
-
-```powershell
-node cli.cjs status                  # 查看安装状态与备份完整性
-node cli.cjs install                 # 安装全部模块（主题 + 两项前端补丁）
-node cli.cjs install --theme-only    # 仅更新主题（无需退出 T3 Code）
-node cli.cjs uninstall               # 完整卸载并逐字节还原原版 server.asar
-node cli.cjs uninstall --keep-theme  # 仅卸载前端补丁，保留主题
-node tests/verify.cjs                # 运行自动化单元测试与 ASAR 试构建校验
-```
-
-### Linux x86_64
-
-准备 Node.js 20 或更新版本，以及 [T3 Code 0.1.11 官方 x86_64 AppImage](https://github.com/pingdotgg/t3code/releases/tag/v0.1.11)。在增强包解压目录中以桌面用户执行：
+### 通用命令行（Win / Linux / macOS）
 
 ```bash
-node linux.cjs install ~/Downloads/T3-Code-x86_64.AppImage
+node cli.cjs install --interactive                # 交互菜单选择预设/自由搭配/修复/卸载
+node cli.cjs install                              # 安装默认完整版 (full)
+node cli.cjs install --preset clean               # 选择预设：full | chat-lite | clean | privacy-only | theme-only
+node cli.cjs install --packs theme,privacy,chat   # 自由搭配模块：theme, privacy, composer, chat, workspace
+node cli.cjs install --theme-only                 # 仅更新主题（无需退出 T3 Code）
+node cli.cjs status                               # 查看主题、备份与全模块状态
+node cli.cjs repair                               # 修复损坏 ASAR / 残留临时文件 / 备份与主题
+node cli.cjs uninstall                            # 完整卸载并逐字节还原纯净原版（支持 --keep-theme / --purge-backup / --purge-profile）
+node cli.cjs build /tmp/test.asar                 # 在副本上试构建并校验（不改动已安装的 T3 Code）
+node tests/verify.cjs                             # 运行全部自动化单元测试与干跑构建校验
+```
+
+### Linux（AppImage 与解包版）
+
+准备 Node.js 20+ 与 [T3 Code 0.1.11 官方 x86_64 AppImage](https://github.com/pingdotgg/t3code/releases/tag/v0.1.11)：
+
+```bash
+node cli.cjs install --appimage ~/Downloads/T3-Code-x86_64.AppImage
 "${XDG_DATA_HOME:-$HOME/.local/share}/t3code-enhancer/launch.sh"
 ```
 
-安装器校验官方 AppImage 的 SHA-256 后解包，原 AppImage 可继续单独使用。增强版默认使用本地端口 `3774`，可在启动命令前用 `T3CODE_PORT=3775` 指定空闲端口。首次启动后可在「设置 → 外观」选择 **ChatGPT App**。
+- 默认使用独立配置目录 `t3code-enhancer-profile` 与端口 `3774`（可用 `T3CODE_PORT=3775` 指定），并注入 `T3CODE_DISABLE_AUTO_UPDATE=1`。
+- 若启用去遥测模块，`launch.sh` 还会导出 `T3CODE_TELEMETRY_ENABLED=false` 与 `T3CODE_OTEL_SDK_DISABLED=true`。
+- 如需与官方版共用 `~/.t3` 数据，可加 `--shared-data`（两者勿同时运行）。
+- `.deb` / 解包版（如 `/opt/T3 Code`）可直接运行 `node cli.cjs install` 或通过 `--asar <路径>` 指定。已在 Debian/Ubuntu/Omarchy x86_64 实测通过。
 
-`node linux.cjs status` 查看状态。退出增强版后执行 `node linux.cjs uninstall` 可以移除它，增强版的会话和偏好保存在同级的 `t3code-enhancer-profile`。安装和卸载已在 Omarchy x86_64 上验证。
+### macOS（基于既有 PR 适配，未在 Mac 真机实测）
 
-### macOS
-
-准备 Node.js 20 或更新版本，以及安装在「应用程序」中的 T3 Code 0.1.11 官方版。在增强包解压目录中执行：
+`macos.cjs` 基于原 macOS PR 迁移并已对齐当前分块安装、去遥测与修复逻辑（核心逻辑通过跨平台单元测试，**未在实体 Mac 上运行测试**）。在 Apple 设备上使用 `node cli.cjs install` 或 `node macos.cjs install`（官方版不在 `/Applications/T3 Code (Beta).app` 时可追加路径或 `--app <路径>`）：
 
 ```bash
-node macos.cjs install
+node cli.cjs install --app "/Applications/T3 Code (Beta).app"
 open "$HOME/Applications/T3 Code Enhancer.app"
 ```
 
-官方版不在 `/Applications/T3 Code (Beta).app` 时，把实际路径加在 `install` 后面。安装器校验官方签名和版本后，复制出 `~/Applications/T3 Code Enhancer.app` 并打补丁，再用本机 ad-hoc 签名。官方版保持不变，两者可以同时运行。增强版使用本地端口 `3774`，关闭自动更新，会话和偏好保存在 `~/Library/Application Support/t3code-enhancer-profile`。首次启动后可在「设置 → 外观」选择 **ChatGPT App**。
-
-`node macos.cjs status` 查看状态。退出增强版后执行 `node macos.cjs uninstall` 可以移除它，独立配置会保留。两个版本启动时都会登记 `t3code://` 登录回调，最后启动的那个生效；要在官方版里登录 T3 账号，先重启官方版。安装和卸载已在 Apple Silicon 上验证，Intel 机型未验证。
-
-如果状态显示「已安装旧版」，退出增强版，再用新版增强包运行 `node macos.cjs install`。升级仍需要官方 T3 Code 0.1.11，会沿用现有的独立或共用数据模式，并保留会话与设置。
-
-想直接使用官方版已有的会话和项目，改用 `node macos.cjs install --shared-data`。这时增强版和官方版共用 `~/.t3` 与 Electron 用户数据，两者不能同时运行，切换前先退出另一个。增强版第一次读取钥匙串时，选择「始终允许」。官方版自动更新到新版本后可能升级数据格式，而增强版仍是 0.1.11，这时先停用增强版。已经按独立配置安装过的，先执行 `uninstall` 再重新安装。
+支持 `status` / `repair` / `uninstall`、`--shared-data`、`--official`、`--purge-profile`，若需仅更新特定解压版 ASAR 也可回退使用 `node cli.cjs install --asar <path>`。
 
 ## 安全保障
-- 安装前自动备份纯净原版为 `server.asar.before-t3code-enhancer`（若此前已安装过旧版 `patch-timeline-collapse.cjs`，会自动继承其纯净原版备份，绝不覆盖原版）。
-- 写入前自动进行 ESM 语法检查、SHA-256 块完整性重算、以及所有未修改文件的逐字节一致性校验。
-- T3 Code 后续版本更新覆盖 `server.asar` 时，可先运行 `node cli.cjs status` 确认兼容性。
+- 安装前校验原版片段哈希，首次修改自动保存 `.before-t3code-enhancer` 纯净备份（兼容继承早期 `.before-timeline-collapse` 备份）；检测到非 `0.1.11` 未知版本时立即中止，绝不用旧备份覆盖新版本。
+- 写入前自动完成脚本语法检查、ASAR 头部 SHA-256 块校验与全量未修改字节比对。
 
 ## 许可与致谢
 

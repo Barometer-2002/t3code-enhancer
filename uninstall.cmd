@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-node cli.cjs uninstall --banner
+node cli.cjs uninstall --banner %*
 echo.
 pause

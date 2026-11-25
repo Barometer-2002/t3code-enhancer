@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-node cli.cjs install --banner
+node cli.cjs install --interactive --banner %*
 echo.
 pause
