@@ -5,10 +5,11 @@ const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { readAsar } = require("./lib/asar.cjs");
+const { readAsar, writeVerifiedAsarCopy } = require("./lib/asar.cjs");
 const {
   ALL_PATCHES,
   selectPatches,
+  inferRepairPlanOptions,
   applicablePatchesForArchive,
   getLinuxAsarCandidates,
   getAsarPaths,
@@ -17,11 +18,12 @@ const {
   isT3Running,
   assertT3Closed,
   inspectArchive,
+  inspectCompatibleSource,
   summarizeModuleStates,
   resolvePristineBaseline,
   buildPatchedArchive,
 } = require("./lib/engine.cjs");
-const { getThemeStatus, installTheme, uninstallTheme } = require("./lib/theme-manager.cjs");
+const { getThemeStatus, formatThemeStatusText, installTheme, uninstallTheme } = require("./lib/theme-manager.cjs");
 const {
   PACKS,
   PRESETS,
@@ -35,7 +37,7 @@ function cleanupStaleAsarStaging(sourcePath) {
   const base = path.basename(sourcePath);
   if (!fs.existsSync(dir)) return;
   for (const name of fs.readdirSync(dir)) {
-    if (name.startsWith(base + ".") && name.endsWith(".tmp")) {
+    if (name.startsWith(base + ".") && /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}\.tmp$/i.test(name.slice(base.length + 1))) {
       fs.rmSync(path.join(dir, name), { force: true });
     }
   }
@@ -44,12 +46,7 @@ function cleanupStaleAsarStaging(sourcePath) {
 function cmdStatus(asarOverride) {
   const theme = getThemeStatus();
   console.log("=== T3 Code 主题与体验强化状态 ===");
-  console.log(
-    "主题文件 (chatgpt-app) :",
-    theme.installed
-      ? `${theme.matchesBundled ? "已安装（最新" : "已安装（与项目内版本有差异"} · ${theme.active ? "已激活" : "未激活"}）`
-      : "未安装"
-  );
+  console.log("主题文件 (chatgpt-app) :", formatThemeStatusText(theme));
   console.log("主题备份 :", theme.hasBackup ? "存在" : "无");
 
   let targetPaths;
@@ -86,46 +83,93 @@ function cmdStatus(asarOverride) {
   }
 }
 
-function applyAsarPlanToTarget(plan, paths, options = {}) {
+function stageAsarPlan(plan, paths, staging) {
   const asarName = path.basename(paths.source);
-  if (options.repair) cleanupStaleAsarStaging(paths.source);
-  assertT3Closed(paths.source);
   const baseline = resolvePristineBaseline(paths);
   const targetPatches = applicablePatchesForArchive(baseline.asar, plan.selectedPatches);
-  const staging = `${paths.source}.${randomUUID()}.tmp`;
-  try {
-    if (targetPatches.length > 0) {
-      console.log(`[补丁] 正在基于干净原版基线构建 ${asarName}（${targetPatches.map((p) => p.id).join(" + ")}）...`);
-      const report = buildPatchedArchive(baseline.asar, targetPatches, staging);
-      if (!fs.existsSync(paths.backup)) {
-        fs.copyFileSync(baseline.path, paths.backup, fs.constants.COPYFILE_EXCL);
-        assert(readAsar(paths.backup).archive.equals(baseline.asar.archive), "原版备份校验不一致");
-      }
-      assertT3Closed(paths.source);
-      fs.renameSync(staging, paths.source);
-      for (const r of report) {
-        console.log(`[补丁] ✓ ${r.id} -> ${r.key} (${r.patched.slice(0, 12)})`);
-      }
-      console.log(`[备份] 原版安全备份位于：${paths.backup}`);
-    } else {
-      const current = inspectArchive(paths.source);
-      if (current.modules.every((m) => m.pristine)) return;
-      console.log(`[补丁] 当前方案不包含 ${asarName} 补丁，正在还原为纯净原版...`);
-      fs.copyFileSync(baseline.path, staging, fs.constants.COPYFILE_EXCL);
-      assert(readAsar(staging).archive.equals(baseline.asar.archive), "原版恢复校验不一致");
-      assertT3Closed(paths.source);
-      fs.renameSync(staging, paths.source);
-      console.log(`[备份] 已保留原版备份：${paths.backup}`);
+  if (targetPatches.length > 0) {
+    console.log(`[补丁] 正在基于干净原版基线构建 ${asarName}（${targetPatches.map((p) => p.id).join(" + ")}）...`);
+    const report = buildPatchedArchive(baseline.asar, targetPatches, staging);
+    if (baseline.path !== paths.backup) {
+      writeVerifiedAsarCopy(baseline.path, paths.backup, {
+        overwrite: true,
+        expectedArchive: baseline.asar.archive,
+        label: "原版备份校验不一致",
+      });
     }
+    return () => {
+      for (const r of report) console.log(`[补丁] ✓ ${r.id} -> ${r.key} (${r.patched.slice(0, 12)})`);
+      console.log(`[备份] 原版安全备份位于：${paths.backup}`);
+    };
+  }
+  if (inspectCompatibleSource(paths.source)?.modules.every((m) => m.pristine)) return;
+  writeVerifiedAsarCopy(baseline.path, staging, { expectedArchive: baseline.asar.archive });
+  return () => console.log(`[补丁] 已还原纯净原版 ${asarName}（来源：${baseline.path}）`);
+}
+
+function runAsarTransaction(targetPaths, stage, { cleanup = false } = {}) {
+  const lock = path.join(path.dirname(targetPaths[0].source), ".t3code-enhancer-asar.lock");
+  try {
+    fs.mkdirSync(lock);
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    throw new Error(`已有 ASAR 维护命令持锁。确认命令已退出后可移除空锁目录：${lock}`, { cause: error });
+  }
+  const files = targetPaths.map((paths) => {
+    const stem = `${paths.source}.${randomUUID()}`;
+    return { paths, staging: `${stem}.tmp`, snapshot: `${stem}.rollback`, replaced: false, keepSnapshot: false };
+  });
+  try {
+    for (const file of files) {
+      assertT3Closed(file.paths.source);
+      if (cleanup) cleanupStaleAsarStaging(file.paths.source);
+      file.report = stage(file.paths, file.staging);
+    }
+    const replacements = files.filter((file) => fs.existsSync(file.staging));
+    for (const { paths: { source }, snapshot, staging } of replacements) {
+      const stat = fs.statSync(source, { throwIfNoEntry: false });
+      if (!stat) continue;
+      fs.copyFileSync(source, snapshot, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(staging, stat.mode & 0o777);
+    }
+    try {
+      for (const file of replacements) {
+        assertT3Closed(file.paths.source);
+        fs.renameSync(file.staging, file.paths.source);
+        file.replaced = true;
+      }
+    } catch (error) {
+      const rollbackErrors = [];
+      for (const file of replacements.reverse()) {
+        if (!file.replaced) continue;
+        try {
+          if (fs.existsSync(file.snapshot)) fs.renameSync(file.snapshot, file.paths.source);
+          else fs.unlinkSync(file.paths.source);
+        } catch (rollbackError) {
+          file.keepSnapshot = true;
+          rollbackErrors.push(`${file.paths.source}（${rollbackError.message}，回滚副本：${file.snapshot}）`);
+        }
+      }
+      if (rollbackErrors.length) throw new Error(`${error.message}。回滚失败：${rollbackErrors.join("、")}`, { cause: error });
+      throw error;
+    }
+    for (const file of files) file.report?.();
   } finally {
-    if (fs.existsSync(staging)) fs.unlinkSync(staging);
+    try {
+      for (const file of files) {
+        fs.rmSync(file.staging, { force: true });
+        if (!file.keepSnapshot) fs.rmSync(file.snapshot, { force: true });
+      }
+    } finally {
+      fs.rmdirSync(lock);
+    }
   }
 }
 
 function applyAsarPlan(plan, asarOverride, options = {}) {
-  for (const paths of getArchiveTargetPaths(asarOverride)) {
-    applyAsarPlanToTarget(plan, paths, options);
-  }
+  runAsarTransaction(getArchiveTargetPaths(asarOverride), (paths, staging) => stageAsarPlan(plan, paths, staging), {
+    cleanup: options.repair,
+  });
 }
 
 function cmdInstall(flags, asarOverride, planOptions = {}) {
@@ -140,11 +184,13 @@ function cmdInstall(flags, asarOverride, planOptions = {}) {
   }
 
   console.log(`[方案] ${plan.presetId} | 模块: ${plan.packIds.join(", ")}`);
+  if (!plan.themeOnly) applyAsarPlan(plan, asarOverride);
 
   if (plan.includeTheme) {
     const res = installTheme({ officialOnly: plan.officialOnly, createSettingsIfMissing: true });
     console.log(`[主题] 已安装 chatgpt-app 主题（${plan.officialOnly ? "仅官方稳定层 Layer 1" : "完整分层主题 Layer 1-3"}） -> ${res.targetPath}`);
     if (res.backupPath) console.log(`[主题] 原主题已备份 -> ${res.backupPath}`);
+    if (!res.activated) console.log("[警告] 未能在 settings.json 中自动激活主题（配置文件可能损坏），请在设置 -> 外观中手动选择 ChatGPT App。");
   } else if (plan.presetId === "privacy-only") {
     console.log("[主题] 纯去遥测模式：保持现有主题不变。");
   }
@@ -154,30 +200,58 @@ function cmdInstall(flags, asarOverride, planOptions = {}) {
     return;
   }
 
-  applyAsarPlan(plan, asarOverride);
   console.log("\n全部安装完成！现在可以重新启动 T3 Code。");
 }
 
-function cmdRepair(flags, asarOverride, planOptions = {}) {
-  const plan = resolveInstallPlan(ALL_PATCHES, {
-    preset: planOptions.preset || null,
-    packs: planOptions.packs || null,
-    flags,
+function resolveRepairPlan(flags, asarOverride, planOptions = {}) {
+  const explicitSelection = Boolean(
+    planOptions.preset || planOptions.packs || flags.has("--theme-only") || flags.has("--patch-only")
+  );
+  if (explicitSelection) {
+    return resolveInstallPlan(ALL_PATCHES, {
+      preset: planOptions.preset || null,
+      packs: planOptions.packs || null,
+      flags,
+    });
+  }
+  const effectiveFlags = new Set(flags);
+  const themeStatus = getThemeStatus();
+  let mergedModules = [];
+  try {
+    for (const paths of getArchiveTargetPaths(asarOverride)) {
+      const inspected = inspectArchive(paths.source);
+      mergedModules.push(...inspected.modules);
+    }
+  } catch {
+    mergedModules = [];
+  }
+  const inferred = inferRepairPlanOptions(mergedModules, themeStatus, effectiveFlags);
+  if (inferred.officialOnly) effectiveFlags.add("--official");
+  if (inferred.patchOnly) effectiveFlags.add("--patch-only");
+  return resolveInstallPlan(ALL_PATCHES, {
+    preset: inferred.preset,
+    packs: inferred.packs,
+    flags: effectiveFlags,
   });
+}
+
+function cmdRepair(flags, asarOverride, planOptions = {}) {
+  const plan = resolveRepairPlan(flags, asarOverride, planOptions);
   if (plan.needsLayer3Warning) {
     console.log("[提示] --official 仅安装 Layer 1 官方样式层，部分功能补丁的视觉样式可能不完整；纯官方主题建议配合 --preset theme-only 或 --preset clean 使用。");
   }
   console.log(`[方案] ${plan.presetId} | 模块: ${plan.packIds.join(", ")}`);
   console.log("[修复] 正在清理残留临时文件并检查主题与 ASAR 完整性...");
+  if (!plan.themeOnly) applyAsarPlan(plan, asarOverride, { repair: true });
   if (plan.includeTheme) {
     const res = installTheme({ officialOnly: plan.officialOnly, createSettingsIfMissing: true });
     console.log(`[修复] 主题已重新校验并写入 -> ${res.targetPath}`);
+    if (!res.activated) console.log("[警告] 未能在 settings.json 中自动激活主题，请在设置 -> 外观中手动选择 ChatGPT App。");
   }
   if (plan.themeOnly) {
     console.log("\n主题修复完成（无需重启 T3 Code）。");
     return;
   }
-  applyAsarPlan(plan, asarOverride, { repair: true });
   console.log("\n修复完成！现在可以重新启动 T3 Code。");
 }
 
@@ -186,24 +260,30 @@ function cmdUninstall(flags, asarOverride) {
   const themeOnly = flags.has("--theme-only");
   const purgeBackup = flags.has("--purge-backup");
 
-  const targetPaths = themeOnly ? [] : getArchiveTargetPaths(asarOverride);
-  const resolvedTargets = [];
-  for (const paths of targetPaths) {
-    const asarName = path.basename(paths.source);
-    cleanupStaleAsarStaging(paths.source);
-    assertT3Closed(paths.source);
-    const backupPath = fs.existsSync(paths.backup) ? paths.backup : fs.existsSync(paths.legacyBackup) ? paths.legacyBackup : null;
-    if (!backupPath) {
-      const current = inspectArchive(paths.source);
-      if (current.modules.every((m) => m.pristine)) {
-        resolvedTargets.push({ paths, asarName, backupPath: null, alreadyPristine: true });
-        continue;
+  if (!themeOnly) {
+    runAsarTransaction(getArchiveTargetPaths(asarOverride), (paths, staging) => {
+      const asarName = path.basename(paths.source);
+      const current = inspectCompatibleSource(paths.source);
+      const alreadyPristine = current?.modules.every((module) => module.pristine);
+      if (!alreadyPristine) {
+        const original = resolvePristineBaseline(paths);
+        assert(original.path !== paths.source, `未找到原版 ${asarName} 备份文件，无法自动还原。`);
+        writeVerifiedAsarCopy(original.path, staging, {
+          expectedArchive: original.asar.archive,
+          label: "还原文件校验不一致",
+        });
       }
-      throw new Error(`未找到原版 ${asarName} 备份文件，无法自动还原。`);
-    }
-    const original = inspectArchive(backupPath);
-    assert(original.modules.every((m) => m.pristine), `备份文件 ${backupPath} 校验不是纯净原版`);
-    resolvedTargets.push({ paths, asarName, backupPath, original, alreadyPristine: false });
+      return () => {
+        console.log(`[补丁] ${alreadyPristine ? "原版已完整" : "已逐字节还原纯净原版"} ${asarName}`);
+        if (purgeBackup) {
+          for (const backup of new Set([paths.backup, paths.legacyBackup])) {
+            if (!fs.existsSync(backup)) continue;
+            fs.unlinkSync(backup);
+            console.log(`[备份] 已移除：${backup}`);
+          }
+        }
+      };
+    }, { cleanup: true });
   }
 
   if (!keepTheme) {
@@ -212,34 +292,6 @@ function cmdUninstall(flags, asarOverride) {
   }
   if (themeOnly) return;
 
-  for (const target of resolvedTargets) {
-    const { paths, asarName, backupPath, original, alreadyPristine } = target;
-    if (alreadyPristine) {
-      console.log(`[补丁] 当前 ${asarName} 已是纯净原版，无需还原。`);
-      continue;
-    }
-
-    const staging = `${paths.source}.${randomUUID()}.tmp`;
-    try {
-      fs.copyFileSync(backupPath, staging, fs.constants.COPYFILE_EXCL);
-      assert(readAsar(staging).archive.equals(original.asar.archive), "还原文件校验不一致");
-      assertT3Closed(paths.source);
-      fs.renameSync(staging, paths.source);
-      console.log(`[补丁] ✓ 已逐字节还原纯净原版 ${asarName}（来源：${backupPath}）`);
-      if (purgeBackup) {
-        if (fs.existsSync(paths.backup)) {
-          fs.unlinkSync(paths.backup);
-          console.log(`[备份] 已移除原版备份文件：${paths.backup}`);
-        }
-        if (paths.legacyBackup && paths.legacyBackup !== paths.backup && fs.existsSync(paths.legacyBackup)) {
-          fs.unlinkSync(paths.legacyBackup);
-          console.log(`[备份] 已移除旧版备份文件：${paths.legacyBackup}`);
-        }
-      }
-    } finally {
-      if (fs.existsSync(staging)) fs.unlinkSync(staging);
-    }
-  }
   console.log("\n卸载完成！现在可以重新启动 T3 Code。");
 }
 
@@ -253,9 +305,20 @@ function cmdBuild(outputPath, flags, asarOverride, planOptions = {}) {
     flags,
   });
   const resolved = path.resolve(outputPath);
-  if (fs.existsSync(resolved)) fs.unlinkSync(resolved);
-  const report = buildPatchedArchive(baseline.asar, plan.selectedPatches, resolved);
-  console.log(JSON.stringify({ output: resolved, preset: plan.presetId, packs: plan.packIds, modules: report }, null, 2));
+  assert(!fs.existsSync(resolved), `构建输出已存在，请指定新文件：${resolved}`);
+  const staging = `${resolved}.${randomUUID()}.tmp`;
+  try {
+    const report = buildPatchedArchive(baseline.asar, plan.selectedPatches, staging);
+    try {
+      fs.linkSync(staging, resolved);
+    } catch (error) {
+      if (!["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "EMLINK"].includes(error.code)) throw error;
+      fs.copyFileSync(staging, resolved, fs.constants.COPYFILE_EXCL);
+    }
+    console.log(JSON.stringify({ output: resolved, preset: plan.presetId, packs: plan.packIds, modules: report }, null, 2));
+  } finally {
+    if (fs.existsSync(staging)) fs.unlinkSync(staging);
+  }
 }
 
 function parseCliArgs(argv) {
@@ -268,19 +331,19 @@ function parseCliArgs(argv) {
   for (let i = 0; i < remaining.length; i++) {
     const arg = remaining[i];
     if (arg === "--asar") {
-      assert(i + 1 < remaining.length && remaining[i + 1].trim() && !remaining[i + 1].startsWith("--"), "请为 --asar 提供路径参数");
+      assert(i + 1 < remaining.length && remaining[i + 1].trim() && !remaining[i + 1].startsWith("-"), "请为 --asar 提供路径参数");
       asarPath = remaining[++i];
     } else if (arg.startsWith("--asar=")) {
       asarPath = arg.slice("--asar=".length);
       assert(asarPath.trim(), "请为 --asar= 提供路径参数");
     } else if (arg === "--appimage") {
-      assert(i + 1 < remaining.length && remaining[i + 1].trim() && !remaining[i + 1].startsWith("--"), "请为 --appimage 提供路径参数");
+      assert(i + 1 < remaining.length && remaining[i + 1].trim() && !remaining[i + 1].startsWith("-"), "请为 --appimage 提供路径参数");
       appImagePath = remaining[++i];
     } else if (arg.startsWith("--appimage=")) {
       appImagePath = arg.slice("--appimage=".length);
       assert(appImagePath.trim(), "请为 --appimage= 提供路径参数");
     } else if (arg === "--app") {
-      assert(i + 1 < remaining.length && remaining[i + 1].trim() && !remaining[i + 1].startsWith("--"), "请为 --app 提供路径参数");
+      assert(i + 1 < remaining.length && remaining[i + 1].trim() && !remaining[i + 1].startsWith("-"), "请为 --app 提供路径参数");
       macAppPath = remaining[++i];
     } else if (arg.startsWith("--app=")) {
       macAppPath = arg.slice("--app=".length);
@@ -293,7 +356,8 @@ function parseCliArgs(argv) {
       positional.push(arg);
     }
   }
-  const resolvedCmd = positional[0]
+  const rawCmd = positional[0] === "restore" ? "uninstall" : positional[0];
+  const resolvedCmd = rawCmd
     || (flags.has("--help") ? "help"
       : flags.has("--install") ? "install"
       : flags.has("--repair") ? "repair"
@@ -328,12 +392,32 @@ function stripCliOnlyFlags(argv) {
   return out;
 }
 
+function buildDelegatedArgs(parsed, rawArgv, extraInputPath) {
+  const commandAliases = new Set(["status", "install", "repair", "uninstall", "restore", "--status", "--install", "--repair", "--uninstall"]);
+  const stripped = stripCliOnlyFlags(rawArgv).filter((arg) => !commandAliases.has(arg));
+  const forwarded = [parsed.cmd, ...stripped];
+  if (extraInputPath) {
+    assert(parsed.cmd === "install" || parsed.cmd === "repair", "命令参数不正确");
+    if (!parsed.rest[0]) forwarded.push(extraInputPath);
+  }
+  return forwarded;
+}
+
+function isThemeOnlySelection(parsed) {
+  return Boolean(
+    parsed.flags.has("--theme-only")
+    || parsed.preset === "theme-only"
+    || (Array.isArray(parsed.packs) && parsed.packs.length === 1 && parsed.packs[0].trim().toLowerCase() === "theme")
+  );
+}
+
 function shouldDelegateToLinux(parsed) {
   if (process.platform !== "linux" || parsed.asarPath || process.env.T3CODE_ASAR) return false;
-  if (parsed.cmd === "build") return false;
+  if (parsed.cmd === "build" || parsed.cmd === "help" || parsed.flags.has("--help")) return false;
   const linuxCli = require("./linux.cjs");
-  const installed = fs.existsSync(linuxCli.getLinuxPaths().installDirectory);
-  if ((parsed.flags.has("--theme-only") || parsed.preset === "theme-only") && !installed && !parsed.appImagePath) {
+  const linuxPaths = linuxCli.getLinuxPaths();
+  const installed = fs.existsSync(linuxPaths.installDirectory) || fs.existsSync(linuxPaths.previousDirectory);
+  if (isThemeOnlySelection(parsed) && !installed && !parsed.appImagePath) {
     return false;
   }
   if (parsed.appImagePath || parsed.rest[0]?.endsWith(".AppImage")) return true;
@@ -344,15 +428,15 @@ function shouldDelegateToLinux(parsed) {
 
 function shouldDelegateToMacos(parsed) {
   if (process.platform !== "darwin" || parsed.asarPath || process.env.T3CODE_ASAR) return false;
-  if (parsed.cmd === "build") return false;
+  if (parsed.cmd === "build" || parsed.cmd === "help" || parsed.flags.has("--help")) return false;
   const macosCli = require("./macos.cjs");
   const paths = macosCli.getMacosPaths();
-  const installed = fs.existsSync(paths.installDirectory);
-  if ((parsed.flags.has("--theme-only") || parsed.preset === "theme-only") && !installed && !parsed.macAppPath) {
+  const installed = fs.existsSync(paths.installDirectory) || fs.existsSync(paths.previousApp);
+  if (isThemeOnlySelection(parsed) && !installed && !parsed.macAppPath) {
     return false;
   }
   if (parsed.macAppPath || parsed.rest[0]?.replace(/[/\\]+$/, "").endsWith(".app")) return true;
-  return installed || fs.existsSync(macosCli.DEFAULT_SOURCE) || parsed.flags.has("--shared-data");
+  return installed || fs.existsSync(macosCli.DEFAULT_SOURCE) || parsed.flags.has("--shared-data") || parsed.flags.has("--purge-profile");
 }
 
 function printUsage() {
@@ -391,25 +475,19 @@ async function main() {
 
   if (shouldDelegateToLinux(parsed)) {
     const linuxCli = require("./linux.cjs");
-    const forwarded = stripCliOnlyFlags(rawArgv);
-    if (!rawArgv.length || !["status", "install", "repair", "uninstall", "restore", "build", "help"].includes(rawArgv[0])) {
-      if (rawArgv[0]?.startsWith("--")) forwarded.unshift(cmd);
-    }
-    if ((cmd === "install" || cmd === "repair") && parsed.appImagePath && !rest[0]) forwarded.push(parsed.appImagePath);
-    return linuxCli.runLinuxCli(forwarded);
+    return linuxCli.runLinuxCli(buildDelegatedArgs(parsed, rawArgv, parsed.appImagePath));
   }
   if (shouldDelegateToMacos(parsed)) {
     const macosCli = require("./macos.cjs");
-    const forwarded = stripCliOnlyFlags(rawArgv);
-    if (!rawArgv.length || !["status", "install", "repair", "uninstall", "restore", "build", "help"].includes(rawArgv[0])) {
-      if (rawArgv[0]?.startsWith("--")) forwarded.unshift(cmd);
-    }
-    if ((cmd === "install" || cmd === "repair") && parsed.macAppPath && !rest[0]) forwarded.push(parsed.macAppPath);
-    return macosCli.runMacosCli(forwarded);
+    return macosCli.runMacosCli(buildDelegatedArgs(parsed, rawArgv, parsed.macAppPath));
   }
 
-  if (cmd === "status" || flags.has("--status")) return cmdStatus(asarPath);
+  if (cmd === "status" || flags.has("--status")) {
+    assert(rest.length === 0, "命令参数不正确");
+    return cmdStatus(asarPath);
+  }
   if (cmd === "install" || flags.has("--install")) {
+    assert(rest.length === 0, "命令参数不正确");
     if (flags.has("--banner")) {
       console.log("============================================================");
       console.log("  T3 Code 主题与体验强化通用安装器 (t3code-enhancer)");
@@ -417,7 +495,7 @@ async function main() {
       console.log("============================================================\n");
     }
     if (flags.has("--interactive") && !preset && !packs && !flags.has("--theme-only")) {
-      const pick = await promptInteractiveAction();
+      const pick = await promptInteractiveAction({ patchOnly: flags.has("--patch-only") });
       if (pick.action === "cancel") return;
       if (pick.action === "repair") return cmdRepair(flags, asarPath, {});
       if (pick.action === "uninstall") return cmdUninstall(flags, asarPath);
@@ -427,6 +505,7 @@ async function main() {
     return cmdInstall(flags, asarPath, { preset, packs });
   }
   if (cmd === "repair") {
+    assert(rest.length === 0, "命令参数不正确");
     if (flags.has("--banner")) {
       console.log("============================================================");
       console.log("  T3 Code 主题与体验强化修复工具 (t3code-enhancer)");
@@ -435,6 +514,7 @@ async function main() {
     return cmdRepair(flags, asarPath, { preset, packs });
   }
   if (cmd === "uninstall" || flags.has("--uninstall") || cmd === "restore") {
+    assert(rest.length === 0, "命令参数不正确");
     if (flags.has("--banner")) {
       console.log("============================================================");
       console.log("  T3 Code 主题与体验强化一键卸载 (t3code-enhancer)");
@@ -443,7 +523,10 @@ async function main() {
     }
     return cmdUninstall(flags, asarPath);
   }
-  if (cmd === "build" || flags.has("--build")) return cmdBuild(rest[0], flags, asarPath, { preset, packs });
+  if (cmd === "build" || flags.has("--build")) {
+    assert(rest.length <= 1, "命令参数不正确");
+    return cmdBuild(rest[0], flags, asarPath, { preset, packs });
+  }
 
   printUsage();
 }
@@ -468,4 +551,8 @@ module.exports = {
   getArchiveTargetPaths,
   isLinuxAppRunning,
   parseCliArgs,
+  buildDelegatedArgs,
+  isThemeOnlySelection,
+  shouldDelegateToLinux,
+  shouldDelegateToMacos,
 };
