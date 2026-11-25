@@ -4,7 +4,7 @@ T3 Code 0.1.11 的全功能体验增强、去遥测与 ChatGPT 风格主题工�
 
 适用平台：**Windows 桌面版**（含 `server.asar` 与系统托盘 `app.asar`）、**Linux x86_64**（官方 AppImage / `.deb` 与解压版）以及 **macOS 官方版**（注：macOS 脚本为基于既有 PR 的适配迁移，核心逻辑已通过跨平台单元测试，**尚未在 Mac 真机上实机验证**）。
 
-从 [GitHub Releases](https://github.com/Barometer-2002/t3code-enhancer/releases/latest) 下载安装 ZIP，详细说明与常见问题见 [使用教程](使用教程.md)。
+运行安装脚本需要 Node.js 20 或以上版本。已发布的安装 ZIP 在 [GitHub Releases](https://github.com/Barometer-2002/t3code-enhancer/releases/latest)，仓库源码也可以直接运行。详细安装步骤见 [使用教程](使用教程.md)。
 
 ## 界面预览
 
@@ -60,8 +60,9 @@ node cli.cjs install --theme-only                 # 仅更新主题（无需退�
 node cli.cjs status                               # 查看主题、备份与全模块状态
 node cli.cjs repair                               # 修复损坏 ASAR / 残留临时文件 / 备份与主题
 node cli.cjs uninstall                            # 完整卸载并逐字节还原纯净原版（支持 --keep-theme / --purge-backup / --purge-profile）
-node cli.cjs build /tmp/test.asar                 # 在副本上试构建并校验（不改动已安装的 T3 Code）
-node tests/verify.cjs                             # 运行全部自动化单元测试与干跑构建校验
+node cli.cjs build /tmp/test.asar                 # 构建并校验一个新的 ASAR 文件
+npm run test:unit                                 # 运行无需 T3 Code 安装包的单元测试
+npm test -- /path/to/app.asar                      # 使用官方 T3 Code 0.1.11 ASAR 执行完整校验
 ```
 
 ### Linux（AppImage 与解包版）
@@ -90,7 +91,7 @@ open "$HOME/Applications/T3 Code Enhancer.app"
 支持 `status` / `repair` / `uninstall`、`--shared-data`、`--official`、`--purge-profile`，若需仅更新特定解压版 ASAR 也可回退使用 `node cli.cjs install --asar <path>`。
 
 ## 安全保障
-- 安装前校验原版片段哈希，首次修改自动保存 `.before-t3code-enhancer` 纯净备份（兼容继承早期 `.before-timeline-collapse` 备份）；检测到非 `0.1.11` 未知版本时立即中止，绝不用旧备份覆盖新版本。
+- 安装前校验原版片段哈希，首次修改自动保存 `.before-t3code-enhancer` 纯净备份（兼容早期 `.before-timeline-collapse` 备份）。安装、修复和卸载都会校验当前 ASAR 版本，识别到不兼容的包时会中止。
 - 写入前自动完成脚本语法检查、ASAR 头部 SHA-256 块校验与全量未修改字节比对。
 
 ## 许可与致谢

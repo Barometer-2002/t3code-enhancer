@@ -13,7 +13,8 @@
     "install-enhancer": "node cli.cjs install",
     "repair": "node cli.cjs repair",
     "uninstall-enhancer": "node cli.cjs uninstall",
-    "test": "node tests/verify.cjs"
+    "test": "node tests/verify.cjs",
+    "test:unit": "node tests/verify.cjs --unit"
   },
   "engines": {
     "node": ">=20.0.0"
