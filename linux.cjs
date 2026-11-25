@@ -33,8 +33,9 @@ const {
   uninstallTheme,
 } = require("./lib/theme-manager.cjs");
 
-const T3_VERSION = "0.1.11";
-const APPIMAGE_HASH = "8baa06a7bbaa3f729d69466fb211ed7006d6a6e4d800b9ecdacd831fd1686b14";
+const T3_VERSION = "0.1.12";
+// 待官方发布 v0.1.12 稳定版 x86_64 AppImage 后补录其 SHA-256（避免在未校验哈希前执行 --appimage-extract）
+const APPIMAGE_HASH = null;
 const MANAGED_FILE = ".t3code-enhancer-appimage";
 const SHARED_DATA_FILE = ".t3code-enhancer-shared-data";
 const APP_DIRECTORY = "squashfs-root";
@@ -81,7 +82,9 @@ function isManagedInstall(directory) {
   const stat = fs.lstatSync(directory, { throwIfNoEntry: false });
   if (!stat?.isDirectory()) return false;
   const marker = path.join(directory, MANAGED_FILE);
-  return fs.existsSync(marker) && fs.readFileSync(marker, "utf8") === T3_VERSION + "\n";
+  if (!fs.existsSync(marker)) return false;
+  const content = fs.readFileSync(marker, "utf8").trim();
+  return content === T3_VERSION || /^\d+\.\d+\.\d+/.test(content);
 }
 
 function usesSharedData(directory) {
@@ -113,7 +116,7 @@ function inspectInstall(paths = getLinuxPaths()) {
   assert(isManagedInstall(installDirectory), `安装目录已被其他文件占用：${installDirectory}`);
   const asarPath = path.join(installDirectory, APP_ASAR);
   const backupPath = asarPath + BACKUP_SUFFIX;
-  const { asar, modules } = inspectArchive(asarPath, ALL_PATCHES);
+  const { asar, modules, appVersion } = inspectArchive(asarPath, ALL_PATCHES);
   const summary = summarizeModuleStates(modules);
   const hasBackup = fs.existsSync(backupPath);
   assert(
@@ -122,7 +125,7 @@ function inspectInstall(paths = getLinuxPaths()) {
   );
   const sharedData = usesSharedData(installDirectory);
   const themeStatus = getThemeStatus(getUserdataDir(sharedData, paths));
-  return { sharedData, asar, modules, summary, hasBackup, asarPath, backupPath, themeStatus };
+  return { sharedData, asar, modules, summary, hasBackup, asarPath, backupPath, themeStatus, appVersion };
 }
 
 function status(paths = getLinuxPaths()) {
@@ -135,7 +138,13 @@ function status(paths = getLinuxPaths()) {
     return;
   }
   const installedList = existing.modules.filter((m) => m.installed).map((m) => m.id);
-  console.log(`T3 Code ${T3_VERSION} Linux 增强版已安装，${isRunning(installDirectory) ? "运行中" : "未运行"}。`);
+  const versionStr = existing.appVersion ? `v${existing.appVersion}` : `v${T3_VERSION}`;
+  const compatTier = existing.summary.autoAdapted
+    ? "跨版本自动适配 (auto-adapted)"
+    : existing.summary.allRecognized
+      ? "已验证 (verified)"
+      : "不兼容 (incompatible)";
+  console.log(`T3 Code ${versionStr} Linux 增强版已安装 [兼容性: ${compatTier}]，${isRunning(installDirectory) ? "运行中" : "未运行"}。`);
   console.log(
     existing.summary.allInstalled
       ? "补丁：已是最新版（全部模块）。"
@@ -290,12 +299,22 @@ function install(input, options = {}, paths = getLinuxPaths()) {
       } catch (error) {
         throw new Error(`${error.message}。可传入官方 AppImage 重建受管理的副本。`, { cause: error });
       }
+      const baselineInfo = inspectArchive(baseline.path, ALL_PATCHES);
+      const baselineSummary = summarizeModuleStates(baselineInfo.modules);
+      assert(baselineSummary.allRecognized, `基线 ASAR 包含未识别的版本内容，已中止安装。`);
+      const compatTier = baselineSummary.autoAdapted ? "跨版本自动适配 (auto-adapted)" : "已验证 (verified)";
+      const verStr = baseline.appVersion ? `v${baseline.appVersion}` : `v${T3_VERSION}`;
+      console.log(`[兼容性] 原版基线版本 ${verStr} · ${compatTier}`);
       const stagingAsar = `${asarPath}.${randomUUID()}.tmp`;
       const targetPatches = applicablePatchesForArchive(baseline.asar, selectedPatches);
       try {
         if (targetPatches.length > 0) {
           console.log(`正在基于原版备份构建补丁（${targetPatches.map((p) => p.id).join(" + ")}）…`);
-          buildPatchedArchive(baseline.asar, targetPatches, stagingAsar);
+          const report = buildPatchedArchive(baseline.asar, targetPatches, stagingAsar);
+          for (const r of report) {
+            const tag = r.compat === "auto-adapted" ? " (跨版本自动适配)" : "";
+            console.log(`  ✓ ${r.id} -> ${r.key}${tag}`);
+          }
         } else {
           console.log("正在还原为纯净原版 app.asar…");
           writeVerifiedAsarCopy(baseline.path, stagingAsar, {
@@ -335,6 +354,8 @@ function install(input, options = {}, paths = getLinuxPaths()) {
     try {
       const image = path.join(staging, "T3-Code-x86_64.AppImage");
       fs.copyFileSync(source, image, fs.constants.COPYFILE_EXCL);
+      assert(APPIMAGE_HASH,
+        `暂未收录 T3 Code ${T3_VERSION} 官方 x86_64 AppImage 的 SHA-256，无法安全自动解包。请先手动运行 --appimage-extract 后改用 node cli.cjs install --asar <app.asar路径>`);
       assert.equal(digest(fs.readFileSync(image)), APPIMAGE_HASH,
         `需要官方 T3 Code ${T3_VERSION} x86_64 AppImage（SHA-256 不匹配）`);
       fs.chmodSync(image, 0o700);
@@ -345,6 +366,11 @@ function install(input, options = {}, paths = getLinuxPaths()) {
       const target = path.join(staging, APP_ASAR);
       const backup = target + BACKUP_SUFFIX;
       const baseline = inspectArchive(target, ALL_PATCHES);
+      const baselineSummary = summarizeModuleStates(baseline.modules);
+      assert(baselineSummary.allRecognized, `目标 ASAR 与补丁不兼容，已中止安装。`);
+      const compatTier = baselineSummary.autoAdapted ? "跨版本自动适配 (auto-adapted)" : "已验证 (verified)";
+      const verStr = baseline.appVersion ? `v${baseline.appVersion}` : `v${T3_VERSION}`;
+      console.log(`[兼容性] 检测到版本 ${verStr} · ${compatTier}`);
       writeVerifiedAsarCopy(target, backup, {
         overwrite: true,
         expectedArchive: baseline.asar.archive,
@@ -353,7 +379,11 @@ function install(input, options = {}, paths = getLinuxPaths()) {
       const targetPatches = applicablePatchesForArchive(baseline.asar, selectedPatches);
       if (targetPatches.length > 0) {
         const patched = target + ".patched";
-        buildPatchedArchive(baseline.asar, targetPatches, patched);
+        const report = buildPatchedArchive(baseline.asar, targetPatches, patched);
+        for (const r of report) {
+          const tag = r.compat === "auto-adapted" ? " (跨版本自动适配)" : "";
+          console.log(`  ✓ ${r.id} -> ${r.key}${tag}`);
+        }
         fs.chmodSync(patched, fs.statSync(target).mode & 0o777);
         fs.renameSync(patched, target);
       }

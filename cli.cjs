@@ -43,6 +43,20 @@ function cleanupStaleAsarStaging(sourcePath) {
   }
 }
 
+function getArchiveCompatibilityTier(inspected) {
+  if (!inspected || !Array.isArray(inspected.modules) || inspected.modules.length === 0) {
+    return { tier: "incompatible", label: "不兼容 (incompatible)" };
+  }
+  const summary = summarizeModuleStates(inspected.modules);
+  if (!summary.allRecognized) {
+    return { tier: "incompatible", label: "不兼容 (incompatible)" };
+  }
+  if (summary.autoAdapted) {
+    return { tier: "auto-adapted", label: "跨版本自动适配 (auto-adapted)" };
+  }
+  return { tier: "verified", label: "已验证 (verified)" };
+}
+
 function cmdStatus(asarOverride) {
   const theme = getThemeStatus();
   console.log("=== T3 Code 主题与体验强化状态 ===");
@@ -63,21 +77,34 @@ function cmdStatus(asarOverride) {
   for (const paths of targetPaths) {
     const label = targetPaths.length > 1 ? ` (${path.basename(paths.source)})` : "";
     console.log(`安装包路径${label} :`, paths.source);
+    try {
+      const current = inspectArchive(paths.source);
+      const compat = getArchiveCompatibilityTier(current);
+      const versionStr = current.appVersion ? `v${current.appVersion}` : "未知版本";
+      console.log(`检测版本与兼容性${label} : ${versionStr} · ${compat.label}`);
+    } catch (err) {
+      console.log(`检测版本与兼容性${label} : 未知版本 · 不兼容 (incompatible) - ${err.message}`);
+    }
     console.log(`原版 ASAR 备份${label} :`, fs.existsSync(paths.backup) ? paths.backup : fs.existsSync(paths.legacyBackup) ? `${paths.legacyBackup}（旧版备份，安装时将自动继承）` : "尚未创建");
   }
   console.log("\n前端与桌面增强模块：");
   for (const paths of targetPaths) {
-    const current = inspectArchive(paths.source);
+    let current;
+    try {
+      current = inspectArchive(paths.source);
+    } catch {
+      continue;
+    }
     for (const m of current.modules) {
       const state = m.installed
-        ? "已安装（最新）"
+        ? (m.compat === "auto-adapted" ? "已安装（跨版本自动适配）" : "已安装（最新）")
         : m.outdated
           ? `已安装旧版（关闭 T3 Code 后重新运行 ${upgradeHint} 升级）`
           : m.pristine
-            ? "未安装（兼容原版）"
+            ? (m.compat === "auto-adapted" ? "未安装（跨版本自动适配）" : "未安装（兼容原版）")
             : current.modules.some((related) => related.key === m.key && (related.installed || related.outdated))
               ? "未安装（同一文件已有其他补丁）"
-              : "未识别版本";
+              : "未识别版本（不兼容）";
       console.log(`  - [${m.installed ? "✓" : m.outdated ? "↑" : " "}] ${m.id} (${m.name}) : ${state}`);
     }
   }
@@ -85,10 +112,14 @@ function cmdStatus(asarOverride) {
 
 function stageAsarPlan(plan, paths, staging) {
   const asarName = path.basename(paths.source);
-  const baseline = resolvePristineBaseline(paths);
+  const baseline = resolvePristineBaseline(paths, plan.selectedPatches);
   const targetPatches = applicablePatchesForArchive(baseline.asar, plan.selectedPatches);
+  const versionStr = baseline.appVersion ? `v${baseline.appVersion}` : "未知版本";
   if (targetPatches.length > 0) {
-    console.log(`[补丁] 正在基于干净原版基线构建 ${asarName}（${targetPatches.map((p) => p.id).join(" + ")}）...`);
+    const inspectedBaseline = inspectArchive(baseline.path, targetPatches);
+    const compatTier = getArchiveCompatibilityTier(inspectedBaseline);
+    assert(compatTier.tier !== "incompatible", `当前 ${asarName} 与所选补丁不兼容（${versionStr}），已中止。`);
+    console.log(`[补丁] 正在基于干净原版基线构建 ${asarName} [${versionStr} · 兼容性: ${compatTier.label}]（${targetPatches.map((p) => p.id).join(" + ")}）...`);
     const report = buildPatchedArchive(baseline.asar, targetPatches, staging);
     if (baseline.path !== paths.backup) {
       writeVerifiedAsarCopy(baseline.path, paths.backup, {
@@ -98,13 +129,16 @@ function stageAsarPlan(plan, paths, staging) {
       });
     }
     return () => {
-      for (const r of report) console.log(`[补丁] ✓ ${r.id} -> ${r.key} (${r.patched.slice(0, 12)})`);
+      for (const r of report) {
+        const compatTag = r.compat === "auto-adapted" ? " (跨版本自动适配)" : "";
+        console.log(`[补丁] ✓ ${r.id} -> ${r.key} (${r.patched.slice(0, 12)})${compatTag}`);
+      }
       console.log(`[备份] 原版安全备份位于：${paths.backup}`);
     };
   }
   if (inspectCompatibleSource(paths.source)?.modules.every((m) => m.pristine)) return;
   writeVerifiedAsarCopy(baseline.path, staging, { expectedArchive: baseline.asar.archive });
-  return () => console.log(`[补丁] 已还原纯净原版 ${asarName}（来源：${baseline.path}）`);
+  return () => console.log(`[补丁] 已还原纯净原版 ${asarName} [${versionStr}]（来源：${baseline.path}）`);
 }
 
 function runAsarTransaction(targetPaths, stage, { cleanup = false } = {}) {
@@ -306,16 +340,26 @@ function cmdBuild(outputPath, flags, asarOverride, planOptions = {}) {
   });
   const resolved = path.resolve(outputPath);
   assert(!fs.existsSync(resolved), `构建输出已存在，请指定新文件：${resolved}`);
+  const targetPatches = applicablePatchesForArchive(baseline.asar, plan.selectedPatches);
   const staging = `${resolved}.${randomUUID()}.tmp`;
   try {
-    const report = buildPatchedArchive(baseline.asar, plan.selectedPatches, staging);
+    const report = buildPatchedArchive(baseline.asar, targetPatches, staging);
     try {
       fs.linkSync(staging, resolved);
     } catch (error) {
       if (!["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "EMLINK"].includes(error.code)) throw error;
       fs.copyFileSync(staging, resolved, fs.constants.COPYFILE_EXCL);
     }
-    console.log(JSON.stringify({ output: resolved, preset: plan.presetId, packs: plan.packIds, modules: report }, null, 2));
+    const inspected = inspectArchive(baseline.path, targetPatches.length > 0 ? targetPatches : ALL_PATCHES);
+    const compatTier = getArchiveCompatibilityTier(inspected);
+    console.log(JSON.stringify({
+      output: resolved,
+      preset: plan.presetId,
+      packs: plan.packIds,
+      appVersion: baseline.appVersion || null,
+      compatibility: compatTier.tier,
+      modules: report,
+    }, null, 2));
   } finally {
     if (fs.existsSync(staging)) fs.unlinkSync(staging);
   }
@@ -555,4 +599,5 @@ module.exports = {
   isThemeOnlySelection,
   shouldDelegateToLinux,
   shouldDelegateToMacos,
+  getArchiveCompatibilityTier,
 };

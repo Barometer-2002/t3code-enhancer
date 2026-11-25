@@ -32,7 +32,7 @@ const {
   uninstallTheme,
 } = require("./lib/theme-manager.cjs");
 
-const T3_VERSION = "0.1.11";
+const T3_VERSION = "0.1.12";
 const T3_TEAM_ID = "ARK85ZXQ4Z";
 const DEFAULT_SOURCE = "/Applications/T3 Code (Beta).app";
 const BUNDLE_ID = "com.t3tools.t3code.enhancer";
@@ -46,9 +46,15 @@ const INFO_PLIST = path.join("Contents", "Info.plist");
 const userDataPatch = {
   id: "macos-user-data",
   name: "独立 Electron 用户数据目录",
+  scope: "desktop",
   marker: `"${PROFILE_NAME}/electron"`,
+  legacyMarkers: [],
   targetRegex: /^apps\/desktop\/dist-electron\/main\.cjs$/,
-  originalHash: "873697d72e3daf3388b16ff8b0ca68bb2cbe15327005b8404b755b53228ebcc6",
+  targetSpec: {
+    pathRegex: /^apps\/desktop\/dist-electron\/main\.cjs$/,
+    includes: ['current: "t3code-v2",'],
+  },
+  originalHash: "3767e3a14ef66756b8e404e11a2a472bb22c1993f710b932653f24bd29f50cdd",
   apply(text) {
     const anchor = 'current: "t3code-v2",';
     assert.equal(text.split(anchor).length, 2, "无法唯一定位 userData 目录名");
@@ -98,8 +104,9 @@ function writePlist(app, key, value) {
 function isManagedInstall(app) {
   const stat = fs.lstatSync(app, { throwIfNoEntry: false });
   if (!stat?.isDirectory() || !fs.existsSync(path.join(app, INFO_PLIST))) return false;
+  const version = readOptionalPlist(app, "CFBundleShortVersionString");
   return readOptionalPlist(app, "CFBundleIdentifier") === BUNDLE_ID
-    && readOptionalPlist(app, "CFBundleShortVersionString") === T3_VERSION;
+    && (version === T3_VERSION || (typeof version === "string" && /^\d+\.\d+\.\d+/.test(version)));
 }
 
 // --shared-data 安装不设置 T3CODE_HOME，和官方版一样使用 ~/.t3。
@@ -180,13 +187,13 @@ function selectMacosPatches(sharedData, options = {}) {
 
 function inspectMacosModules(asarPath, sharedData) {
   const expectedPatches = sharedData ? ALL_PATCHES : PATCHES;
-  const { modules } = inspectArchive(asarPath, expectedPatches);
+  const { modules, appVersion } = inspectArchive(asarPath, expectedPatches);
   const summary = summarizeModuleStates(modules);
   assert(
     summary.allRecognized && (summary.hasKnownEnhancement || summary.allPristine),
     "安装目录中的补丁不完整或无法识别"
   );
-  return { modules, summary };
+  return { modules, summary, appVersion };
 }
 
 function inspectInstall(paths = getMacosPaths()) {
@@ -194,10 +201,10 @@ function inspectInstall(paths = getMacosPaths()) {
   if (!fs.lstatSync(installDirectory, { throwIfNoEntry: false })) return null;
   assert(isManagedInstall(installDirectory), `安装位置已被其他应用占用：${installDirectory}`);
   const sharedData = usesSharedData(installDirectory);
-  const { modules, summary } = inspectMacosModules(path.join(installDirectory, APP_ASAR), sharedData);
+  const { modules, summary, appVersion } = inspectMacosModules(path.join(installDirectory, APP_ASAR), sharedData);
   const currentEnv = readOptionalPlist(installDirectory, "LSEnvironment", "json", {});
   const themeStatus = getThemeStatus(getUserdataDir(sharedData, paths));
-  return { sharedData, modules, summary, currentEnv, themeStatus };
+  return { sharedData, modules, summary, currentEnv, themeStatus, appVersion };
 }
 
 function status(existing, paths = getMacosPaths()) {
@@ -210,7 +217,13 @@ function status(existing, paths = getMacosPaths()) {
     return;
   }
   const installedList = existing.modules.filter((m) => m.installed).map((m) => m.id);
-  console.log(`T3 Code ${T3_VERSION} macOS 增强版已安装，${isRunning(paths, { allowMissing: true }) ? "运行中" : "未运行"}。`);
+  const versionStr = existing.appVersion ? `v${existing.appVersion}` : `v${T3_VERSION}`;
+  const compatTier = existing.summary.autoAdapted
+    ? "跨版本自动适配 (auto-adapted)"
+    : existing.summary.allRecognized
+      ? "已验证 (verified)"
+      : "不兼容 (incompatible)";
+  console.log(`T3 Code ${versionStr} macOS 增强版已安装 [兼容性: ${compatTier}]，${isRunning(paths, { allowMissing: true }) ? "运行中" : "未运行"}。`);
   console.log(
     existing.summary.allInstalled
       ? "补丁：已是最新版（全部模块）。"
@@ -344,7 +357,8 @@ function install(input = DEFAULT_SOURCE, options = {}, paths = getMacosPaths()) 
     assert(fs.existsSync(source), `找不到官方 T3 Code 应用：${source}（请传入实际 .app 路径或使用 --app <路径>）`);
     assert(fs.existsSync(path.join(source, INFO_PLIST)), `无效的官方 T3 Code 应用（缺少 ${INFO_PLIST}）：${source}`);
     console.log("校验官方 T3 Code 的版本与签名…");
-    assert.equal(readPlist(source, "CFBundleShortVersionString"), T3_VERSION, `需要官方 T3 Code ${T3_VERSION}`);
+    const sourceVersion = readPlist(source, "CFBundleShortVersionString");
+    assert(sourceVersion, `无法读取官方应用版本：${source}`);
     const staging = fs.mkdtempSync(path.join(paths.applicationsDirectory, ".t3code-enhancer-"));
     try {
       const app = path.join(staging, `${DISPLAY_NAME}.app`);
@@ -361,9 +375,18 @@ function install(input = DEFAULT_SOURCE, options = {}, paths = getMacosPaths()) 
       const patched = target + ".patched";
       if (selectedPatches.length > 0) {
         const inspectedTarget = inspectArchive(target, selectedPatches);
+        const targetSummary = summarizeModuleStates(inspectedTarget.modules);
+        assert(targetSummary.allRecognized, `目标 ASAR 与补丁不兼容（版本 ${sourceVersion}），已中止安装。`);
+        const compatTier = targetSummary.autoAdapted ? "跨版本自动适配 (auto-adapted)" : "已验证 (verified)";
+        const detectedVer = inspectedTarget.appVersion || sourceVersion;
+        console.log(`[兼容性] 检测到版本 v${detectedVer} · ${compatTier}`);
         const targetPatches = applicablePatchesForArchive(inspectedTarget.asar, selectedPatches);
         if (targetPatches.length > 0) {
-          buildPatchedArchive(inspectedTarget.asar, targetPatches, patched);
+          const report = buildPatchedArchive(inspectedTarget.asar, targetPatches, patched);
+          for (const r of report) {
+            const tag = r.compat === "auto-adapted" ? " (跨版本自动适配)" : "";
+            console.log(`  ✓ ${r.id} -> ${r.key}${tag}`);
+          }
           fs.chmodSync(patched, fs.statSync(target).mode & 0o777);
           fs.renameSync(patched, target);
         }
