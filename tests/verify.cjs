@@ -149,9 +149,8 @@ assert.equal(usageRings.t3SelectPrimaryQuotaForModel([
 console.log("   OK");
 
 console.log("3.5. Unit testing inline-file-diff unified diff parser...");
-const parsedDiff = inlineFileDiff.t3ParseUnifiedDiff(
-  "diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n@@ -2,3 +2,4 @@\n ctx\n-old1\n+new1\n+new2\n end\n"
-);
+const rawDiff = "diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n@@ -2,3 +2,4 @@\n ctx\n-old1\n+new1\n+new2\n end\n";
+const parsedDiff = inlineFileDiff.t3ParseUnifiedDiff(rawDiff);
 assert.equal(parsedDiff.additions, 2);
 assert.equal(parsedDiff.deletions, 1);
 assert.equal(parsedDiff.rows.length, 5);
@@ -160,6 +159,13 @@ assert.equal(parsedDiff.rows[1].lineNo, "3");
 assert.equal(parsedDiff.rows[2].kind, "add");
 assert.equal(parsedDiff.rows[2].lineNo, "3");
 assert.equal(parsedDiff.rows[3].lineNo, "4");
+const limitedDiff = inlineFileDiff.t3ParseUnifiedDiff(rawDiff.replaceAll("\n", "\r\n"), null, null, 2);
+assert.deepEqual(limitedDiff.rows, parsedDiff.rows.slice(0, 2));
+assert.equal(limitedDiff.rowCount, parsedDiff.rows.length);
+assert.equal(limitedDiff.additions, parsedDiff.additions);
+assert.equal(limitedDiff.deletions, parsedDiff.deletions);
+const countsOnlyDiff = inlineFileDiff.t3ParseUnifiedDiff(rawDiff, null, null, 0);
+assert.deepEqual(countsOnlyDiff, { ...parsedDiff, rows: [] });
 const fallbackDiff = inlineFileDiff.t3ParseUnifiedDiff("", "a\nb", "a\nc\nd");
 assert.equal(fallbackDiff.deletions, 2);
 assert.equal(fallbackDiff.additions, 3);
@@ -223,7 +229,7 @@ const openFrame = placeSurfaceFloat(roomy, [], true);
 const nextFrame = placeSurfaceFloat(roomy, [openFrame], false);
 assert(nextFrame.x + nextFrame.width <= openFrame.x, "The next window should use the empty left side");
 assert.equal(placeSurfaceFloat(floatBounds, [], true, { x: 10, y: 10 }).x, 8);
-assert.equal(workspaceFloatingPanels.marker, "T3_WORKSPACE_FLOATING_PANELS_V22");
+assert(workspaceFloatingPanels.legacyMarkers.includes("T3_WORKSPACE_FLOATING_PANELS_V22"));
 console.log("   OK");
 
 function verifyFloatingPanelPortal(asar) {
@@ -674,11 +680,14 @@ function verifyNativePreviewPosition(asar) {
   const source = findUniqueEntry(asar, patch.targetRegex, patch.id).content.toString("utf8");
   const nativeSurface = source.match(/function _D\(e\)\{[\s\S]+?(?=function vD\()/);
   const syncPreview = source.match(/^function t3SyncNativePreview\(container\) \{[\s\S]+?^\}/m);
-  assert(nativeSurface && syncPreview, "Missing preview position sync in patched archive");
+  const movePreview = source.match(/^const t3PanelMovesPending = new WeakSet\(\);[\s\S]+?(?=^function t3SyncNativePreview)/m);
+  assert(nativeSurface && syncPreview && movePreview, "Missing preview position sync in patched archive");
   const reports = [];
   const fits = [];
   const window = new EventTarget();
-  const [render, sync] = runInNewContext(nativeSurface[0] + "\n" + syncPreview[0] + "\n[_D, t3SyncNativePreview]", {
+  const pendingFrames = [];
+  const [render, sync, movePanelHost] = runInNewContext(
+    nativeSurface[0] + "\n" + syncPreview[0] + "\n" + movePreview[0] + "\n[_D, t3SyncNativePreview, t3MovePanelHost]", {
     Q: { c: (size) => Array(size).fill(Symbol.for("react.memo_cache_sentinel")) },
     Z: { useRef: (value) => ({ current: value }), useLayoutEffect() {} },
     $: { jsx: (_type, props) => props },
@@ -689,6 +698,7 @@ function verifyNativePreviewPosition(asar) {
     Am: () => () => {},
     t3BrowserLayoutMode: workspaceFloatingPanels.t3BrowserLayoutMode,
     document: { querySelectorAll: () => [] },
+    requestAnimationFrame: (callback) => pendingFrames.push(callback),
     Event,
     window
   });
@@ -725,9 +735,21 @@ function verifyNativePreviewPosition(asar) {
   sync(frame);
   assert.deepEqual(fits, [false, "responsive", false]);
   assert.equal(reports.at(-1).zIndex, 30);
+  const host = { isConnected: true, parentElement: null, querySelectorAll: () => [viewport] };
+  const makeSlot = (x) => ({ appendChild(panel) {
+    panel.parentElement = this;
+    bounds = { ...bounds, x };
+  } });
+  movePanelHost(host, makeSlot(70));
+  movePanelHost(host, makeSlot(120));
+  assert.equal(pendingFrames.length, 1, "Multiple panel moves in one frame share one layout notification");
+  assert.equal(reports.length, 5, "The native preview waits for the final layout");
+  pendingFrames.shift()();
+  assert.equal(reports.length, 6);
+  assert.equal(reports.at(-1).rect.x, 120);
   cleanup();
   sync(frame);
-  assert.equal(reports.length, 5);
+  assert.equal(reports.length, 6);
   assert.equal(workspaceFloatingPanels.t3BrowserLayoutMode(viewport, true), true);
 }
 
@@ -804,6 +826,7 @@ function verifyInlineEditDetail(asar) {
   let request;
   let checkpointRequest;
   let checkpointReply = {};
+  const parseLimits = [];
   let source;
   let uuidSeq = 0;
   const jsx = (type, props) => ({ type, props });
@@ -833,7 +856,10 @@ function verifyInlineEditDetail(asar) {
       t3IsZhLocale: () => false,
       t3ShortFileName: (path) => path,
       t3EnsureDiffStyles() {},
-      t3ParseUnifiedDiff: inlineFileDiff.t3ParseUnifiedDiff,
+      t3ParseUnifiedDiff: (...args) => {
+        parseLimits.push(args[3]);
+        return inlineFileDiff.t3ParseUnifiedDiff(...args);
+      },
       T3ObserveIntersection: (node, callback) => {
         assert.equal(node, rowElement);
         observeRow = callback;
@@ -892,12 +918,17 @@ function verifyInlineEditDetail(asar) {
   const [header, preview] = cardTree().props.children;
   const [lead, actions] = header.props.children;
   const [title] = lead.props.children;
+  assert.equal(parseLimits.at(-1), 320, "The card should materialize only the preview rows");
   assert.deepEqual(rowStats(), lead.props.children[1], "A collapsed row should show the expanded card's exact line totals");
+  assert.equal(parseLimits.at(-1), 0, "The collapsed row should compute counts without constructing rows");
+  const parseCount = parseLimits.length;
   assert.equal(rowStats(true), null, "The expanded header must show the counts only once");
+  assert.equal(parseLimits.length, parseCount, "The expanded row label must not parse the card's diff again");
   assert.equal(request, null, "An expanded row must leave detail loading to the card");
-  projected.item = { ...summary, additions: 4, deletions: 0 };
+  projected.item = { ...summary, diffStr: addedLines, additions: 4, deletions: 0 };
   assert.match(JSON.stringify(rowStats()), /"\+","4"/);
   assert.equal(request, null, "Known line totals must not fetch file details");
+  assert.equal(parseLimits.length, parseCount, "Known line totals must not parse embedded diff content");
   projected.item = summary;
   assert.equal(title.props["aria-expanded"], undefined);
   assert.equal(preview.props.children[0].length, 320);
@@ -1143,6 +1174,8 @@ function verifyUsageRingsUX(asar) {
   const jsx = (type, props) => ({ type, props: props || {} });
   let activeRingsCtx = null;
   let activeComposerCtx = null;
+  let activeContextWindow = null;
+  let activeThreadStats = null;
   const states = [];
   let stateCursor = 0;
   let openArg = true;
@@ -1156,7 +1189,12 @@ function verifyUsageRingsUX(asar) {
     Z: {
       Fragment: Symbol("Fragment"),
       createContext: (def) => ({ _def: def }),
-      useContext: (ctx) => (ctx === sandbox.T3ComposerCtx ? activeComposerCtx : activeRingsCtx),
+      useContext: (ctx) => {
+        if (ctx === sandbox.T3ComposerCtx) return activeComposerCtx;
+        if (ctx === sandbox.T3ContextWindowCtx) return activeContextWindow;
+        if (ctx === sandbox.T3ThreadStatsCtx) return activeThreadStats;
+        return activeRingsCtx;
+      },
       useState: (init) => {
         const idx = stateCursor++;
         if (!(idx in states)) states[idx] = typeof init === "function" ? init() : init;
@@ -1193,7 +1231,7 @@ function verifyUsageRingsUX(asar) {
   };
 
   runInNewContext(
-    runtimeCode + "\nObject.assign(globalThis, { T3RingsCtx, T3ComposerCtx, T3RingsCtxProvider, T3ComposerCtxProvider, T3ComposerPlusMenu, T3EffortSlider, T3ComposerQuotaRing, T3QuotaPopoverCard, T3ComposerContextRing, T3ContextPopoverCard, T3UnifiedModelControls });",
+    runtimeCode + "\nObject.assign(globalThis, { T3RingsCtx, T3ComposerCtx, T3ContextWindowCtx, T3ThreadStatsCtx, T3RingsCtxProvider, T3ComposerCtxProvider, T3ComposerPlusMenu, T3EffortSlider, T3ComposerQuotaRing, T3QuotaPopoverCard, T3ComposerContextRing, T3ContextPopoverCard, T3UnifiedModelControls });",
     sandbox
   );
 
@@ -1207,10 +1245,18 @@ function verifyUsageRingsUX(asar) {
   memoSlots.length = 0;
   memoCursor = 0;
   const emptyArr = [];
-  const rNode1 = sandbox.T3RingsCtxProvider({ providerInstanceId: "p1", providers: emptyArr, sources: emptyArr, contextWindow: null, activeModel: "m1", runs: emptyArr, messages: emptyArr, turnItems: emptyArr, children: "c" });
+  const providerProps = { providerInstanceId: "p1", providers: emptyArr, sources: emptyArr, contextWindow: null, activeModel: "m1", runs: emptyArr, messages: emptyArr, turnItems: emptyArr, children: "c" };
+  const rNode1 = sandbox.T3RingsCtxProvider(providerProps);
   memoCursor = 0;
-  const rNode2 = sandbox.T3RingsCtxProvider({ providerInstanceId: "p1", providers: emptyArr, sources: emptyArr, contextWindow: null, activeModel: "m1", runs: emptyArr, messages: emptyArr, turnItems: emptyArr, children: "c" });
+  const rNode2 = sandbox.T3RingsCtxProvider(providerProps);
   assert.equal(rNode1.props.value, rNode2.props.value, "T3RingsCtx value must stay referentially identical across unrelated ChatView renders");
+  memoCursor = 0;
+  const newWindow = { usedTokens: 40 };
+  const newTurnItems = [{ type: "file_change" }];
+  const rNode3 = sandbox.T3RingsCtxProvider({ ...providerProps, contextWindow: newWindow, turnItems: newTurnItems });
+  assert.equal(rNode3.props.value, rNode2.props.value, "Context or history updates must not notify quota consumers");
+  assert.equal(rNode3.props.children.props.value, newWindow);
+  assert.equal(rNode3.props.children.props.children.props.value.turnItems, newTurnItems);
   memoSlots.length = 0;
   stateCursor = 0;
   memoCursor = 0;
@@ -1286,7 +1332,12 @@ function verifyUsageRingsUX(asar) {
       { ...turn, status: "running", completedAt: null },
     ],
   };
-  const contextCard = sandbox.T3ContextPopoverCard({ usage, stats, loc: "zh-CN" });
+  const renderContextCard = (statsInput) => {
+    activeThreadStats = statsInput;
+    memoCursor = 0;
+    return sandbox.T3ContextPopoverCard({ usage, loc: "zh-CN" });
+  };
+  const contextCard = renderContextCard(stats);
   const metricValue = (tree, key) => findNodes(tree, (node) => node.props?.["data-metric"] === key)[0].props.children[1].props.children;
   assert.equal(metricValue(contextCard, "activity")[0], "3 轮 · 12 步");
   assert.equal(metricValue(contextCard, "speed")[0], "94");
@@ -1297,14 +1348,12 @@ function verifyUsageRingsUX(asar) {
     { ...turn, turnTokenUsage: { usageStatus: "partial", outputTokens: 940 } },
     { ...turn, startedAt: turn.completedAt },
   ]) {
-    const incompleteCard = sandbox.T3ContextPopoverCard({
-      usage, stats: { ...stats, providerTurns: [incomplete] }, loc: "zh-CN",
-    });
+    const incompleteCard = renderContextCard({ ...stats, providerTurns: [incomplete] });
     assert.equal(metricValue(incompleteCard, "speed")[0], "—");
     assert.equal(metricValue(incompleteCard, "speed")[1], null);
   }
-  const savedRingsCtx = activeRingsCtx;
-  activeRingsCtx = { ...savedRingsCtx, contextWindow: usage, threadStats: stats };
+  activeContextWindow = usage;
+  activeThreadStats = stats;
   states.length = 0;
   stateCursor = 0;
   sandbox.T3ComposerContextRing().props.onOpenChange(true);
@@ -1312,8 +1361,8 @@ function verifyUsageRingsUX(asar) {
   const openContextRing = sandbox.T3ComposerContextRing();
   const openContextPopup = findNodes(openContextRing, (node) => node.type === "PopoverContent")[0];
   assert.equal(openContextPopup.props.children.type, sandbox.T3ContextPopoverCard);
-  assert.equal(openContextPopup.props.children.props.stats, stats);
-  activeRingsCtx = savedRingsCtx;
+  assert.equal(openContextPopup.props.children.props.usage, usage);
+  activeContextWindow = null;
   states.length = 0;
   stateCursor = 0;
   delete sandbox.document.documentElement;
@@ -1335,9 +1384,20 @@ function verifyUsageRingsUX(asar) {
   const selectedCalls = [];
   const modelOptionsByInstance = new Map([
     ["codex-1", [{ slug: "gpt-6", name: "GPT-6" }]],
-    ["ag-2", [{ slug: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" }, { slug: "claude-opus-4-6-thinking", name: "Claude Opus 4.6" }]],
+    ["ag-2", [
+      { slug: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" },
+      { slug: "claude-opus-4-6-thinking", name: "Claude Opus 4.6" },
+      ...Array.from({ length: 5 }, (_, index) => ({ slug: "model-" + index, name: "Model " + index })),
+    ]],
     ["claude-vps", [{ slug: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" }]],
   ]);
+  let modelListScans = 0;
+  for (const options of modelOptionsByInstance.values()) {
+    options.filter = function (predicate) {
+      modelListScans++;
+      return Array.prototype.filter.call(this, predicate);
+    };
+  }
   const instanceEntries = providers.map((p) => ({ instanceId: p.instanceId, displayName: p.displayName, driverKind: "codex", enabled: true }));
   const renderControls = () => {
     stateCursor = 0;
@@ -1355,10 +1415,12 @@ function verifyUsageRingsUX(asar) {
     });
   };
   let tree = renderControls();
+  assert.equal(modelListScans, 0, "Effort view must not scan the model catalog");
   const switchBtn = findNodes(tree, (n) => n.props && n.props.className === "t3e-effort-switch-btn")[0];
   assert(switchBtn, "Initial view must show effort card with model switch button");
   switchBtn.props.onClick();
   tree = renderControls();
+  assert.equal(modelListScans, 1, "Opening the model view scans the active catalog once");
   const agChip = findNodes(tree, (n) => n.props && n.props.className?.includes("t3e-harness-chip") && JSON.stringify(n).includes("Antigravity2"))[0];
   assert(agChip, "Must render Antigravity2 harness chip");
   agChip.props.onClick();
@@ -1366,6 +1428,13 @@ function verifyUsageRingsUX(asar) {
   const quotaBar = findNodes(tree, (n) => n.props && n.props.className === "t3e-harness-quota")[0];
   assert.equal(quotaBar.props["data-harness-id"], "ag-2");
   assert.match(JSON.stringify(quotaBar), /95%.*40%|40%.*95%/);
+  const searchInput = (node) => findNodes(node, (item) => item.props?.className === "t3e-model-search")[0];
+  searchInput(tree).props.onChange({ currentTarget: { value: "unmatched" } });
+  tree = renderControls();
+  assert.equal(searchInput(tree).props.value, "unmatched", "Keep the search input mounted after filtering out every model");
+  assert.match(JSON.stringify(tree), /No matching models/);
+  searchInput(tree).props.onChange({ currentTarget: { value: "" } });
+  tree = renderControls();
   const claudeRow = findNodes(tree, (n) => n.props && String(n.props.className || "").includes("t3e-model-row") && JSON.stringify(n).includes("Claude Opus 4.6"))[0];
   assert.match(JSON.stringify(claudeRow), /40%/);
   claudeRow.props.onClick();
@@ -1889,13 +1958,27 @@ function verifyFilesChangesExplorer(asar) {
   assert(feCode.includes('className: "t3e-fe-file-main"'), "Changed file row must expose native button separate from diff badge");
   const idx = feCode.indexOf(`/* ${filesChangesExplorer.marker} */`);
   assert(idx >= 0);
-  const { t3BuildChangedFileTree, T3FeChangedTreeNodes } = runInNewContext(
-    feCode.slice(idx) + "\n({ t3BuildChangedFileTree, T3FeChangedTreeNodes })",
+  let gitCalls = 0;
+  let treeScans = 0;
+  let changesOpen = true;
+  let stateCursor = 0;
+  const files = [{ path: "src/file.ts", insertions: 2, deletions: 1 }];
+  files[Symbol.iterator] = function () {
+    treeScans++;
+    return Array.prototype[Symbol.iterator].call(this);
+  };
+  const { t3BuildChangedFileTree, T3FeChangedTreeNodes, T3FilesChangesLayout } = runInNewContext(
+    feCode.slice(idx) + "\n({ t3BuildChangedFileTree, T3FeChangedTreeNodes, T3FilesChangesLayout })",
     {
       $: { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) },
-      Z: { Fragment: Symbol("Fragment"), useState: (i) => [i, () => {}], useEffect() {}, useMemo: (f) => f() },
-      t3GitQueries: { status: () => null },
-      t3UseQuery: () => ({ data: null }),
+      Z: {
+        Fragment: Symbol("Fragment"),
+        useState: (i) => [stateCursor++ === 0 ? changesOpen : i, () => {}],
+        useEffect() {},
+        useMemo: (f) => f()
+      },
+      t3GitQueries: { status: () => { gitCalls++; return true; } },
+      t3UseQuery: (atom) => ({ data: atom ? { workingTree: { files } } : null }),
       t3DiffPanelStore: { getState: () => ({ selectGitScope() {} }) },
       t3RightPanelStore: { getState: () => ({ open() {} }) },
     }
@@ -1919,6 +2002,19 @@ function verifyFilesChangesExplorer(asar) {
     openAllChanges: () => {},
   });
   assert.equal(collapsedTree[0].props.children[0].props["aria-expanded"], true, "Active search must auto-expand collapsed directories");
+  const props = { environmentId: "env", cwd: "/repo", allFilesNode: {} };
+  stateCursor = 0;
+  T3FilesChangesLayout(props);
+  assert.equal(gitCalls, 0, "No Git status lookup without a thread that can open the Changes panel");
+  stateCursor = 0;
+  const threadRef = { environmentId: "env", threadId: "thread" };
+  T3FilesChangesLayout({ ...props, threadRef });
+  assert.equal(gitCalls, 1);
+  assert.equal(treeScans, 1);
+  changesOpen = false;
+  stateCursor = 0;
+  T3FilesChangesLayout({ ...props, threadRef });
+  assert.equal(treeScans, 1, "A collapsed changes pane skips rebuilding its file tree");
 }
 
 if (process.argv[2] === "--unit") {
