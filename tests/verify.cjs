@@ -1129,6 +1129,7 @@ function verifyUsageRingsUX(asar) {
   const chat = findUniqueEntry(asar, usageRings.targetRegex, usageRings.id).content.toString("utf8");
   assert.match(chat, /T3ComposerCtxProvider,\{canAttach:go,[^}]*providerInstanceId:Br,/);
   assert.match(chat, /T3RingsCtxProvider,\{providerInstanceId:vs,/);
+  assert.match(chat, /providerTurns:Y\?\.providerTurns,activeProviderThreadId:Y\?\.thread\?\.activeProviderThreadId/);
   assert.match(chat, /\.t3e-slider-fill \{[\s\S]*?z-index: 1;/);
   assert.match(chat, /\.t3e-effort-tick \{[\s\S]*?z-index: 2;/);
   assert.match(chat, /\.t3e-effort-tick\[data-filled="true"\]/);
@@ -1187,11 +1188,12 @@ function verifyUsageRingsUX(asar) {
     Jr: () => [{ id: "low", label: "Low" }, { id: "medium", label: "Medium" }, { id: "high", label: "High" }, { id: "max", label: "Max" }],
     Xn: () => true, px: "px", el: "PopoverRoot", Qc: "PopoverTrigger", Zc: "PopoverContent", tp: "Link",
     SH: "Section", jU: "Row", jn: "TipRoot", an: "TipTrig", Zt: "TipContent", za: "PlusIcon",
+    GP: String,
     qI: () => {},
   };
 
   runInNewContext(
-    runtimeCode + "\nObject.assign(globalThis, { T3RingsCtx, T3ComposerCtx, T3RingsCtxProvider, T3ComposerCtxProvider, T3ComposerPlusMenu, T3EffortSlider, T3ComposerQuotaRing, T3QuotaPopoverCard, T3UnifiedModelControls });",
+    runtimeCode + "\nObject.assign(globalThis, { T3RingsCtx, T3ComposerCtx, T3RingsCtxProvider, T3ComposerCtxProvider, T3ComposerPlusMenu, T3EffortSlider, T3ComposerQuotaRing, T3QuotaPopoverCard, T3ComposerContextRing, T3ContextPopoverCard, T3UnifiedModelControls });",
     sandbox
   );
 
@@ -1266,6 +1268,54 @@ function verifyUsageRingsUX(asar) {
   sandbox.document.documentElement = { lang: "zh-CN" };
   const popCardZh = sandbox.T3QuotaPopoverCard({ limits: providers[1].usageLimits, now: Date.parse("2026-11-25T00:00:00Z"), tFn: (v) => v, fmtFn: (v) => String(v), activeKey: "cg-5h:cg-7d", providerName: "Antigravity2", onClose: () => {} });
   assert.match(JSON.stringify(popCardZh), /Antigravity2 · 实时配额/);
+  const turn = {
+    providerThreadId: "active", status: "completed",
+    startedAt: "2026-11-25T00:00:00Z", completedAt: "2026-11-25T00:00:10Z",
+    turnTokenUsage: { usageStatus: "complete", outputTokens: 940 },
+  };
+  const usage = {
+    usedTokens: 252000, maxTokens: 451000, usedPercentage: 56, autoCompactThreshold: 390000,
+    inputTokens: 41860, outputTokens: 940, cachedInputTokens: 36000,
+  };
+  const stats = {
+    runs: [{}, {}, {}], messages: [{}], activeProviderThreadId: "active",
+    turnItems: [...Array(12).fill({ type: "file_change" }), { type: "assistant_message" }],
+    providerTurns: [
+      { ...turn, providerThreadId: "other", completedAt: "2026-11-25T00:00:11Z" },
+      turn,
+      { ...turn, status: "running", completedAt: null },
+    ],
+  };
+  const contextCard = sandbox.T3ContextPopoverCard({ usage, stats, loc: "zh-CN" });
+  const metricValue = (tree, key) => findNodes(tree, (node) => node.props?.["data-metric"] === key)[0].props.children[1].props.children;
+  assert.equal(metricValue(contextCard, "activity")[0], "3 轮 · 12 步");
+  assert.equal(metricValue(contextCard, "speed")[0], "94");
+  assert.equal(metricValue(contextCard, "speed")[1].props.children, "tok/s");
+  assert.equal(metricValue(contextCard, "tokens")[0], "42.8k");
+  assert.equal(metricValue(contextCard, "cache")[0], "86.0%");
+  for (const incomplete of [
+    { ...turn, turnTokenUsage: { usageStatus: "partial", outputTokens: 940 } },
+    { ...turn, startedAt: turn.completedAt },
+  ]) {
+    const incompleteCard = sandbox.T3ContextPopoverCard({
+      usage, stats: { ...stats, providerTurns: [incomplete] }, loc: "zh-CN",
+    });
+    assert.equal(metricValue(incompleteCard, "speed")[0], "—");
+    assert.equal(metricValue(incompleteCard, "speed")[1], null);
+  }
+  const savedRingsCtx = activeRingsCtx;
+  activeRingsCtx = { ...savedRingsCtx, contextWindow: usage, threadStats: stats };
+  states.length = 0;
+  stateCursor = 0;
+  sandbox.T3ComposerContextRing().props.onOpenChange(true);
+  stateCursor = 0;
+  const openContextRing = sandbox.T3ComposerContextRing();
+  const openContextPopup = findNodes(openContextRing, (node) => node.type === "PopoverContent")[0];
+  assert.equal(openContextPopup.props.children.type, sandbox.T3ContextPopoverCard);
+  assert.equal(openContextPopup.props.children.props.stats, stats);
+  activeRingsCtx = savedRingsCtx;
+  states.length = 0;
+  stateCursor = 0;
   delete sandbox.document.documentElement;
   activeComposerCtx = { providerInstanceId: "ag-2", activeModel: "gemini-4-hydrogen" };
   stateCursor = 0;
