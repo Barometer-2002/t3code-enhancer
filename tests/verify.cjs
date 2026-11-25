@@ -9,6 +9,8 @@ const { runInNewContext } = require("node:vm");
 const { readAsar, findUniqueEntry } = require("../lib/asar.cjs");
 const { ALL_PATCHES, selectPatches, applicablePatchesForArchive, inspectArchive, summarizeModuleStates, resolvePristineBaseline, buildPatchedArchive, getLinuxAsarCandidates, isLinuxAppRunning, parseCliArgs } = require("../cli.cjs");
 const { PACKS, PRESETS, resolveInstallPlan } = require("../lib/packs.cjs");
+const { withInstallDirectoryLock } = require("../lib/install-state.cjs");
+const { inspectCompatibleSource } = require("../lib/engine.cjs");
 const noTelemetry = require("../lib/patches/no-telemetry.cjs");
 const desktopTray = require("../lib/patches/desktop-tray.cjs");
 const newChatLayout = require("../lib/patches/new-chat-layout.cjs");
@@ -99,6 +101,10 @@ assert.deepEqual(grouped[3].entries.map((x) => x.id), ["e1", "e2"]);
 assert.equal(grouped[4].type, "single");
 assert.equal(grouped[4].entry.id, "e3");
 assert.equal(timelineCollapse.t3FormatReadRanges(grouped[1].entries), "L1-100, L101-200 +1");
+assert.deepEqual(timelineCollapse.t3AggregateEditStats([
+  { additions: 3, diffStr: "--- a/f\n+++ b/f\n@@ -1 +1 @@\n---removed text\n+++added text" },
+]), { additions: 3, deletions: 1 });
+assert.equal(timelineCollapse.t3AggregateEditStats([{ oldStr: "full file", newStr: "updated file" }]), null);
 console.log("   OK");
 
 console.log("3. Unit testing usage-rings 5h/7d pairing logic...");
@@ -135,6 +141,11 @@ assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired1, "gemini-4-argon").
 assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired1, "claude-opus-5-5").title, "Claude & GPT (shared)");
 assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired1, "gpt-oss-120b").title, "Claude & GPT (shared)");
 assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired2, "gpt-6.2-sol").key, "s:w");
+const explicitModel = "claude-opus-ultra";
+assert.equal(usageRings.t3SelectPrimaryQuotaForModel([
+  { kind: "single", key: "heuristic", title: "Claude Opus Ultra", window: {} },
+  { kind: "single", key: "authoritative", title: "Other", window: { modelIds: [explicitModel] } },
+], explicitModel).key, "authoritative");
 console.log("   OK");
 
 console.log("3.5. Unit testing inline-file-diff unified diff parser...");
@@ -779,8 +790,10 @@ function verifyInlineEditDetail(asar) {
   const code = findUniqueEntry(asar, inlineFileDiff.targetRegex, inlineFileDiff.id).content.toString("utf8");
   const detailHook = code.match(/function t_\(e,t,n,r\)\{[\s\S]+?(?=function n_\()/);
   const card = code.match(/^function T3InlineFileDiffCard\([\s\S]+?^\}/m);
-  assert(detailHook && card, "Missing timeline detail hook or inline file diff card");
+  const checkpointHelpers = code.match(/^function t3CheckpointPath\([\s\S]+?(?=^function t3EnsureDiffStyles)/m);
+  assert(detailHook && card && checkpointHelpers, "Missing timeline detail hook or inline file diff card");
   assert.match(code, /&&j&&\(F\|\|R\|\|n\.projectedItem&&L===void 0\)\?[^;]*?\(o_,\{/);
+  assert.match(code, /wd\(i\|\|s\.pending,e\.onInitialOutputReady\);if\(o\.type===`file_change`\)return\(0,\$\.jsx\)\(T3InlineFileDiffCardMemo/);
 
   const summary = { type: "file_change", fileName: "README.md", updatedAt: "r1" };
   const projected = { sourceThreadId: "source-thread", sourceItemId: "edit-1", item: summary };
@@ -788,11 +801,13 @@ function verifyInlineEditDetail(asar) {
   const memo = Array(29).fill(Symbol.for("react.memo_cache_sentinel"));
   let reply = { isPending: true };
   let request;
+  let checkpointRequest;
+  let checkpointReply = {};
   let source;
   let uuidSeq = 0;
   const jsx = (type, props) => ({ type, props });
   const { t_, T3InlineFileDiffCard } = runInNewContext(
-    detailHook[0] + "\n" + card[0] + "\n({ t_, T3InlineFileDiffCard })", {
+    detailHook[0] + "\n" + checkpointHelpers[0] + "\n" + card[0] + "\n({ t_, T3InlineFileDiffCard })", {
       Q: { c: () => memo },
       J: () => (text) => text,
       Fa: () => false,
@@ -812,6 +827,14 @@ function verifyInlineEditDetail(asar) {
       t3IsZhLocale: () => false,
       t3ShortFileName: (path) => path,
       t3ParseUnifiedDiff: inlineFileDiff.t3ParseUnifiedDiff,
+      T3UseCheckpointSummaries: (ref) => ref ? [{ runId: "turn-9", checkpointTurnCount: 9 }] : [],
+      T3UseCheckpointDiff: (input, options) => {
+        checkpointRequest = options.enabled ? input : null;
+        return options.enabled ? checkpointReply : {};
+      },
+      T3ParseCheckpointDiff: (patch) => ({
+        kind: "files", files: [{ name: /^\+\+\+ b\/(.*)$/m.exec(patch)?.[1] }]
+      }),
       T3DiffCopyIcon: () => null,
       T3DiffSideIcon: () => null,
       io: String,
@@ -821,7 +844,7 @@ function verifyInlineEditDetail(asar) {
   const cardTree = () => {
     const result = t_(projected, "env", { detail: customDetailSource }, false);
     return T3InlineFileDiffCard({
-      item: result.item, projectedItem: projected, detail: result.output,
+      item: result.item, projectedItem: projected, detail: result.output, workspaceRoot: "C:\\Work\\project",
       onOpenToolDiff: (request) => { sideRequest = request; },
     });
   };
@@ -834,6 +857,8 @@ function verifyInlineEditDetail(asar) {
   const loaded = render();
   assert.match(loaded, /is-add.*new text/);
   assert.match(loaded, /is-del.*old text/);
+  assert.equal(checkpointRequest, null);
+  assert.equal(cardTree().props["data-v2-item-inspector"], "file_change");
   const [header, preview] = cardTree().props.children;
   const [lead, actions] = header.props.children;
   const [title] = lead.props.children;
@@ -860,12 +885,33 @@ function verifyInlineEditDetail(asar) {
   );
   reply = { isPending: false, error: "unavailable" };
   assert.match(render(), /Could not load the diff for this edit/);
+  projected.item = { ...projected.item, fileName: "/C:/work/project/README.md" };
+  reply = { isPending: false, data: { item: projected.item } };
+  checkpointReply = { isPending: true };
+  assert.match(render(), /Loading the diff for this edit/);
+  assert.deepEqual({ ...checkpointRequest }, {
+    environmentId: "env", threadId: "source-thread", fromTurnCount: 8, toTurnCount: 9, ignoreWhitespace: false
+  });
+  checkpointReply = { data: { diff:
+    "diff --git a/sub/README.md b/sub/README.md\n--- a/sub/README.md\n+++ b/sub/README.md\n@@ -1 +1 @@\n-x\n+UNRELATED\n" +
+    "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-before\n+RECOVERED\n"
+  } };
+  const recovered = render();
+  assert.match(recovered, /Turn Git diff/);
+  assert.match(recovered, /is-add.*RECOVERED/);
+  assert.doesNotMatch(recovered, /UNRELATED/);
+  assert.equal(cardTree().props.children[0].props.children[0].props.children[0].props.onClick({}), undefined);
+  assert.equal(sideRequest.filePath, "README.md");
+  projected.item = { ...projected.item, runId: "turn-with-no-checkpoint" };
+  reply = { isPending: false, data: { item: projected.item } };
+  assert.doesNotMatch(render(), /RECOVERED/);
+  assert.equal(checkpointRequest, null);
 
   // Verify DiffPanel sideRevealPatch for single-file, multi-file, and blank tool-call -> turn/unstaged fallback
   const diffPanel = findUniqueEntry(asar, inlineFileDiff.sideRevealPatch.targetRegex, inlineFileDiff.id + "-side").content.toString("utf8");
   const helpersMatch = diffPanel.match(/function t3NormDiffPath[\s\S]+?function t3PickToolDiffFallback\([\s\S]+?\n(?=\s*export\{)/);
   const revealMatch = diffPanel.match(
-    /\/\* T3_INLINE_FILE_DIFF_SIDE_REVEAL_V3 \*\/let t3RawZ=z,t3Fb=[\s\S]+?;[\s\S]*?(Fn=t3RawZ\?\.revealRequestId[\s\S]+?,In=t3RawZ\?\.revealRequestId\?\?\([^)]+\)),[\s\S]*?(li=e=>\{[^}]+\}),t\[76\][\s\S]*?(let path=\(\(\)=>\{[\s\S]+?\}\)\(\);if\(!path\)\{Mi\.current=null;return\}let e=JSON\.stringify\(\[K,path,In\]\);Mi\.current!==e&&ji\(path\)&&\(Mi\.current=e\))/
+    /\/\* T3_INLINE_FILE_DIFF_SIDE_REVEAL_V\d+ \*\/let t3RawZ=z,t3Fb=[\s\S]+?;[\s\S]*?(Fn=t3RawZ\?\.revealRequestId[\s\S]+?,In=t3RawZ\?\.revealRequestId\?\?\([^)]+\)),[\s\S]*?(li=e=>\{[^}]+\}),t\[76\][\s\S]*?(let path=\(\(\)=>\{[\s\S]+?\}\)\(\);if\(!path\)\{Mi\.current=null;return\}let e=JSON\.stringify\(\[K,path,In\]\);Mi\.current!==e&&ji\(path\)&&\(Mi\.current=e\))/
   );
   assert(helpersMatch && revealMatch, "Missing updated DiffPanel sideRevealPatch injection");
   const fallbackFns = runInNewContext(
@@ -883,6 +929,10 @@ function verifyInlineEditDetail(asar) {
     },
     (fd) => fd.name
   );
+  assert.equal(fallbackFns.t3DiffMatchesTarget("nested/src/app.ts", "src/app.ts", "/repo"), false);
+  assert.equal(fallbackFns.t3DiffMatchesTarget("src/App.ts", "src/app.ts", "/repo"), false);
+  assert.equal(fallbackFns.t3DiffMatchesTarget("src/App.ts", "src/app.ts", "C:\\repo"), true);
+  assert.equal(fallbackFns.t3DiffMatchesTarget("/repo/src/app.ts", "src/app.ts", "/repo"), true);
   const emptyTool = { type: "file_change", runId: "run-5", changes: [{ path: "src/app.ts", operation: "modify" }], oldStr: "a", newStr: "b" };
   const turnFb = fallbackFns.t3PickToolDiffFallback({
     rawZ: { kind: "tool-call", filePath: "src\\app.ts", revealRequestId: "r1" },
@@ -927,6 +977,7 @@ function verifyInlineEditDetail(asar) {
   const revealRunner = runInNewContext(
     `(function(t3RawZ, z, R, k, ai, K, Mi, ji, yt, M, t3GitMode) {
       ${helpersMatch[0]}
+      const f = "/repo";
       let ${revealMatch[1]};
       let ${revealMatch[2]};
       ${revealMatch[3]};
@@ -1258,6 +1309,10 @@ function verifyLinuxSupport(patchedAsarPath) {
   ]);
   assert.equal(fullSummary.allInstalled, true);
   assert.equal(fullSummary.outdated, false);
+  assert.equal(summarizeModuleStates([
+    { id: "a", key: "chat.js", installed: true },
+    { id: "b", key: "diff.js", pristine: true },
+  ]).outdated, false);
 
   const upgradeSummary = summarizeModuleStates([
     { id: "usage-rings", key: "_chat.js", installed: false, outdated: true, pristine: false },
@@ -1321,6 +1376,24 @@ function verifyLinuxSupport(patchedAsarPath) {
     assert.equal(parsedLinux.input, "/tmp/T3.AppImage");
     assert.equal(parsedLinux.flags.has("--shared-data"), true);
     assert.equal(parsedLinux.flags.has("--official"), true);
+    withInstallDirectoryLock(linuxPaths.installLock, () => {
+      assert.throws(() => withInstallDirectoryLock(linuxPaths.installLock, () => {
+        assert.fail("Concurrent maintenance must not run");
+      }), /持有安装锁/);
+      assert(fs.statSync(linuxPaths.installLock).isDirectory());
+    });
+    assert(!fs.existsSync(linuxPaths.installLock));
+
+    const unknownAsar = path.join(tmpRoot, "unknown.asar");
+    const header = Buffer.from('{"files":{}}');
+    const padded = Math.ceil(header.length / 4) * 4;
+    const archive = Buffer.alloc(16 + padded);
+    [4, 8 + padded, 4 + padded, header.length].forEach((size, i) => archive.writeUInt32LE(size, i * 4));
+    header.copy(archive, 16);
+    fs.writeFileSync(unknownAsar, archive);
+    assert.throws(() => inspectCompatibleSource(unknownAsar), /未识别的版本内容/);
+    fs.truncateSync(unknownAsar, 8);
+    assert.equal(inspectCompatibleSource(unknownAsar), null, "Truncated ASAR must remain eligible for backup recovery");
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -1483,7 +1556,7 @@ function verifySameFileFolding(asar) {
   // 1) Patched session-logic Be/ce deduplicates repeated reads (including Windows backslash/Path keys) & edits
   const slCode = findUniqueEntry(asar, timelineCollapse.summaryPatch.targetRegex, timelineCollapse.summaryPatch.id).content.toString("utf8");
   const ceMatch = slCode.match(/function y\(e\)\{[\s\S]+?function w\(e\)\{[\s\S]+?\}/);
-  const beMatch = slCode.match(/function Be\(e,t\)\{\/\* T3_TIMELINE_SUMMARY_V1 \*\/[\s\S]+?\n?\}(?=function Ve\()/);
+  const beMatch = slCode.match(/function Be\(e,t\)\{\/\* T3_TIMELINE_SUMMARY_V\d+ \*\/[\s\S]+?\n?\}(?=function Ve\()/);
   assert(ceMatch && beMatch, "Missing patched session-logic path extractor or Be counter");
   const slCtx = runInNewContext(
     ceMatch[0] + "\n" + beMatch[0] + "\n({ w, Be })",
@@ -1757,6 +1830,11 @@ function verifyFilesChangesExplorer(asar) {
     openAllChanges: () => {},
   });
   assert.equal(collapsedTree[0].props.children[0].props["aria-expanded"], true, "Active search must auto-expand collapsed directories");
+}
+
+if (process.argv[2] === "--unit") {
+  console.log("\nUNIT TESTS PASSED.");
+  return;
 }
 
 console.log("4. Full dry-run ASAR build (all patches) + syntax & integrity check...");
