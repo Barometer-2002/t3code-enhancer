@@ -789,10 +789,11 @@ function verifyResponsiveBrowserLayout(asar) {
 function verifyInlineEditDetail(asar) {
   const code = findUniqueEntry(asar, inlineFileDiff.targetRegex, inlineFileDiff.id).content.toString("utf8");
   const detailHook = code.match(/function t_\(e,t,n,r\)\{[\s\S]+?(?=function n_\()/);
-  const card = code.match(/^function T3InlineFileDiffCard\([\s\S]+?^\}/m);
+  const inlineComponents = code.match(/^function t3RenderFileChangeStats\([\s\S]+?(?=^const t3DiffMemo)/m);
   const checkpointHelpers = code.match(/^function t3CheckpointPath\([\s\S]+?(?=^function t3EnsureDiffStyles)/m);
-  assert(detailHook && card && checkpointHelpers, "Missing timeline detail hook or inline file diff card");
+  assert(detailHook && inlineComponents && checkpointHelpers, "Missing timeline detail hook or inline file diff components");
   assert.match(code, /&&j&&\(F\|\|R\|\|n\.projectedItem&&L===void 0\)\?[^;]*?\(o_,\{/);
+  assert.match(code, /T3FileChangeRowLabelMemo,\{projectedItem:n\.projectedItem,workspaceRoot:r,cwd:a\.markdownCwd,environmentId:a\.activeThreadEnvironmentId,source:a\.turnItemSource,expanded:b\}/);
   assert.match(code, /wd\(i\|\|s\.pending,e\.onInitialOutputReady\);if\(o\.type===`file_change`\)return\(0,\$\.jsx\)\(T3InlineFileDiffCardMemo/);
 
   const summary = { type: "file_change", fileName: "README.md", updatedAt: "r1" };
@@ -806,8 +807,13 @@ function verifyInlineEditDetail(asar) {
   let source;
   let uuidSeq = 0;
   const jsx = (type, props) => ({ type, props });
-  const { t_, T3InlineFileDiffCard } = runInNewContext(
-    detailHook[0] + "\n" + checkpointHelpers[0] + "\n" + card[0] + "\n({ t_, T3InlineFileDiffCard })", {
+  let renderRow = false;
+  let rowVisible = false;
+  let observeRow;
+  const rowElement = {};
+  const { t_, T3InlineFileDiffCard, T3FileChangeRowLabel } = runInNewContext(
+    detailHook[0] + "\n" + checkpointHelpers[0] + "\n" + inlineComponents[0] +
+    "\n({ t_, T3InlineFileDiffCard, T3FileChangeRowLabel })", {
       Q: { c: () => memo },
       J: () => (text) => text,
       Fa: () => false,
@@ -816,9 +822,9 @@ function verifyInlineEditDetail(asar) {
       Wa: () => null,
       Ha: () => [],
       Z: {
-        useState: (init) => [init, () => {}],
-        useRef: (init) => ({ current: init }),
-        useEffect: () => {},
+        useState: (init) => renderRow ? [rowVisible, (visible) => { rowVisible = visible; }] : [init, () => {}],
+        useRef: (init) => ({ current: renderRow ? rowElement : init }),
+        useEffect: (effect) => { if (renderRow) effect(); },
         useMemo: (create) => create(),
       },
       $: { jsx, jsxs: jsx },
@@ -826,7 +832,13 @@ function verifyInlineEditDetail(asar) {
       Xr: (path) => path,
       t3IsZhLocale: () => false,
       t3ShortFileName: (path) => path,
+      t3EnsureDiffStyles() {},
       t3ParseUnifiedDiff: inlineFileDiff.t3ParseUnifiedDiff,
+      T3ObserveIntersection: (node, callback) => {
+        assert.equal(node, rowElement);
+        observeRow = callback;
+        return () => {};
+      },
       T3UseCheckpointSummaries: (ref) => ref ? [{ runId: "turn-9", checkpointTurnCount: 9 }] : [],
       T3UseCheckpointDiff: (input, options) => {
         checkpointRequest = options.enabled ? input : null;
@@ -849,6 +861,24 @@ function verifyInlineEditDetail(asar) {
     });
   };
   const render = () => JSON.stringify(cardTree());
+  const rowTree = (expanded = false) => {
+    renderRow = true;
+    try {
+      return T3FileChangeRowLabel({
+        projectedItem: projected, workspaceRoot: "C:\\Work\\project", environmentId: "env",
+        source: { detail: customDetailSource }, expanded,
+      });
+    } finally {
+      renderRow = false;
+    }
+  };
+  const rowStats = (expanded) => rowTree(expanded).props.children.props.children[2];
+  assert.equal(rowStats(), null);
+  assert.equal(request, null, "Offscreen file changes must not fetch file details");
+  observeRow({ isIntersecting: true });
+  assert.equal(rowStats(), null);
+  assert.deepEqual({ ...request }, { environmentId: "env", threadId: "source-thread", itemId: "edit-1", revision: "r1" });
+  assert.equal(source, customDetailSource);
   assert.match(render(), /Loading the diff for this edit/);
   assert.deepEqual({ ...request }, { environmentId: "env", threadId: "source-thread", itemId: "edit-1", revision: "r1" });
   assert.equal(source, customDetailSource);
@@ -862,6 +892,13 @@ function verifyInlineEditDetail(asar) {
   const [header, preview] = cardTree().props.children;
   const [lead, actions] = header.props.children;
   const [title] = lead.props.children;
+  assert.deepEqual(rowStats(), lead.props.children[1], "A collapsed row should show the expanded card's exact line totals");
+  assert.equal(rowStats(true), null, "The expanded header must show the counts only once");
+  assert.equal(request, null, "An expanded row must leave detail loading to the card");
+  projected.item = { ...summary, additions: 4, deletions: 0 };
+  assert.match(JSON.stringify(rowStats()), /"\+","4"/);
+  assert.equal(request, null, "Known line totals must not fetch file details");
+  projected.item = summary;
   assert.equal(title.props["aria-expanded"], undefined);
   assert.equal(preview.props.children[0].length, 320);
   assert.equal(sideRequest, undefined);
@@ -900,6 +937,8 @@ function verifyInlineEditDetail(asar) {
   assert.match(recovered, /Turn Git diff/);
   assert.match(recovered, /is-add.*RECOVERED/);
   assert.doesNotMatch(recovered, /UNRELATED/);
+  assert.deepEqual(rowStats(), cardTree().props.children[0].props.children[0].props.children[1],
+    "A collapsed row should reuse the card's file-specific checkpoint totals");
   assert.equal(cardTree().props.children[0].props.children[0].props.children[0].props.onClick({}), undefined);
   assert.equal(sideRequest.filePath, "README.md");
   projected.item = { ...projected.item, runId: "turn-with-no-checkpoint" };
@@ -1900,7 +1939,7 @@ try {
   console.log("8. Verifying main chat toolbar and workspace controls in docked and floating modes...");
   verifyWorkspaceToolbar(verified);
   console.log("   OK");
-  console.log("9. Verifying on-demand inline diff per expanded edit...");
+  console.log("9. Verifying inline diffs and shared line totals in expanded and collapsed edits...");
   verifyInlineEditDetail(verified);
   console.log("   OK");
   console.log("10. Verifying new tab address handoff and configured browser search...");
