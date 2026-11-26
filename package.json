@@ -1,7 +1,7 @@
 {
   "name": "t3code-enhancer",
-  "version": "0.1.1",
-  "description": "T3 Code ChatGPT/Codex 主题与体验强化工具（一体化主题 + 折叠联动 + 加号多功能菜单 + 思考深度滑块与Harness快切 + 5h/7d双层圆环与上下文统计浮层，支持一键安装与卸载）",
+  "version": "0.2.0-preview.1",
+  "description": "T3 Code 0.1.12 ChatGPT/Codex 主题与体验强化工具（彻底去遥测 + 同文件折叠与内联 Diff + 加号菜单与双层额度圈 + 工作区小窗/主侧交换 + 后台托盘 + 跨平台分块安装/修复/卸载）",
   "private": true,
   "license": "MIT",
   "repository": {
@@ -11,8 +11,11 @@
   "scripts": {
     "status": "node cli.cjs status",
     "install-enhancer": "node cli.cjs install",
+    "repair": "node cli.cjs repair",
     "uninstall-enhancer": "node cli.cjs uninstall",
-    "test": "node tests/verify.cjs"
+    "test": "node tests/verify.cjs",
+    "test:full": "node tests/verify.cjs --full",
+    "test:unit": "node tests/verify.cjs --unit"
   },
   "engines": {
     "node": ">=20.0.0"

@@ -1,108 +1,129 @@
+<div align="center">
+
+<img src="assets/icon.svg" alt="t3code-enhancer" width="64" height="64" />
+
 # t3code-enhancer
 
-T3 Code 桌面版的主题与界面增强工具，提供安装、状态检测和卸载命令。
+**让 T3 Code 更接近 ChatGPT 桌面版**<br/>
+更顺眼的整体界面 · 更干净的隐私去遥测 · 后台系统托盘 · 更顺手的对话与多浮窗工作区
 
-适用于 T3 Code **0.1.11** 的 **Windows 桌面版**、**Linux x86_64 官方 AppImage** 和 **macOS 官方版**。Linux 和 macOS 版会安装一个独立的增强版副本。
+<p align="center"><a href="https://github.com/Barometer-2002/t3code-enhancer/releases"><img src="https://img.shields.io/badge/version-v0.2.0--preview.1-7c3aed?style=flat-square" alt="Version" /></a> <a href="https://github.com/pingdotgg/t3code/releases/tag/v0.1.12"><img src="https://img.shields.io/badge/T3_Code-0.1.12-0ea5e9?style=flat-square" alt="T3 Code" /></a> <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%E2%89%A5%2020-339933?style=flat-square" alt="Node.js" /></a> <a href="#核心体验"><img src="https://img.shields.io/badge/dependencies-0-22c55e?style=flat-square" alt="Zero Deps" /></a> <a href="#平台支持"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS*-64748b?style=flat-square" alt="Platforms" /></a> <a href="#说明与许可"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License" /></a></p>
 
-从 [GitHub Releases](https://github.com/Barometer-2002/t3code-enhancer/releases/latest) 下载安装 ZIP。安装、卸载和界面截图见 [使用教程](使用教程.md)。
+[实机演示](#实机演示) · [核心体验](#核心体验) · [快速开始](#快速开始) · [按需搭配](#按需搭配) · [平台支持](#平台支持) · [文档导航](#文档导航)
 
-## 界面预览
+<sub>纯本地运行 · 零外部依赖 · 自动保留原版备份，随时一键还原</sub>
 
-![输入框底栏，左侧是加号和额度，右侧是上下文、模型、思考深度和发送按钮](assets/tutorial/composer.png)
+</div>
 
-| 加号菜单 | 模型与 Harness |
-| :---: | :---: |
-| <img src="assets/tutorial/plus-menu.png" alt="添加文件、引用、技能与斜杠命令菜单" width="310"> | <img src="assets/tutorial/model-picker.png" alt="Harness 切换、模型搜索与选择" width="310"> |
+## 实机演示
 
-| 思考深度 | 右侧详情面板 |
-| :---: | :---: |
-| <img src="assets/tutorial/effort-slider.png" alt="思考深度滑块与恢复默认按钮" width="310"> | <img src="assets/tutorial/side-panel.png" alt="右侧详情面板的额度双环与上下文占用" width="297"> |
+以下动图均在真实 T3 Code `0.1.12` 客户端中录制（点击图片可放大查看）：
 
-| 额度详情 | 上下文与统计 |
-| :---: | :---: |
-| <img src="assets/tutorial/quota-details.png" alt="5 小时和 7 天剩余额度及重置时间" width="310"> | <img src="assets/tutorial/context-stats.png" alt="上下文占用、缓存命中率与 Token 明细" width="310"> |
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>整体界面重塑与双模主题</strong><br/>
+      <sub>明暗双模 ChatGPT App 风格、<code>1.35px</code> 图标线宽与侧栏/新建页重构 · <a href="docs/FEATURES.md#1-整体界面重塑与双模主题">详情</a></sub><br/><br/>
+      <img src="assets/showcase/theme.gif" alt="ChatGPT App 风格主题与整体界面展示" width="100%" />
+    </td>
+    <td width="50%" valign="top">
+      <strong>输入框、模型面板与双环额度</strong><br/>
+      <sub><code>+</code> 附件菜单、思考深度滑块、<code>5h/7d</code> 双环与实时 <code>tok/s</code> · <a href="docs/FEATURES.md#4-输入框模型面板与实时统计">详情</a></sub><br/><br/>
+      <img src="assets/showcase/composer.gif" alt="输入框与模型面板增强展示" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>工作区启动台、多浮窗与左右互换</strong><br/>
+      <sub>空白页单键启动、标签拖出浮窗、<code>Alt+S</code> 左右互换 · <a href="docs/FEATURES.md#6-工作区启动台多浮窗与左右互换">详情</a></sub><br/><br/>
+      <img src="assets/showcase/workspace.gif" alt="工作区与浮窗增强展示" width="100%" />
+    </td>
+    <td width="50%" valign="top">
+      <strong>对话时间线、行内 Diff 与文件栏</strong><br/>
+      <sub>同文件折叠去重、红绿行内 Diff、三段变更文件视图 · <a href="docs/FEATURES.md#5-对话时间线行内-diff-与文件栏">详情</a></sub><br/><br/>
+      <img src="assets/showcase/chat.gif" alt="对话时间线与 Diff 视图展示" width="100%" />
+    </td>
+  </tr>
+</table>
 
-**工作过程**可以按组展开。收起上级后，再次打开时下级仍处于折叠状态。
+## 核心体验
 
-![展开工作组后显示的命令与工具列表](assets/tutorial/work-log.png)
+每一项增强均可按模块自由开关，不修改对话记录、项目代码与 AI 核心逻辑：
 
-## 包含模块
+| 体验模块 | 带来什么变化 | 详情 |
+| --- | --- | --- |
+| **ChatGPT App 双模主题与布局** | 明暗双模主题自动激活、浅灰侧栏与卡片化主画布、侧栏常驻搜索与独立「新聊天」、顺手的新建对话吸底布局 | [详情](docs/FEATURES.md#1-整体界面重塑与双模主题) |
+| **全局视觉效果优化** | 全界面图标物理线宽统一 `1.35px`、正文/代码/时间线排版与间距对齐、圆角表单与胶囊工具栏、文件预览/浏览器/终端与状态卡质感统一 | [详情](docs/FEATURES.md#全局视觉效果优化) |
+| **右下角后台系统托盘** | 点 `×` 隐藏到托盘不中断长任务，单击立刻唤回，右键随时切换「直接退出」或彻底关闭 | [详情](docs/FEATURES.md#2-右下角后台系统托盘) |
+| **全链路隐私与去遥测** | 关闭匿名上报、停止读取本机 Claude / Codex 账号文件，并在桌面端拦截遥测域名 | [说明](docs/PRIVACY_AND_SECURITY.md) |
+| **输入框、模型与实时统计** | 圆形 `+` 菜单快速附加 7 类上下文、常驻权限、思考深度滑块（最高档星空流光）、`5h/7d` 双环额度与底栏实时 `tok/s` | [详情](docs/FEATURES.md#4-输入框模型面板与实时统计) |
+| **对话时间线与行内 Diff** | 同文件连续读写自动折叠去重，对话内点击直出红绿语法高亮 Diff，文件栏升级为三段变更视图 | [详情](docs/FEATURES.md#5-对话时间线行内-diff-与文件栏) |
+| **工作区启动台与多浮窗** | 新标签页搜索栏与单键启动、标签拖出变可缩放浮窗、全屏主对话状态胶囊、`Alt+S` 一键左右互换 | [详情](docs/FEATURES.md#6-工作区启动台多浮窗与左右互换) |
 
-1. **ChatGPT / Codex 一体化主题（`themes/chatgpt-app.json`）**
-   - 明暗双模统一设计 Token（`768px` 主阅读栏 / `296px` 右侧面板 / `10px` 根圆角 / 4 级墨色与字号阶梯）。
-   - 全局 `vector-effect: non-scaling-stroke`（`1.35px` 固定物理线宽）+ 分区锁定图标尺寸，彻底消除图标发虚与粗细不一。
-   - 主对话区 `0px → 7px → 22px` 左轴对齐、侧栏统一 `10px` 基准线、无顶栏硬线、丝滑鼠标悬停交互。
-2. **多层级折叠联动补丁（`lib/patches/timeline-collapse.cjs`）**
-   - 收起上级菜单（回合折叠 / 尝试折叠 / 工具组折叠）时，自动清空该分支下所有下级展开状态，同级其他回合不受影响。
-3. **加号多功能菜单、思考深度滑块/Harness 快切 & 悬停双浮层卡（`lib/patches/usage-rings.cjs`）**
-   - **底部输入框 `+` 多功能菜单**：将原回形针附件按钮升级为 ChatGPT 风格 `32×32px` 圆形 `+` 按钮（`17px` 图标，带常驻/悬停/按压分阶圆底纹），点击展开分组菜单（`添加`：文件和图片 / `@` 引用工作区文件 / `$` 技能与扩展；`模式与命令`：`/btw` 侧边对话 / 压缩上下文 / 新建干净上下文 / `/` 全部斜杠命令），菜单图标统一锁定 `15px` / `1.35px` 线宽。
-   - **完全替换原生三栏模型面板（ChatGPT 双面板一体设计）**：
-     - **模型 & Harness 按钮（`[ 图标 模型名 ]`）**：点击展开 ChatGPT 风格 `288px`「选择模型」卡片——顶部为严格过滤后的**仅已开启可用 Harness 2 列网格**（默认展示 4 个，超出可点「展开 +N / 收起」）、中段为简洁单列模型列表（多模型自动出现搜索框）、底部集成 T3 原生访问权限切换与「思考深度 ›」直达入口。
-     - **独立思考深度按钮（`[ ▂▄▆ High ]`）**：不再与模型按钮重复显示，点击展开纯正 ChatGPT 风格推理强度滑块卡片（`⚡` 快速模式开关、`↺` 恢复默认、点击/拖拽/键盘吸附的靛蓝分段滑块、以及模型名直达入口），两张面板设计语言完全统一且一键互通。
-   - **底部双胶囊（悬停直接展开 + 同款 `8px` 圆角灰底纹响应）**：
-     - 左下角 `◎ 84%` 额度双环：**实时联动当前选中模型**（多模型独立额度池下自动匹配如 `Gemini` / `Gemini 4 Argon` / `Claude & GPT (shared)`，低额文字与圆环同步变橙/红），悬停展开「**用量**」卡片（当前模型额度行标有「当前」徽标 + 5h/7d 各自独立换行重置倒计时 + 「查看完整用量 →」跳转）。
-     - 右下角 `19% · 204k ◔` 上下文直显（支持费用自动拼接）：悬停展开「**上下文与统计**」卡片（上下文进度条与自动压缩刻度线、会话费用/缓存命中/回合与步骤统计、本轮耗时与输入输出、Token 细分统计）。
-   - **右侧详情面板**：自动配对同一模型的 `5h` / `7d` 窗口为双层同心圆环（外环 7d 陶土橙、内环 5h 翡翠绿，低额度自动变警告橙/红），统一 `px-2.5` 左对齐，上下文圆环悬停同步展开「上下文与统计」浮层。
-   - **自动激活与还原**：`install.cmd` 会自动在 `settings.json` 中激活 `chatgpt-app` 主题，`uninstall.cmd` 会同步还原默认主题与纯净原版 `server.asar`。
+## 快速开始
 
-## 使用方法
+准备 **Node.js 20+**，从 [GitHub Releases](https://github.com/Barometer-2002/t3code-enhancer/releases) 下载压缩包并解压（无需 `npm install`）：
 
-### Windows 一键脚本
+**Windows**
+1. 退出 T3 Code（若在托盘运行，右键右下角图标点击退出）。
+2. 双击 **`install.cmd`**，直接回车安装默认完整版（或按菜单编号自由选择）。
+3. 重新启动 T3 Code；随时可双击 **`uninstall.cmd`** 一键还原原版。
 
-- **查看状态**：双击 `status.cmd`
-- **一键安装**：先关闭所有 T3 Code 窗口 → 双击 `install.cmd` → 重新打开 T3 Code
-- **一键卸载**：先关闭所有 T3 Code 窗口 → 双击 `uninstall.cmd` → 重新打开 T3 Code
-
-### Windows 命令行
-
-```powershell
-node cli.cjs status                  # 查看安装状态与备份完整性
-node cli.cjs install                 # 安装全部模块（主题 + 两项前端补丁）
-node cli.cjs install --theme-only    # 仅更新主题（无需退出 T3 Code）
-node cli.cjs uninstall               # 完整卸载并逐字节还原原版 server.asar
-node cli.cjs uninstall --keep-theme  # 仅卸载前端补丁，保留主题
-node tests/verify.cjs                # 运行自动化单元测试与 ASAR 试构建校验
+**Linux / macOS**
+```bash
+chmod +x install.sh
+./install.sh
 ```
 
-### Linux x86_64
+> Linux AppImage 与 macOS 独立副本的完整步骤见 **[安装与使用教程](使用教程.md)**。
 
-准备 Node.js 20 或更新版本，以及 [T3 Code 0.1.11 官方 x86_64 AppImage](https://github.com/pingdotgg/t3code/releases/tag/v0.1.11)。在增强包解压目录中以桌面用户执行：
+## 按需搭配
+
+不想全装？可以在交互菜单里挑选，或通过 `--preset` 一步指定：
+
+| 预设 | 适合谁 | 包含内容 |
+| --- | --- | --- |
+| `full`（默认） | 想要完整体验 | 主题 + 去遥测 + 输入框/额度 + 时间线/Diff + 布局/浮窗/托盘 |
+| `chat-lite` | 喜欢官方原本布局 | 主题 + 去遥测 + 输入框/额度 + 时间线/Diff |
+| `clean` | 只要颜值和隐私 | 主题 + 去遥测（零交互改动） |
+| `privacy-only` | 只要去遥测 | 100% 保留官方界面，仅关闭遥测 |
+| `theme-only` | 只想换个皮肤 | 仅安装外观主题，无需重启 T3 Code |
 
 ```bash
-node linux.cjs install ~/Downloads/T3-Code-x86_64.AppImage
-"${XDG_DATA_HOME:-$HOME/.local/share}/t3code-enhancer/launch.sh"
+node cli.cjs install --preset clean                   # 只要主题 + 去遥测
+node cli.cjs install --preset full --no-desktop-tray  # 完整版，但不要托盘最小化
+node cli.cjs uninstall                                # 一键还原官方原版
 ```
 
-安装器校验官方 AppImage 的 SHA-256 后解包，原 AppImage 可继续单独使用。增强版默认使用本地端口 `3774`，可在启动命令前用 `T3CODE_PORT=3775` 指定空闲端口。首次启动后可在「设置 → 外观」选择 **ChatGPT App**。
+## 平台支持
 
-`node linux.cjs status` 查看状态。退出增强版后执行 `node linux.cjs uninstall` 可以移除它，增强版的会话和偏好保存在同级的 `t3code-enhancer-profile`。安装和卸载已在 Omarchy x86_64 上验证。
+- **Windows（官方桌面版）** — ✅ 已实测，安装前自动保留原版备份。
+- **Linux x86_64（AppImage / `.deb` / 解包版）** — ✅ 已实测，AppImage 默认独立目录运行、互不干扰。
+- **macOS\*（官方 `.app`）** — 🧪 已通过跨平台单元测试，**诚征 Mac 真机试用反馈**（默认生成独立副本，不动官方原版）。
 
-### macOS
+## 文档导航
 
-准备 Node.js 20 或更新版本，以及安装在「应用程序」中的 T3 Code 0.1.11 官方版。在增强包解压目录中执行：
+按需渐进阅读，从 3 分钟上手到安全审计各取所需：
 
-```bash
-node macos.cjs install
-open "$HOME/Applications/T3 Code Enhancer.app"
-```
+- **[安装与使用教程](使用教程.md)** — 分平台安装步骤、日常升级、修复与一键还原
+- **[功能详解](docs/FEATURES.md)** — 整体界面重塑、后台系统托盘、全部功能亮点与快捷键速查
+- **[隐私与安全说明](docs/PRIVACY_AND_SECURITY.md)** — 修改范围边界、5 层去遥测明细、明文代码审计与备份机制
+- **[CLI 命令参考](docs/CLI_REFERENCE.md)** — 全部子命令、选项参数、自由搭配与测试命令速查
+- **[常见问题与排查](docs/TROUBLESHOOTING.md)** — 按现象直给解法（托盘、统计口径、升级兼容、反馈模板）
+- **[架构蓝图](docs/ARCHITECTURE.md)** · **[开发者指南](AGENTS.md)** — 内部架构、补丁映射与维护约定
 
-官方版不在 `/Applications/T3 Code (Beta).app` 时，把实际路径加在 `install` 后面。安装器校验官方签名和版本后，复制出 `~/Applications/T3 Code Enhancer.app` 并打补丁，再用本机 ad-hoc 签名。官方版保持不变，两者可以同时运行。增强版使用本地端口 `3774`，关闭自动更新，会话和偏好保存在 `~/Library/Application Support/t3code-enhancer-profile`。首次启动后可在「设置 → 外观」选择 **ChatGPT App**。
+## 说明与许可
 
-`node macos.cjs status` 查看状态。退出增强版后执行 `node macos.cjs uninstall` 可以移除它，独立配置会保留。两个版本启动时都会登记 `t3code://` 登录回调，最后启动的那个生效；要在官方版里登录 T3 账号，先重启官方版。安装和卸载已在 Apple Silicon 上验证，Intel 机型未验证。
+本项目是个人维护的独立开源工具（与 T3 Code 官方无关），采用 [MIT 许可](LICENSE)。工具默认保留同版本原版备份并提供回滚保护，日常重要工作前仍建议顺手备份 `~/.t3`；如只想先尝鲜，也可以先选 `theme-only` 或用 `node cli.cjs build` 试构建。
 
-如果状态显示「已安装旧版」，退出增强版，再用新版增强包运行 `node macos.cjs install`。升级仍需要官方 T3 Code 0.1.11，会沿用现有的独立或共用数据模式，并保留会话与设置。
+- 部分界面定位参考了 [T3 Code](https://github.com/pingdotgg/t3code)（[许可](licenses/T3-Code.txt)）。
+- 部分面板图标来自 [Lucide](https://github.com/lucide-icons/lucide) 与 Feather（[许可](licenses/Lucide.txt)）。
+- 认可并支持 [LINUX DO 社区](https://linux.do/)。
 
-想直接使用官方版已有的会话和项目，改用 `node macos.cjs install --shared-data`。这时增强版和官方版共用 `~/.t3` 与 Electron 用户数据，两者不能同时运行，切换前先退出另一个。增强版第一次读取钥匙串时，选择「始终允许」。官方版自动更新到新版本后可能升级数据格式，而增强版仍是 0.1.11，这时先停用增强版。已经按独立配置安装过的，先执行 `uninstall` 再重新安装。
+## 版本号规范
 
-## 安全保障
-- 安装前自动备份纯净原版为 `server.asar.before-t3code-enhancer`（若此前已安装过旧版 `patch-timeline-collapse.cjs`，会自动继承其纯净原版备份，绝不覆盖原版）。
-- 写入前自动进行 ESM 语法检查、SHA-256 块完整性重算、以及所有未修改文件的逐字节一致性校验。
-- T3 Code 后续版本更新覆盖 `server.asar` 时，可先运行 `node cli.cjs status` 确认兼容性。
+本项目遵循语义化版本（SemVer 2.0.0），由 [lib/version.cjs](lib/version.cjs) 与 [package.json](package.json) 统一管理（执行 `node cli.cjs --version` 查看）：
 
-## 许可与致谢
-
-本项目是独立的 T3 Code 增强工具，采用 [MIT 许可](LICENSE)。
-
-- 补丁定位使用了 [T3 Code](https://github.com/pingdotgg/t3code) 的部分代码片段。 [T3 Code 许可](licenses/T3-Code.txt)
-- 部分面板图标来自 [Lucide](https://github.com/lucide-icons/lucide) 及 Feather。 [Lucide 与 Feather 许可](licenses/Lucide.txt)
-- 本项目认可并支持 [LINUX DO 社区](https://linux.do/)。
+- **正式版**：`vMAJOR.MINOR.PATCH`（如 `v0.1.0`、`v0.1.1`、`v0.2.0`）
+- **预览版**：`vMAJOR.MINOR.PATCH-<alpha|beta|preview|rc>.<N>`（当前为 `v0.2.0-preview.1`）
+- 工具版本号与所适配的官方 T3 Code 基线版本（`0.1.12`）相互独立
