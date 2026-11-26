@@ -12,18 +12,8 @@ if [ $# -eq 0 ]; then
   exec node cli.cjs install --interactive --banner
 fi
 
-case "$1" in
-  status|install|repair|uninstall|restore|build|help|-*)
-    exec node cli.cjs "$@"
-    ;;
-  *)
-    case "${1%/}" in
-      *.AppImage|*.app)
-        exec node cli.cjs install "$@"
-        ;;
-      *)
-        exec node cli.cjs "$@"
-        ;;
-    esac
-    ;;
+case "${1%/}" in
+  -*) ;;
+  *.AppImage|*.app) set -- install "$@" ;;
 esac
+exec node cli.cjs "$@"

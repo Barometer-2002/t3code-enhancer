@@ -18,8 +18,8 @@ const {
   buildPatchedArchive,
   isLinuxAppRunning,
 } = require("./lib/engine.cjs");
-const { digest, readAsar, writeVerifiedAsarCopy } = require("./lib/asar.cjs");
-const { withInstallDirectoryLock, retirePreviousInstall } = require("./lib/install-state.cjs");
+const { digest, writeVerifiedAsarCopy } = require("./lib/asar.cjs");
+const { withInstallDirectoryLock, recoverPreviousInstall, replaceStagedInstall, cleanupStagingDirectories } = require("./lib/install-state.cjs");
 const {
   resolveInstallPlan,
   parsePlatformArgs,
@@ -29,13 +29,16 @@ const {
   getThemeStatus,
   getUserdataDir: resolveUserdataDir,
   prepareProfileAt,
+  prepareThemeTransaction,
   formatThemeStatusText,
   uninstallTheme,
+  reportThemeUninstall,
 } = require("./lib/theme-manager.cjs");
+const { ENHANCER_TAG, T3_BASELINE_VERSION } = require("./lib/version.cjs");
 
-const T3_VERSION = "0.1.12";
-// 待官方发布 v0.1.12 稳定版 x86_64 AppImage 后补录其 SHA-256（避免在未校验哈希前执行 --appimage-extract）
-const APPIMAGE_HASH = null;
+const T3_VERSION = T3_BASELINE_VERSION;
+// SHA-256 published on the upstream v0.1.12 release asset.
+const APPIMAGE_HASH = "66b91551571df6d29b55cb590295edf411cff96c95a8feb3f41c3ca595d722e2";
 const MANAGED_FILE = ".t3code-enhancer-appimage";
 const SHARED_DATA_FILE = ".t3code-enhancer-shared-data";
 const APP_DIRECTORY = "squashfs-root";
@@ -116,7 +119,7 @@ function inspectInstall(paths = getLinuxPaths()) {
   assert(isManagedInstall(installDirectory), `安装目录已被其他文件占用：${installDirectory}`);
   const asarPath = path.join(installDirectory, APP_ASAR);
   const backupPath = asarPath + BACKUP_SUFFIX;
-  const { asar, modules, appVersion } = inspectArchive(asarPath, ALL_PATCHES);
+  const { asar, modules, appVersion, buildMeta } = inspectArchive(asarPath, ALL_PATCHES);
   const summary = summarizeModuleStates(modules);
   const hasBackup = fs.existsSync(backupPath);
   assert(
@@ -125,12 +128,22 @@ function inspectInstall(paths = getLinuxPaths()) {
   );
   const sharedData = usesSharedData(installDirectory);
   const themeStatus = getThemeStatus(getUserdataDir(sharedData, paths));
-  return { sharedData, asar, modules, summary, hasBackup, asarPath, backupPath, themeStatus, appVersion };
+  return { sharedData, asar, modules, summary, hasBackup, asarPath, backupPath, themeStatus, appVersion, buildMeta };
 }
 
 function status(paths = getLinuxPaths()) {
   const { installDirectory, previousDirectory, profileDirectory } = paths;
-  const existing = inspectInstall(paths);
+  let existing = null;
+  try {
+    existing = inspectInstall(paths);
+  } catch (err) {
+    if (isManagedInstall(installDirectory)) {
+      console.log(`检测到受管理的 Linux 安装 (${installDirectory})，当前包无法直接识别（${err.message}）。`);
+      console.log("若之前安装自更早版本（如 v0.1.0 / v0.1.1 的 0.1.11），请先退出应用并传入新版官方 AppImage 升级，或运行 repair 修复。");
+      return;
+    }
+    throw err;
+  }
   if (!existing) {
     console.log(fs.lstatSync(previousDirectory, { throwIfNoEntry: false })
       ? `上次升级未完成，旧安装仍保存在 ${previousDirectory}。运行 node linux.cjs repair 可恢复。`
@@ -144,7 +157,7 @@ function status(paths = getLinuxPaths()) {
     : existing.summary.allRecognized
       ? "已验证 (verified)"
       : "不兼容 (incompatible)";
-  console.log(`T3 Code ${versionStr} Linux 增强版已安装 [兼容性: ${compatTier}]，${isRunning(installDirectory) ? "运行中" : "未运行"}。`);
+  console.log(`T3 Code ${versionStr} Linux 增强版已安装 (t3code-enhancer ${ENHANCER_TAG}) [兼容性: ${compatTier}]，${isRunning(installDirectory) ? "运行中" : "未运行"}。`);
   console.log(
     existing.summary.allInstalled
       ? "补丁：已是最新版（全部模块）。"
@@ -168,11 +181,7 @@ function status(paths = getLinuxPaths()) {
 
 function cleanupStaleStaging(paths) {
   if (!fs.existsSync(paths.dataHome)) return;
-  for (const name of fs.readdirSync(paths.dataHome)) {
-    if (/^\.t3code-enhancer-[A-Za-z0-9]{6}$/.test(name)) {
-      fs.rmSync(path.join(paths.dataHome, name), { recursive: true, force: true });
-    }
-  }
+  cleanupStagingDirectories(paths.dataHome);
   const resourcesDir = path.join(paths.installDirectory, APP_DIRECTORY, "resources");
   if (fs.existsSync(resourcesDir)) {
     for (const name of fs.readdirSync(resourcesDir)) {
@@ -186,16 +195,7 @@ function cleanupStaleStaging(paths) {
 function withInstallLock(operation, paths = getLinuxPaths()) {
   const { installDirectory, installLock, previousDirectory } = paths;
   return withInstallDirectoryLock(installLock, () => {
-    if (fs.lstatSync(previousDirectory, { throwIfNoEntry: false })) {
-      assert(isManagedInstall(previousDirectory), `无法确认旧安装备份：${previousDirectory}`);
-      if (fs.lstatSync(installDirectory, { throwIfNoEntry: false })) {
-        inspectInstall(paths);
-        retirePreviousInstall(previousDirectory);
-        assert(!fs.existsSync(previousDirectory), `无法清理旧安装备份：${previousDirectory}`);
-      } else {
-        fs.renameSync(previousDirectory, installDirectory);
-      }
-    }
+    recoverPreviousInstall(installDirectory, previousDirectory, isManagedInstall, () => inspectInstall(paths));
     return operation();
   });
 }
@@ -217,6 +217,8 @@ function install(input, options = {}, paths = getLinuxPaths()) {
     preset: options.preset || null,
     packs: options.packs || null,
     flags,
+    excludePatchIds: options.excludePatchIds || [],
+    exactPatchIds: options.exactPatchIds || null,
   });
   const requestedSharedData = flags.has("--shared-data") || options.sharedData === true;
   if (plan.needsLayer3Warning) {
@@ -235,9 +237,6 @@ function install(input, options = {}, paths = getLinuxPaths()) {
     assert(!requestedSharedData || sharedData, "当前为独立配置模式，无需 --shared-data（如需切换请先卸载）");
     const res = prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
     console.log(`[主题] 已安装 chatgpt-app 主题（${plan.officialOnly ? "仅官方稳定层 Layer 1" : "完整分层主题 Layer 1-3"}） -> ${res.targetPath}`);
-    if (!res.activated) {
-      console.warn(`[提示] 主题已写入，但未能自动激活：${res.reason || "请检查设置文件后手动切换主题"}`);
-    }
   }, paths);
 
   return withInstallLock(() => {
@@ -247,7 +246,7 @@ function install(input, options = {}, paths = getLinuxPaths()) {
     try {
       existing = inspectInstall(paths);
     } catch (err) {
-      if (options.repair && isManagedInstall(paths.installDirectory)) {
+      if ((options.repair || input) && isManagedInstall(paths.installDirectory)) {
         existingCorrupt = true;
       } else {
         throw err;
@@ -274,10 +273,7 @@ function install(input, options = {}, paths = getLinuxPaths()) {
           : "")
     ) {
       if (plan.includeTheme) {
-        const themeRes = prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
-        if (!themeRes.activated) {
-          console.warn(`[提示] 主题已写入，但未能自动激活：${themeRes.reason || "请检查设置文件后手动切换主题"}`);
-        }
+        prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
       }
       return status(paths);
     }
@@ -299,18 +295,32 @@ function install(input, options = {}, paths = getLinuxPaths()) {
       } catch (error) {
         throw new Error(`${error.message}。可传入官方 AppImage 重建受管理的副本。`, { cause: error });
       }
-      const baselineInfo = inspectArchive(baseline.path, ALL_PATCHES);
-      const baselineSummary = summarizeModuleStates(baselineInfo.modules);
+      const baselineSummary = summarizeModuleStates(baseline.modules);
       assert(baselineSummary.allRecognized, `基线 ASAR 包含未识别的版本内容，已中止安装。`);
       const compatTier = baselineSummary.autoAdapted ? "跨版本自动适配 (auto-adapted)" : "已验证 (verified)";
       const verStr = baseline.appVersion ? `v${baseline.appVersion}` : `v${T3_VERSION}`;
       console.log(`[兼容性] 原版基线版本 ${verStr} · ${compatTier}`);
       const stagingAsar = `${asarPath}.${randomUUID()}.tmp`;
+      const asarRollback = `${asarPath}.${randomUUID()}.rollback`;
       const targetPatches = applicablePatchesForArchive(baseline.asar, selectedPatches);
+      const userdataDir = getUserdataDir(sharedData, paths);
+      const themeTx = plan.includeTheme
+        ? prepareThemeTransaction(userdataDir, { officialOnly: plan.officialOnly, activate: !sharedData, createSettingsIfMissing: !sharedData })
+        : null;
+      const launchPath = path.join(paths.installDirectory, "launch.sh");
+      const managedPath = path.join(paths.installDirectory, MANAGED_FILE);
+      const sharedMarkerPath = path.join(paths.installDirectory, SHARED_DATA_FILE);
+      const launcherSnap = {
+        launch: fs.existsSync(launchPath) ? fs.readFileSync(launchPath) : null,
+        managed: fs.existsSync(managedPath) ? fs.readFileSync(managedPath) : null,
+        shared: fs.existsSync(sharedMarkerPath) ? fs.readFileSync(sharedMarkerPath) : null,
+      };
+      let asarReplaced = false;
+      let keepAsarRollback = false;
       try {
         if (targetPatches.length > 0) {
           console.log(`正在基于原版备份构建补丁（${targetPatches.map((p) => p.id).join(" + ")}）…`);
-          const report = buildPatchedArchive(baseline.asar, targetPatches, stagingAsar);
+          const report = buildPatchedArchive(baseline.asar, targetPatches, stagingAsar, { plan });
           for (const r of report) {
             const tag = r.compat === "auto-adapted" ? " (跨版本自动适配)" : "";
             console.log(`  ✓ ${r.id} -> ${r.key}${tag}`);
@@ -331,18 +341,45 @@ function install(input, options = {}, paths = getLinuxPaths()) {
         }
         const stat = fs.statSync(asarPath, { throwIfNoEntry: false }) ?? fs.statSync(baseline.path);
         fs.chmodSync(stagingAsar, stat.mode & 0o777);
+        if (fs.existsSync(asarPath)) {
+          fs.copyFileSync(asarPath, asarRollback, fs.constants.COPYFILE_EXCL);
+        }
         assert(!isRunning(paths.installDirectory), "请先退出 Linux 增强版，再运行升级或修复命令");
         fs.renameSync(stagingAsar, asarPath);
+        asarReplaced = true;
+        if (themeTx) {
+          const res = themeTx.commit();
+          if (!sharedData && !res.activated) {
+            console.warn("[提示] 主题已写入，但未能自动激活：请检查设置文件后手动切换主题");
+          }
+        }
+        writeLauncherFiles(paths.installDirectory, sharedData, { disableTelemetry: plan.telemetryDisabled });
+      } catch (err) {
+        if (asarReplaced) {
+          const rollbackErrors = [];
+          try { themeTx?.rollback(); } catch (e) { rollbackErrors.push(`主题回滚（${e.message}）`); }
+          try {
+            if (launcherSnap.launch !== null) fs.writeFileSync(launchPath, launcherSnap.launch, { mode: 0o700 });
+            if (launcherSnap.managed !== null) fs.writeFileSync(managedPath, launcherSnap.managed);
+            if (launcherSnap.shared !== null) fs.writeFileSync(sharedMarkerPath, launcherSnap.shared);
+            else if (fs.existsSync(sharedMarkerPath)) fs.unlinkSync(sharedMarkerPath);
+          } catch (e) { rollbackErrors.push(`启动器回滚（${e.message}）`); }
+          try {
+            if (fs.existsSync(asarRollback)) fs.renameSync(asarRollback, asarPath);
+            else fs.rmSync(asarPath, { force: true });
+          } catch (e) {
+            keepAsarRollback = true;
+            rollbackErrors.push(`${asarPath}（${e.message}，回滚副本：${asarRollback}）`);
+          }
+          if (rollbackErrors.length) {
+            throw new Error(`${err.message}。已提交 app.asar 且回滚失败：${rollbackErrors.join("、")}`, { cause: err });
+          }
+        }
+        throw err;
       } finally {
         if (fs.existsSync(stagingAsar)) fs.unlinkSync(stagingAsar);
+        if (!keepAsarRollback) fs.rmSync(asarRollback, { force: true });
       }
-      if (plan.includeTheme) {
-        const themeRes = prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
-        if (!themeRes.activated) {
-          console.warn(`[提示] 主题已写入，但未能自动激活：${themeRes.reason || "请检查设置文件后手动切换主题"}`);
-        }
-      }
-      writeLauncherFiles(paths.installDirectory, sharedData, { disableTelemetry: plan.telemetryDisabled });
       return status(paths);
     }
 
@@ -351,11 +388,12 @@ function install(input, options = {}, paths = getLinuxPaths()) {
     assert(fs.statSync(source).isFile(), "AppImage 路径必须是文件");
     fs.mkdirSync(paths.dataHome, { recursive: true });
     const staging = fs.mkdtempSync(path.join(paths.dataHome, ".t3code-enhancer-"));
+    const themeTx = plan.includeTheme
+      ? prepareThemeTransaction(getUserdataDir(sharedData, paths), { officialOnly: plan.officialOnly, activate: !sharedData, createSettingsIfMissing: !sharedData })
+      : null;
     try {
       const image = path.join(staging, "T3-Code-x86_64.AppImage");
       fs.copyFileSync(source, image, fs.constants.COPYFILE_EXCL);
-      assert(APPIMAGE_HASH,
-        `暂未收录 T3 Code ${T3_VERSION} 官方 x86_64 AppImage 的 SHA-256，无法安全自动解包。请先手动运行 --appimage-extract 后改用 node cli.cjs install --asar <app.asar路径>`);
       assert.equal(digest(fs.readFileSync(image)), APPIMAGE_HASH,
         `需要官方 T3 Code ${T3_VERSION} x86_64 AppImage（SHA-256 不匹配）`);
       fs.chmodSync(image, 0o700);
@@ -379,7 +417,7 @@ function install(input, options = {}, paths = getLinuxPaths()) {
       const targetPatches = applicablePatchesForArchive(baseline.asar, selectedPatches);
       if (targetPatches.length > 0) {
         const patched = target + ".patched";
-        const report = buildPatchedArchive(baseline.asar, targetPatches, patched);
+        const report = buildPatchedArchive(baseline.asar, targetPatches, patched, { plan });
         for (const r of report) {
           const tag = r.compat === "auto-adapted" ? " (跨版本自动适配)" : "";
           console.log(`  ✓ ${r.id} -> ${r.key}${tag}`);
@@ -388,29 +426,13 @@ function install(input, options = {}, paths = getLinuxPaths()) {
         fs.renameSync(patched, target);
       }
       writeLauncherFiles(staging, sharedData, { disableTelemetry: plan.telemetryDisabled });
-      if (existing || existingCorrupt) {
+      const replacing = Boolean(existing || existingCorrupt);
+      if (replacing) {
         assert(!isRunning(paths.installDirectory), "请先退出 Linux 增强版，再运行升级或修复命令");
-        fs.renameSync(paths.installDirectory, paths.previousDirectory);
       }
-      try {
-        fs.renameSync(staging, paths.installDirectory);
-      } catch (error) {
-        if (existing || existingCorrupt) {
-          try {
-            fs.renameSync(paths.previousDirectory, paths.installDirectory);
-          } catch (rollbackError) {
-            throw new Error(`安装失败，无法恢复原安装目录。旧安装仍保存在 ${paths.previousDirectory}（${rollbackError.message}）`, { cause: error });
-          }
-        }
-        throw error;
-      }
-      if (existing || existingCorrupt) retirePreviousInstall(paths.previousDirectory);
+      replaceStagedInstall(staging, paths.installDirectory, replacing ? paths.previousDirectory : null, themeTx ? { afterCommit: () => themeTx.commit(), onRollback: () => themeTx.rollback() } : undefined);
     } finally {
       fs.rmSync(staging, { recursive: true, force: true });
-    }
-    if (plan.includeTheme) {
-      const themeRes = prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
-      if (!themeRes.activated) console.warn(`[提示] 主题已写入，但未能自动激活：${themeRes.reason || "请检查设置文件后手动切换主题"}`);
     }
     return status(paths);
   }, paths);
@@ -425,13 +447,20 @@ function repair(input, options = {}, paths = getLinuxPaths()) {
       ? paths.installDirectory : paths.previousDirectory;
     try { existing = inspectInstall({ ...paths, installDirectory }); } catch {}
     if (existing) {
-      const inferred = inferRepairPlanOptions(existing.modules, existing.themeStatus);
+      const inferred = inferRepairPlanOptions(
+        existing.modules,
+        existing.themeStatus,
+        flags,
+        existing.buildMeta?.plan ? [existing.buildMeta.plan] : []
+      );
       if (inferred.officialOnly) flags.add("--official");
       if (inferred.patchOnly) flags.add("--patch-only");
       effectiveOptions = {
         ...effectiveOptions,
         preset: inferred.preset ?? undefined,
         packs: inferred.packs ?? undefined,
+        excludePatchIds: inferred.excludePatchIds,
+        exactPatchIds: inferred.exactPatchIds,
       };
     }
   }
@@ -440,6 +469,14 @@ function repair(input, options = {}, paths = getLinuxPaths()) {
 }
 
 function uninstall(flags = new Set(), paths = getLinuxPaths()) {
+  if (flags.has("--theme-only")) {
+    if (flags.has("--keep-theme")) return;
+    return withInstallDirectoryLock(paths.installLock, () => {
+      const installed = [paths.installDirectory, paths.previousDirectory].find(isManagedInstall);
+      const sharedData = installed ? usesSharedData(installed) : flags.has("--shared-data");
+      reportThemeUninstall(getUserdataDir(sharedData, paths));
+    });
+  }
   return withInstallLock(() => {
     const { installDirectory, profileDirectory } = paths;
     const keepTheme = flags.has("--keep-theme");
@@ -480,7 +517,8 @@ function printUsage() {
   node linux.cjs install [<AppImage>] [--preset <id>] [--packs <a,b>] [--shared-data] [--official] [--interactive]
   node linux.cjs repair  [<AppImage>] [--preset <id>] [--packs <a,b>] [--official]
   node linux.cjs status
-  node linux.cjs uninstall [--keep-theme] [--purge-profile]
+  node linux.cjs uninstall [--theme-only] [--keep-theme] [--purge-profile]
+  node linux.cjs --version
 
 可选预设 (--preset)：full（默认完整版）| chat-lite（轻量对话）| clean（主题+去遥测）| privacy-only（纯去遥测）| theme-only（纯主题）
 可选模块 (--packs) ：theme, privacy, composer, chat, workspace`);
@@ -492,6 +530,10 @@ async function runLinuxCli(argv) {
     printUsage();
     return;
   }
+  if (command === "version" || flags.has("--version")) {
+    console.log(require("./lib/version.cjs").formatVersionBanner());
+    return;
+  }
   assert(process.platform === "linux" && process.arch === "x64", "仅支持 Linux x86_64");
   assert(process.getuid() !== 0, "请以桌面用户运行");
   const paths = getLinuxPaths();
@@ -501,7 +543,7 @@ async function runLinuxCli(argv) {
   if (command === "install") {
     if (flags.has("--banner")) {
       console.log("============================================================");
-      console.log("  T3 Code Linux 增强版安装与升级 (t3code-enhancer)");
+      console.log(`  T3 Code Linux 增强版安装与升级 (t3code-enhancer ${ENHANCER_TAG})`);
       console.log("============================================================\n");
     }
     if (flags.has("--interactive") && !preset && !packs && !flags.has("--theme-only")) {
@@ -526,7 +568,7 @@ async function runLinuxCli(argv) {
   if (command === "repair") {
     if (flags.has("--banner")) {
       console.log("============================================================");
-      console.log("  T3 Code Linux 增强版修复工具 (t3code-enhancer)");
+      console.log(`  T3 Code Linux 增强版修复工具 (t3code-enhancer ${ENHANCER_TAG})`);
       console.log("============================================================\n");
     }
     return repair(input, { flags, preset, packs }, paths);
@@ -539,7 +581,7 @@ async function runLinuxCli(argv) {
     assert(input === undefined, "命令参数不正确");
     if (flags.has("--banner")) {
       console.log("============================================================");
-      console.log("  T3 Code Linux 增强版卸载工具 (t3code-enhancer)");
+      console.log(`  T3 Code Linux 增强版卸载工具 (t3code-enhancer ${ENHANCER_TAG})`);
       console.log("============================================================\n");
     }
     return uninstall(flags, paths);
@@ -568,6 +610,10 @@ module.exports = {
   getUserdataDir,
   prepareProfile,
   inspectInstall,
+  status,
+  install,
+  repair,
+  uninstall,
   matchesSelectedPatches,
   parseLinuxArgs,
   writeLauncherFiles,

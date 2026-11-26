@@ -6,13 +6,13 @@ const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const { runInNewContext, createContext, runInContext } = require("node:vm");
 
-const { readAsar, findUniqueEntry, getAsarAppVersion, writePatchedAsar, validateScriptSyntax, digest } = require("../lib/asar.cjs");
-const { verifyInjectedScope, findPatchTarget, createPatchContext } = require("../lib/resolver.cjs");
-const { collectTopLevelBindings, findUndeclaredIdentifiers } = require("../lib/js-ast.cjs");
-const { ALL_PATCHES, selectPatches, applicablePatchesForArchive, inspectArchive, summarizeModuleStates, resolvePristineBaseline, buildPatchedArchive, getLinuxAsarCandidates, isLinuxAppRunning, parseCliArgs } = require("../cli.cjs");
-const { PACKS, PRESETS, resolveInstallPlan } = require("../lib/packs.cjs");
+const { readAsar, readEntryBuffer, findUniqueEntry, getAsarAppVersion, writePatchedAsar, validateScriptSyntax, digest } = require("../lib/asar.cjs");
+const { verifyInjectedScope, findPatchTarget, createPatchContext, resolveRelativeKey } = require("../lib/resolver.cjs");
+const { collectTopLevelBindings, findUndeclaredIdentifiers, tokenize, parseImports } = require("../lib/js-ast.cjs");
+const { ALL_PATCHES, selectPatches, applicablePatchesForArchive, inspectArchive, summarizeModuleStates, resolvePristineBaseline, buildPatchedArchive, getLinuxAsarCandidates, getAsarPaths, getArchiveTargetPaths, isLinuxAppRunning, parseCliArgs, buildDelegatedArgs, isThemeOnlySelection, shouldDelegateToLinux, shouldDelegateToMacos, isMacosBundleAsarPath, resolveCanonicalPath, assertSafeAsarTargets, runAsarTransaction, matchesSelectedPatches, getArchiveCompatibilityTier, cmdInstall, cmdRepair, cmdUninstall } = require("../cli.cjs");
+const { PACKS, PRESETS, resolveInstallPlan, parsePlatformArgs } = require("../lib/packs.cjs");
 const { withInstallDirectoryLock } = require("../lib/install-state.cjs");
-const { inspectCompatibleSource } = require("../lib/engine.cjs");
+const { inspectCompatibleSource, inferRepairPlanOptions } = require("../lib/engine.cjs");
 const noTelemetry = require("../lib/patches/no-telemetry.cjs");
 const desktopTray = require("../lib/patches/desktop-tray.cjs");
 const newChatLayout = require("../lib/patches/new-chat-layout.cjs");
@@ -24,8 +24,8 @@ const usageRings = require("../lib/patches/usage-rings.cjs");
 const inlineFileDiff = require("../lib/patches/inline-file-diff.cjs");
 const filesChangesExplorer = require("../lib/patches/files-changes-explorer.cjs");
 const workspaceFloatingPanels = require("../lib/patches/workspace-floating-panels.cjs");
-const { workspaceFloatFrame, workspaceSnapFrame, defaultChatFloatFrame, chatPillFrame, placeSurfaceFloat } = workspaceFloatingPanels;
-const { SOURCE_THEME_PATH, extractOfficialTheme } = require("../lib/theme-manager.cjs");
+const { workspaceFloatFrame, workspaceSnapFrame, defaultChatFloatFrame, defaultPreviewFloatFrame, serializePreviewFloatFrame, restorePreviewFloatFrame, chatPillFrame, placeSurfaceFloat } = workspaceFloatingPanels;
+const { SOURCE_THEME_PATH, extractOfficialTheme, installThemeAt, uninstallTheme, getThemeStatus } = require("../lib/theme-manager.cjs");
 
 // Runtime modules under lib/runtime are plain ESM without imports. Load them the way the
 // ASAR does (as a standalone script) so tests exercise the real shipped source, and hand
@@ -115,6 +115,25 @@ const officialTheme = extractOfficialTheme(theme);
 for (const forbidden of ["[data-work-entry-id]", "[data-tool-group-scroll]", "[data-right-panel-", "[data-changed-files-", "[data-testid=", ".t3e-"]) {
   assert(!officialTheme.css.includes(forbidden), `Layer 1 official theme must not contain non-official selector: ${forbidden}`);
 }
+assert.deepEqual(
+  findUndeclaredIdentifiers("function first(){let alias=1} function second(){return alias}", new Set()),
+  ["alias"],
+  "findUndeclaredIdentifiers must isolate declarations per function scope"
+);
+assert.deepEqual(
+  findUndeclaredIdentifiers("function outer(){{const secret=1}return secret}", new Set()),
+  ["secret"],
+  "findUndeclaredIdentifiers must isolate let/const declarations per block scope"
+);
+assert.deepEqual(
+  findUndeclaredIdentifiers("const f=a=>a;const g=()=>a;", new Set()),
+  ["a"],
+  "findUndeclaredIdentifiers must isolate arrow parameters"
+);
+assert.deepEqual(
+  findUndeclaredIdentifiers("function ok(){let x=1;return ()=>x}", new Set()),
+  []
+);
 console.log("   OK (total css:", theme.css.length, "chars | official layer:", officialTheme.css.length, "chars)");
 
 console.log("2. Unit testing timeline-collapse cascade logic...");
@@ -161,21 +180,29 @@ const sampleEntries = [
 const grouped = timelineCollapse.groupSameFileEntries(sampleEntries, "C:\\proj", {
   resolveRelPath: (p, root) => p.replaceAll("\\", "/").replace(/^c:\/proj\//i, ""),
 });
-assert.equal(grouped.length, 5);
+assert.equal(grouped.length, 6, "Only adjacent same-file operations fold; interleaved events stay in chronological order");
 assert.equal(grouped[0].type, "single");
 assert.equal(grouped[0].entry.id, "t0");
-assert.equal(grouped[1].type, "file-group");
-assert.equal(grouped[1].kind, "read");
-assert.equal(grouped[1].filePath, "src/a.ts");
-assert.deepEqual(grouped[1].entries.map((x) => x.id), ["r1", "r3", "r4"]);
+assert.equal(grouped[1].type, "single");
+assert.equal(grouped[1].entry.id, "r1");
 assert.equal(grouped[2].type, "single");
 assert.equal(grouped[2].entry.id, "r2");
 assert.equal(grouped[3].type, "file-group");
-assert.equal(grouped[3].kind, "edit");
-assert.deepEqual(grouped[3].entries.map((x) => x.id), ["e1", "e2"]);
-assert.equal(grouped[4].type, "single");
-assert.equal(grouped[4].entry.id, "e3");
-assert.equal(timelineCollapse.t3FormatReadRanges(grouped[1].entries), "L1-100, L101-200 +1");
+assert.equal(grouped[3].kind, "read");
+assert.equal(grouped[3].filePath, "src/a.ts");
+assert.deepEqual(grouped[3].entries.map((x) => x.id), ["r3", "r4"]);
+assert.equal(grouped[4].type, "file-group");
+assert.equal(grouped[4].kind, "edit");
+assert.deepEqual(grouped[4].entries.map((x) => x.id), ["e1", "e2"]);
+assert.equal(grouped[5].type, "single");
+assert.equal(grouped[5].entry.id, "e3");
+assert.equal(timelineCollapse.t3FormatReadRanges(grouped[3].entries), "L101-200, L201-300");
+const interleavedWithFailure = timelineCollapse.groupSameFileEntries([
+  { id: "a1", itemType: "file_change", action: "edit", changedFiles: ["a.ts"] },
+  { id: "f1", itemType: "file_change", action: "edit", changedFiles: ["a.ts"], status: "failed" },
+  { id: "a2", itemType: "file_change", action: "edit", changedFiles: ["a.ts"] },
+], "", { isEntryFailed: (x) => x.status === "failed" });
+assert.deepEqual(interleavedWithFailure.map((g) => g.entry.id), ["a1", "f1", "a2"], "Failed entries must break same-file folding and keep order");
 assert.deepEqual(timelineCollapse.t3AggregateEditStats([
   { additions: 3, diffStr: "--- a/f\n+++ b/f\n@@ -1 +1 @@\n---removed text\n+++added text" },
 ]), { additions: 3, deletions: 1 });
@@ -183,13 +210,14 @@ assert.equal(timelineCollapse.t3AggregateEditStats([{ oldStr: "full file", newSt
 console.log("   OK");
 
 console.log("3. Unit testing usage-rings 5h/7d pairing logic...");
-const paired1 = usageRings.t3PairUsageWindows([
+const windows1 = [
   { id: "cg-5h", label: "Claude & GPT (shared)", resetsAt: "2026-11-23T05:00:00Z" },
   { id: "gem-5h", label: "Gemini · 5-hour", resetsAt: "2026-11-23T05:00:00Z" },
   { id: "cg-7d", label: "Claude & GPT (shared)", resetsAt: "2026-11-29T00:00:00Z" },
   { id: "argon", label: "Gemini 4 Argon · 5-hour", resetsAt: "2026-11-23T05:00:00Z" },
   { id: "gem-7d", label: "Gemini · Weekly", resetsAt: "2026-11-29T00:00:00Z" },
-]);
+];
+const paired1 = usageRings.t3PairUsageWindows(windows1);
 assert.equal(paired1.length, 3);
 assert.equal(paired1[0].kind, "dual");
 assert.equal(paired1[0].shortWindow.id, "cg-5h");
@@ -201,26 +229,41 @@ assert.equal(paired1[1].longWindow.id, "gem-7d");
 assert.equal(paired1[2].kind, "single");
 assert.equal(paired1[2].window.id, "argon");
 
-const paired2 = usageRings.t3PairUsageWindows([
+const windows2 = [
   { id: "s", label: "Session" },
   { id: "w", label: "Weekly" },
-]);
+];
+const paired2 = usageRings.t3PairUsageWindows(windows2);
 assert.equal(paired2.length, 1);
 assert.equal(paired2[0].kind, "dual");
 assert.equal(paired2[0].shortWindow.id, "s");
 assert.equal(paired2[0].longWindow.id, "w");
 
 // Active-model quota matching across multi-model independent pools
-assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired1, "gemini-4-neon").title, "Gemini");
-assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired1, "gemini-4-argon").window.id, "argon");
-assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired1, "claude-opus-5-5").title, "Claude & GPT (shared)");
-assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired1, "gpt-oss-120b").title, "Claude & GPT (shared)");
-assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired2, "gpt-6.2-sol").key, "s:w");
+assert.equal(usageRings.t3SelectPrimaryQuotaForModel(windows1, "gemini-4-neon").title, "Gemini");
+assert.equal(usageRings.t3SelectPrimaryQuotaForModel(windows1, "gemini-4-argon").window.id, "argon");
+assert.equal(usageRings.t3SelectPrimaryQuotaForModel(windows1, "claude-opus-5-5").title, "Claude & GPT (shared)");
+assert.equal(usageRings.t3SelectPrimaryQuotaForModel(windows1, "gpt-oss-120b").title, "Claude & GPT (shared)");
+assert.equal(usageRings.t3SelectPrimaryQuotaForModel(windows2, "gpt-6.2-sol").key, "s:w");
 const explicitModel = "claude-opus-ultra";
 assert.equal(usageRings.t3SelectPrimaryQuotaForModel([
-  { kind: "single", key: "heuristic", title: "Claude Opus Ultra", window: {} },
-  { kind: "single", key: "authoritative", title: "Other", window: { modelIds: [explicitModel] } },
+  { id: "heuristic", label: "Claude Opus Ultra" },
+  { id: "authoritative", label: "Other", modelIds: [explicitModel] },
 ], explicitModel).key, "authoritative");
+const dailyQuarterly = usageRings.t3PairUsageWindows([
+  { id: "daily", label: "Claude Daily" },
+  { id: "quarterly", label: "Claude Quarterly" },
+]);
+assert.equal(dailyQuarterly.length, 2, "Non-5h/7d windows must not be forcibly synthesized as a dual 5h/7d pair");
+assert.equal(dailyQuarterly.every((item) => item.kind === "single"), true);
+assert.equal(usageRings.t3EstimateOutputTokens(""), 0);
+assert.equal(usageRings.t3EstimateOutputTokens("Hello, world!"), 3.25);
+assert.equal(usageRings.t3EstimateOutputTokens("你好，世界"), 3.75);
+assert.equal(usageRings.t3EstimateOutputTokens("你🙂好"), 3);
+assert(
+  usageRings.t3EstimateOutputTokens("a你🙂b") > usageRings.t3EstimateOutputTokens("a你🙂"),
+  "Output token estimate must remain monotonic as streamed text grows"
+);
 console.log("   OK");
 
 console.log("3.5. Unit testing inline-file-diff unified diff parser...");
@@ -250,20 +293,27 @@ assert.equal(trailingNewlineDiff.additions, 3);
 assert.equal(filesChangesExplorer.t3NormalizeRelPath(".\\src\\index.ts"), "src/index.ts");
 assert.equal(filesChangesExplorer.t3NormalizeRelPath("/foo/bar.js"), "foo/bar.js");
 const feTree = filesChangesExplorer.t3BuildChangedFileTree([
-  { path: "./a/b/c.txt", insertions: 3, deletions: 0 },
-  { path: "a/b/c.txt", insertions: 3, deletions: 0 },
+  { path: "./a/b/c.txt", status: "modified", insertions: 3, deletions: 0 },
+  { path: "a/b/c.txt", status: "modified", insertions: 3, deletions: 0 },
   { path: "ignored-dir/", insertions: 0, deletions: 0 },
-  { path: "a/d.txt", insertions: 1, deletions: 1 },
-  { path: "root.md", insertions: 2, deletions: 0 },
+  { path: "a/d.txt", status: "added", insertions: 1, deletions: 0 },
+  { path: "root.md", status: "modified", insertions: 2, deletions: 0 },
+  { path: "brand-new.md", status: "??", insertions: 0, deletions: 0 },
 ], "");
-assert.equal(feTree.length, 2);
+assert.equal(feTree.length, 3);
 assert.equal(feTree[0].kind, "dir");
 assert.equal(feTree[0].name, "a");
 assert.equal(feTree[0].children[0].kind, "dir");
 assert.equal(feTree[0].children[0].name, "b");
 assert.equal(feTree[0].children[0].children[0].path, "a/b/c.txt");
+assert.equal(feTree[0].children[0].children[0].isNew, false, "Tracked modified file with 0 deletions must not be marked new");
+assert.equal(feTree[0].children[1].isNew, true, "Explicitly added file must be marked new");
 assert.equal(feTree[1].kind, "file");
-assert.equal(feTree[1].name, "root.md");
+assert.equal(feTree[1].name, "brand-new.md");
+assert.equal(feTree[1].isNew, true);
+assert.equal(feTree[2].kind, "file");
+assert.equal(feTree[2].name, "root.md");
+assert.equal(feTree[2].isNew, false);
 console.log("   OK");
 
 console.log("3.6. Unit testing floating window geometry...");
@@ -301,11 +351,463 @@ assert.deepEqual(chatPillFrame(defaultChat, { width: 180, height: 48 }),
   { x: 8, y: 8, width: 164, height: 32 });
 const roomy = { width: 1500, height: 850 };
 const openFrame = placeSurfaceFloat(roomy, [], true);
+assert.deepEqual(openFrame, defaultPreviewFloatFrame(roomy));
+assert(openFrame.x + openFrame.width === roomy.width - 12 && openFrame.y + openFrame.height === roomy.height - 12,
+  "Default floating preview should dock cleanly in the bottom-right corner");
+const desktopPreview = defaultPreviewFloatFrame({ width: 1611, height: 944 });
+assert.deepEqual(desktopPreview, { x: 1183, y: 422, width: 416, height: 510 });
+const savedPreviewRight = serializePreviewFloatFrame({ x: 1160, y: 390, width: 420, height: 500 }, { width: 1600, height: 920 });
+assert.equal(savedPreviewRight.anchorRight, true);
+assert.equal(savedPreviewRight.anchorBottom, true);
+assert.deepEqual(restorePreviewFloatFrame(savedPreviewRight, { width: 1600, height: 920 }), { x: 1160, y: 390, width: 420, height: 500 });
+assert.deepEqual(restorePreviewFloatFrame(savedPreviewRight, { width: 1400, height: 800 }), { x: 960, y: 270, width: 420, height: 500 });
+const savedPreviewLeft = serializePreviewFloatFrame({ x: 40, y: 50, width: 380, height: 420 }, { width: 1600, height: 920 });
+assert.equal(savedPreviewLeft.anchorRight, false);
+assert.equal(savedPreviewLeft.anchorBottom, false);
+assert.deepEqual(placeSurfaceFloat({ width: 1400, height: 800 }, [], true, null, savedPreviewLeft), { x: 40, y: 50, width: 380, height: 420 });
+const secondPreview = placeSurfaceFloat({ width: 1400, height: 800 }, [{ x: 960, y: 270, width: 420, height: 500 }], true, null, savedPreviewRight);
+assert(secondPreview.x + secondPreview.width <= 960, "A second floating browser should avoid stacking directly on top of the saved spot");
 const nextFrame = placeSurfaceFloat(roomy, [openFrame], false);
 assert(nextFrame.x + nextFrame.width <= openFrame.x, "The next window should use the empty left side");
 assert.equal(placeSurfaceFloat(floatBounds, [], true, { x: 10, y: 10 }).x, 8);
 assert(workspaceFloatingPanels.legacyMarkers.includes("T3_WORKSPACE_FLOATING_PANELS_V22"));
+assert(workspaceFloatingPanels.legacyMarkers.includes("T3_WORKSPACE_FLOATING_PANELS_V29"));
 console.log("   OK");
+
+console.log("3.7. Unit testing cross-platform (Windows / Linux / macOS) CLI routing, helpers & EOL hygiene...");
+verifyCrossPlatformCliUnit();
+console.log("   OK");
+
+function verifyCrossPlatformCliUnit() {
+  const repoRoot = path.join(__dirname, "..");
+
+  // 1) Cross-platform packaging / EOL hygiene (LF for Unix scripts, ESM, JSON, docs; CRLF for Windows .cmd)
+  const lfFiles = [
+    "install.sh",
+    "package.json",
+    "themes/chatgpt-app.json",
+    ...fs.readdirSync(path.join(repoRoot, "lib", "runtime")).filter((f) => f.endsWith(".mjs")).map((f) => path.join("lib", "runtime", f)),
+  ];
+  for (const rel of lfFiles) {
+    const raw = fs.readFileSync(path.join(repoRoot, rel), "utf8");
+    assert(!raw.includes("\r\n"), `${rel} must use LF line endings for reproducible cross-platform ASAR/Unix execution`);
+  }
+  const installSh = fs.readFileSync(path.join(repoRoot, "install.sh"), "utf8");
+  assert(installSh.startsWith("#!/usr/bin/env sh\n"), "install.sh must keep POSIX sh shebang on line 1");
+  for (const cmdFile of ["install.cmd", "repair.cmd", "status.cmd", "uninstall.cmd"]) {
+    const raw = fs.readFileSync(path.join(repoRoot, cmdFile), "utf8");
+    assert(raw.includes("\r\n"), `${cmdFile} must use CRLF line endings for Windows cmd.exe`);
+    assert(raw.includes("chcp 65001"), `${cmdFile} must switch console to UTF-8`);
+  }
+
+  // 2) Unified CLI & platform arg parsing (including flags before positional paths and implicit bundle paths)
+  const implicitLinux = parseCliArgs(["--preset", "clean", "/tmp/T3-Code-0.1.12-x86_64.AppImage"]);
+  assert.equal(implicitLinux.cmd, "install");
+  assert.equal(implicitLinux.preset, "clean");
+  assert.deepEqual(implicitLinux.rest, ["/tmp/T3-Code-0.1.12-x86_64.AppImage"]);
+
+  const implicitAppImageFlag = parseCliArgs(["--appimage", "/tmp/T3-Code.AppImage"]);
+  assert.equal(implicitAppImageFlag.cmd, "install");
+  assert.equal(implicitAppImageFlag.appImagePath, "/tmp/T3-Code.AppImage");
+
+  const repairMac = parseCliArgs(["--repair", "/Applications/T3 Code (Beta).app/"]);
+  assert.equal(repairMac.cmd, "repair");
+  assert.deepEqual(repairMac.rest, ["/Applications/T3 Code (Beta).app/"]);
+
+  const buildWithFlag = parseCliArgs(["--build", "/tmp/test.asar", "--preset", "chat-lite"]);
+  assert.equal(buildWithFlag.cmd, "build");
+  assert.deepEqual(buildWithFlag.rest, ["/tmp/test.asar"]);
+  assert.equal(buildWithFlag.preset, "chat-lite");
+
+  assert.equal(parseCliArgs(["--app=/Applications/T3.app"]).cmd, "install");
+  assert.equal(parsePlatformArgs(["/tmp/T3.AppImage", "--shared-data"]).command, "install");
+  assert.equal(parsePlatformArgs(["/tmp/T3.AppImage", "--shared-data"]).input, "/tmp/T3.AppImage");
+  assert.equal(parsePlatformArgs(["--repair", "/Applications/T3.app/"]).command, "repair");
+  assert.equal(parsePlatformArgs(["--repair", "/Applications/T3.app/"]).input, "/Applications/T3.app/");
+  assert.equal(parsePlatformArgs(["restore", "--keep-theme"]).command, "uninstall");
+
+  // 3) 3-platform delegation matrix with mocked process.platform
+  const origDesc = Object.getOwnPropertyDescriptor(process, "platform");
+  const withPlatform = (plat, fn) => {
+    Object.defineProperty(process, "platform", { value: plat, configurable: true });
+    try {
+      return fn();
+    } finally {
+      Object.defineProperty(process, "platform", origDesc);
+    }
+  };
+  withPlatform("win32", () => {
+    assert.equal(shouldDelegateToLinux(parseCliArgs(["status"])), false);
+    assert.equal(shouldDelegateToMacos(parseCliArgs(["status"])), false);
+  });
+  withPlatform("linux", () => {
+    assert.equal(shouldDelegateToLinux(parseCliArgs(["--preset", "clean", "/tmp/T3.AppImage"])), true);
+    assert.equal(shouldDelegateToLinux(parseCliArgs(["install", "--asar", "/opt/T3 Code/resources/app.asar"])), false);
+    assert.equal(shouldDelegateToLinux(parseCliArgs(["build", "/tmp/out.asar"])), false);
+    assert.equal(shouldDelegateToLinux(parseCliArgs(["--help"])), false);
+    assert.deepEqual(
+      buildDelegatedArgs(implicitLinux, ["--preset", "clean", "/tmp/T3.AppImage"], implicitLinux.appImagePath),
+      ["install", "--preset", "clean", "/tmp/T3.AppImage"]
+    );
+    assert.deepEqual(
+      buildDelegatedArgs(parseCliArgs(["--repair", "--appimage", "/tmp/T3.AppImage"]), ["--repair", "--appimage", "/tmp/T3.AppImage"], "/tmp/T3.AppImage"),
+      ["repair", "/tmp/T3.AppImage"]
+    );
+  });
+  withPlatform("darwin", () => {
+    assert.equal(shouldDelegateToMacos(parseCliArgs(["install", "/Applications/Custom.app/"])), true);
+    assert.equal(shouldDelegateToMacos(parseCliArgs(["install", "--asar", "/tmp/app.asar"])), false);
+    assert.equal(shouldDelegateToMacos(parseCliArgs(["build", "/tmp/out.asar"])), false);
+    assert.equal(isThemeOnlySelection(parseCliArgs(["--preset", "theme-only"])), true);
+    assert.equal(isThemeOnlySelection(parseCliArgs(["--packs", "theme"])), true);
+    assert.deepEqual(
+      buildDelegatedArgs(parseCliArgs(["install", "--app", "/Applications/Custom.app"]), ["install", "--app", "/Applications/Custom.app"], "/Applications/Custom.app"),
+      ["install", "/Applications/Custom.app"]
+    );
+  });
+  assert.equal(isMacosBundleAsarPath("/Applications/T3 Code (Beta).app/Contents/Resources/app.asar"), true);
+  assert.equal(isMacosBundleAsarPath("/opt/T3 Code/resources/app.asar"), false);
+  assert.throws(
+    () => assertSafeAsarTargets([{ source: "/Applications/T3 Code (Beta).app/Contents/Resources/app.asar" }]),
+    /禁止通过通用 --asar/,
+    "Mutating a macOS .app bundle ASAR via generic --asar must be rejected"
+  );
+  // Symlink / directory-alias resolution pointing into .app/Contents/Resources (including missing target ASAR repair)
+  const symTmp = fs.mkdtempSync(path.join(os.tmpdir(), "t3e-mac-symlink-"));
+  try {
+    const bundleRes = path.join(symTmp, "T3 Code (Beta).app", "Contents", "Resources");
+    fs.mkdirSync(bundleRes, { recursive: true });
+    const realAsar = path.join(bundleRes, "app.asar");
+    fs.writeFileSync(realAsar, "stub-asar");
+    const aliasDir = path.join(symTmp, "alias-resources");
+    const aliasAsar = path.join(aliasDir, "app.asar");
+    let symlinkCreated = false;
+    try {
+      fs.symlinkSync(bundleRes, aliasDir, process.platform === "win32" ? "junction" : "dir");
+      symlinkCreated = true;
+    } catch (err) {
+      if (!["EPERM", "EACCES"].includes(err?.code)) throw err;
+    }
+    if (symlinkCreated) {
+      assert.equal(isMacosBundleAsarPath(aliasAsar), true, "Real symlinked Resources alias must resolve canonical macOS bundle path");
+      assert.throws(() => assertSafeAsarTargets([{ source: aliasAsar }]), /禁止通过通用 --asar/);
+      fs.unlinkSync(realAsar);
+      assert.equal(isMacosBundleAsarPath(aliasAsar), true, "Real symlinked Resources alias must still be blocked when target app.asar is missing");
+      assert.throws(() => assertSafeAsarTargets([{ source: aliasAsar }]), /禁止通过通用 --asar/);
+    }
+    // Always verify ancestor-walking canonicalization when symlink creation is sandbox-restricted
+    const normAliasDir = path.resolve(aliasDir).toLowerCase();
+    const mockRealpath = (p) => {
+      const low = path.resolve(p).toLowerCase();
+      if (low === path.resolve(aliasAsar).toLowerCase()) {
+        const err = new Error(`ENOENT: ${p}`);
+        err.code = "ENOENT";
+        throw err;
+      }
+      if (low === normAliasDir) return bundleRes;
+      return p;
+    };
+    assert.equal(resolveCanonicalPath(aliasAsar, mockRealpath), path.join(bundleRes, "app.asar"));
+    assert.equal(isMacosBundleAsarPath(aliasAsar, mockRealpath), true);
+  } finally {
+    fs.rmSync(symTmp, { recursive: true, force: true });
+  }
+
+  // 3.8) AST parseExports coverage (async, generator, multi-declarator destructuring, wildcard/ns re-exports, anonymous default)
+  const { parseExports: astParseExports } = require("../lib/js-ast.cjs");
+  const parsedEx = astParseExports(`
+    export async function asyncOp() {}
+    export async function* asyncGenOp() {}
+    export function* genOp() {}
+    export const first = 1, { nested: second, shortB } = obj, [arrA, ...arrRest] = arr;
+    export * from "./sub.js";
+    export * as nsAlias from "./ns.js";
+    export default () => 42;
+  `);
+  const exNames = new Set(parsedEx.filter((e) => !e.from).map((e) => e.exported));
+  for (const expected of ["asyncOp", "asyncGenOp", "genOp", "first", "second", "shortB", "arrA", "arrRest", "default"]) {
+    assert(exNames.has(expected), `parseExports must recognize "${expected}"`);
+  }
+  assert(parsedEx.some((e) => e.exported === "*" && e.from === "./sub.js"), "parseExports must capture export * from");
+  assert(parsedEx.some((e) => e.exported === "nsAlias" && e.from === "./ns.js"), "parseExports must capture export * as ns from");
+
+  // 3.9) Standardized SemVer versioning & project release policy separation
+  const {
+    ENHANCER_VERSION,
+    ENHANCER_TAG,
+    T3_BASELINE_VERSION,
+    SEMVER_REGEX,
+    PROJECT_RELEASE_REGEX,
+    parseSemver,
+    compareSemver,
+    parseProjectReleaseVersion,
+    parseStandardVersion,
+    compareStandardVersions,
+    readPackageVersion,
+    formatVersionBanner,
+  } = require("../lib/version.cjs");
+  assert(SEMVER_REGEX.test(ENHANCER_VERSION) && PROJECT_RELEASE_REGEX.test(ENHANCER_VERSION), `package version must satisfy SemVer & project release format: ${ENHANCER_VERSION}`);
+  assert.equal(ENHANCER_TAG, `v${ENHANCER_VERSION}`);
+  assert.equal(readPackageVersion().version, ENHANCER_VERSION);
+  const parsedSemAlpha = parseSemver("1.0.0-alpha");
+  assert.equal(parsedSemAlpha.prerelease, "alpha");
+  const parsedSemBuild = parseSemver("1.0.0+build.001");
+  assert.equal(parsedSemBuild.build, "build.001");
+  assert.equal(compareSemver("1.0.0+build.001", "1.0.0+build.002"), 0, "SemVer build metadata must not affect precedence");
+  assert(compareSemver("1.0.0-alpha", "1.0.0-alpha.1") < 0);
+  assert(compareSemver("0.2.0-preview.9007199254740992", "0.2.0-preview.9007199254740993") < 0, "Numeric identifiers above MAX_SAFE_INTEGER must compare accurately via BigInt");
+  const parsedPreview = parseProjectReleaseVersion("0.2.0-preview.1");
+  assert.equal(parsedPreview.channel, "preview");
+  assert.equal(parsedPreview.prereleaseTag, "preview");
+  assert.equal(parsedPreview.prereleaseNumber, 1);
+  assert.equal(parsedPreview.isPrerelease, true);
+  assert.equal(parseProjectReleaseVersion("0.2.0").channel, "stable");
+  for (const invalidVer of ["v0.2.0", "0.2", "01.0.0", "0.2.0-01"]) {
+    assert.throws(() => parseStandardVersion(invalidVer), /SemVer 2\.0\.0/, `Invalid SemVer rejected: ${invalidVer}`);
+  }
+  for (const nonReleaseVer of ["1.0.0-alpha", "1.0.0+build.001", "0.2.0-preview.0", "0.2.0-foo.1"]) {
+    assert.throws(() => parseProjectReleaseVersion(nonReleaseVer), /项目发行版本号不符合规范/, `Non-project release rejected: ${nonReleaseVer}`);
+  }
+  const orderedVersions = [
+    "0.1.0",
+    "0.1.1",
+    "0.2.0-alpha.1",
+    "0.2.0-beta.1",
+    "0.2.0-preview.1",
+    "0.2.0-preview.2",
+    "0.2.0-rc.1",
+    "0.2.0",
+  ];
+  for (let i = 0; i < orderedVersions.length - 1; i++) {
+    assert(compareStandardVersions(orderedVersions[i], orderedVersions[i + 1]) < 0, `${orderedVersions[i]} < ${orderedVersions[i + 1]}`);
+    assert(compareStandardVersions(orderedVersions[i + 1], orderedVersions[i]) > 0, `${orderedVersions[i + 1]} > ${orderedVersions[i]}`);
+    assert.equal(compareStandardVersions(orderedVersions[i], orderedVersions[i]), 0);
+  }
+  assert.equal(parseCliArgs(["--version"]).cmd, "version");
+  assert.equal(parseCliArgs(["-v"]).cmd, "version");
+  assert.equal(parseCliArgs(["version"]).cmd, "version");
+  assert.equal(linuxCli.parseLinuxArgs(["--version"]).command, "version");
+  assert.equal(linuxCli.parseLinuxArgs(["-v"]).command, "version");
+  assert.equal(macosCli.parseMacosArgs(["--version"]).command, "version");
+  assert.equal(macosCli.parseMacosArgs(["-v"]).command, "version");
+  withPlatform("linux", () => {
+    assert.equal(shouldDelegateToLinux(parseCliArgs(["--version"])), false);
+    assert.equal(shouldDelegateToLinux(parseCliArgs(["version"])), false);
+  });
+  withPlatform("darwin", () => {
+    assert.equal(shouldDelegateToMacos(parseCliArgs(["--version"])), false);
+    assert.equal(shouldDelegateToMacos(parseCliArgs(["version"])), false);
+  });
+  const rootDir = path.resolve(__dirname, "..");
+  const expectedBanner = formatVersionBanner();
+  assert(expectedBanner.includes(ENHANCER_TAG) && expectedBanner.includes(T3_BASELINE_VERSION));
+  for (const [entry, flag] of [
+    ["cli.cjs", "--version"],
+    ["cli.cjs", "-v"],
+    ["cli.cjs", "version"],
+    ["linux.cjs", "--version"],
+    ["macos.cjs", "--version"],
+  ]) {
+    const out = execFileSync(process.execPath, [path.join(rootDir, entry), flag], { encoding: "utf8" }).trim();
+    assert.equal(out, expectedBanner, `${entry} ${flag} output must match formatVersionBanner()`);
+  }
+  const readmeText = fs.readFileSync(path.join(rootDir, "README.md"), "utf8");
+  const tutorialText = fs.readFileSync(path.join(rootDir, "使用教程.md"), "utf8");
+  assert(readmeText.includes("## 版本号规范") && readmeText.includes(ENHANCER_TAG), "README.md must stay synced with ENHANCER_TAG");
+  assert(tutorialText.includes("版本号规范") && tutorialText.includes(ENHANCER_TAG), "使用教程.md must stay synced with ENHANCER_TAG");
+  assert.equal(JSON.parse(fs.readFileSync(SOURCE_THEME_PATH, "utf8")).version, 1, "Theme JSON schema version must remain upstream integer 1");
+
+  // 4) Isolated dual-ASAR vs single-ASAR discovery (Windows layout)
+  const tmpWin = fs.mkdtempSync(path.join(os.tmpdir(), "t3e-unit-win-"));
+  const origLocalAppData = process.env.LOCALAPPDATA;
+  try {
+    const resDir = path.join(tmpWin, "Programs", "t3code", "resources");
+    fs.mkdirSync(resDir, { recursive: true });
+    const fakeServer = path.join(resDir, "server.asar");
+    const fakeApp = path.join(resDir, "app.asar");
+    fs.writeFileSync(fakeServer, "stub-server");
+    withPlatform("win32", () => {
+      process.env.LOCALAPPDATA = tmpWin;
+      assert.deepEqual(getArchiveTargetPaths().map((p) => p.source), [fakeServer], "Single server.asar when sibling app.asar does not exist");
+      fs.writeFileSync(fakeApp, "stub-app");
+      assert.deepEqual(getArchiveTargetPaths().map((p) => p.source), [fakeServer, fakeApp], "Dual server.asar + app.asar when both exist");
+      assert.deepEqual(getArchiveTargetPaths(fakeApp).map((p) => p.source), [fakeApp], "Explicit --asar override targets only the specified ASAR");
+      assert.equal(getAsarPaths(fakeServer).backup, fakeServer + ".before-t3code-enhancer");
+    });
+  } finally {
+    if (origLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = origLocalAppData;
+    fs.rmSync(tmpWin, { recursive: true, force: true });
+  }
+
+  // 5) Pure macOS & Linux helpers + repair plan inference (runnable without T3 Code installed)
+  assert.equal(getArchiveCompatibilityTier({ modules: [{ installed: true }] }).tier, "verified");
+  assert.equal(getArchiveCompatibilityTier({ modules: [{ pristine: true, compat: "auto-adapted" }] }).tier, "auto-adapted");
+  assert.equal(getArchiveCompatibilityTier({ modules: [{ pristine: false }] }).tier, "incompatible");
+
+  const inferredClean = inferRepairPlanOptions(
+    ALL_PATCHES.map((p) => ({
+      id: p.id,
+      key: p.id,
+      installed: PACKS.find((pk) => pk.id === "privacy").patchIds.includes(p.id),
+      pristine: true,
+    })),
+    { installed: true, managed: true, officialOnly: false }
+  );
+  assert.equal(inferredClean.preset, "clean");
+  const inferredPatchOnly = inferRepairPlanOptions(
+    ALL_PATCHES.map((p) => ({
+      id: p.id,
+      key: p.id,
+      installed: p.id === "desktop-tray" || p.id === "new-chat-layout",
+      pristine: true,
+    })),
+    { installed: false, managed: false, officialOnly: false }
+  );
+  assert.equal(inferredPatchOnly.patchOnly, true);
+  assert.deepEqual(inferredPatchOnly.packs, ["workspace"]);
+
+  const macPaths = macosCli.getMacosPaths("/Users/tester");
+  assert.equal(macPaths.installDirectory, path.join("/Users/tester", "Applications", "T3 Code Enhancer.app"));
+  const macIsoEnv = macosCli.buildInfoPlistEnv({ EXISTING: "1", INVALID_OBJ: { nested: true } }, false, macPaths, { disableTelemetry: true });
+  assert.equal(macIsoEnv.T3CODE_TELEMETRY_ENABLED, "false");
+  assert.equal(macIsoEnv.T3CODE_OTEL_SDK_DISABLED, "true");
+  assert.equal(macIsoEnv.T3CODE_HOME, path.join(macPaths.profileDirectory, "t3-home"));
+  assert.equal("INVALID_OBJ" in macIsoEnv, false);
+  const macSharedEnv = macosCli.buildInfoPlistEnv(macIsoEnv, true, macPaths, { disableTelemetry: false });
+  assert.equal("T3CODE_HOME" in macSharedEnv, false);
+  assert.equal("T3CODE_TELEMETRY_ENABLED" in macSharedEnv, false);
+  assert(macosCli.userDataPatch.apply('const cfg = { current: "t3code-v2", legacy: "T3 Code (Alpha)" };').includes(macosCli.userDataPatch.marker));
+  assert(linuxCli.buildLauncher(false).includes("T3CODE_TELEMETRY_ENABLED=false"));
+  assert(!linuxCli.buildLauncher(true).includes("T3CODE_HOME="));
+  assert.equal(macosCli.parseMacosArgs(["/Applications/Custom.app/"]).command, "install");
+
+  // 6) Upgrade compatibility: v0.1.x theme migration & custom third-party theme preservation
+  const upgradeTmp = fs.mkdtempSync(path.join(os.tmpdir(), "t3e-theme-upg-"));
+  try {
+    const v010ThemeRaw = require("node:zlib").inflateRawSync(Buffer.from(
+      "3Vzhb+O4sf++fwVfFtfEV8uRZdlxtMjixY7dK9BFD7ct0IfLfqAl2mYjkzqKTpwu8r8XJCWZoihZdrLX7YuDIBaH5Mxw+JvhkNTXdwCcPSKWYkrOAtDviu8EbtBZAM6ma8j/9PPfwG2SnMkCmCQIMkhCWRzj1ZqrghCSR5iKh+/n8iejD0NEuHzs3olPRk1jygT113cA1JIVBXPK0IrRLYnMDgqSz1u2hIqr93Nv7s0H1nKjpXJnC8oixGTBbDwbz6Z5gV04UbBmdJN1ei0+RQGN0ASGDzrXV/Or+VgnMJjpz/tzz88JEGNU8XJ3PXC9Yem5UXNy3Z/2pyWKkj7m8/7czYuXNNwqWYaz4Ww0yp/jkJJPW44iWxlJtmp4Zt7MmxXPNyhN4QrdhlxZj6nRUnnjKJYof6KP2Th4t96tNzOIGgcxoynJ78/9eaHATSGj5bnR9FD8FE0nMQzRmsa5kVzfXt/eenlpiiAL158gD9dCisfK+M+nA9etpW4USqOutDofTH0L3YH2QkoiyJ4teijK2rXwF7hAsSQYiZ9irFIcoQVklrmRlUy02TafzeeeUT6lhDMaG4asmUxG18ymovlkGVsru7/QJzUciq/JbDK7q5Ls7XPuzt0K57/Qp88oRmFuZ0Yz9QKpkr8+IhbD53qCXyBOkW0SccQ2mMDYtJHxfDy/NYmmW5ZmCFPWWU7QCE85kRI0n/13/myks7Pj1vZ3XAOa0hTjlMaF1ZRlUyWa1VjLM6s5SGAI59/6t0PPTqqNtnAsvkHVaH/bJIJcjbU7GV3f+eUCs66FRLf/2XyuqfcJMoLJKvMRV1fuyCgxWr/2fNedGTTG9JrMJmfvAHiRXvoRMgwJ1/x0BNlD8a3st2dT8clar/PcJeVYfbd03V4NhdGa2aXmvwfiZ7Qv0jy41xcfrWjvw/tX4qMVVb24jcRky5/5M41k78nnY1HbKDHd4vR2eDs0aHQNDcb9SX+yJ9j782v/2r+e7UvKHr1SWvj0we3gdqCVVL16aSYd8OvmGNd49rvp3XTmVsgODLHFu5sWs/fvMni4M0rM0Gk8GU81NkwfP7od3V75+/KjvPyxfr7R0/t3g0lNy02RVcXbm1qp8/em6i0e3zQp3eebE6Xq9T3f870qhcXvm1PW7vkrDNf7/hrGy97fNCyb/6+RwYwAKk01CVeNAryJN/FmFRItDjAHtSYSMAfFEguYxlMTDZjKtscD3sgfXQ10qh2vqa7HBOak1KMCU13VuKCGQo8MmkkMUaf+1J9O64g1WzAG2R4fmJJrEcLV7cTXVW+NEexE+mzpT7xbX+NDjxPmk8k+iKuNFOZ3s9H4tkJV8kIj77rvnUmKlyJiCFPpiQJGKQdf7wkAjrOkhDspJGkAtlj+46SI4WUXODBJYuSkzylHmy6YxJg8fILhZ/l9Tgnvgvuzz2hFEfj7n+/PxLdPOGQ0pUsO/g/+hHDx/GchBCQr8HkqHux7+aAxsaGESibEP2kCQyQ7mH+ihDq/oNU2hkw193kOxEP1ZQrTEEYYFo+mlKQ0hmk9Q0UHWfcMRnibBsDtjbwhQ5vsMV8zBCMnQhziOHUSSFDsPOGIrwPQH/c0ynDnYPLg9APw3o3Ep/zcC8B7f+SPfFR+PgiAWucYz/0AvL+G1xB6++cZqATg/VL+aCU4ko+vxWf/OIQsEo+vllfLsfZ4jZMAvEchCpHWyGK7WMSyGX/pL4f7grWYQAFgqwW8cLsg++25/rCjsZChqWh4gRZIkz/GBFmqjztlEkcMkoVuqHfDII6rNH3XIKnj2fPLnT6I4VqMriNfl4REzmJlGUhZslxZBiCkm4SmiDnpGkb0KQAu8JId6LvJzqK3jqWiDBJFPV/UG9vqXemKSGiidSboPfHHGVlq9v1OF7jy07c2rDO0Ro+MkgBsWXxxfxZBDgO8gSt0mT6u/rjbxN0fBtP0cQV2m5ikN+drzpPg8vLp6an3NOhRtrr0XNcVxOfgEaOnCd3dnIuePR94/jlY4ji+OSeUoHOQckYf0M35IobhQ/5VTa+bc6/nFY+EeYQwuTmXCFh6/E+KSf78h8Hsh8E0gXwNopvzzTXoj8HIkZ/zS1UoGPthMLs/EyK/3BMJhAGh/OJXIaoTriHPOLg/e8IRuj/70qkrX27jWJTnQCoLQ0o4ElgGdzlS+GOFEy/35H83SADVhSwBH29UWdaChsqiuSfKHiRGOast58Kc+3vEeZHN9cR6r+h+D0FybodVCFqMF+PQrUKQDLcsEDSCI3jl2yBIOegKBKn4pQJBlccKgryltxx4FggyC/Tp7A2HXbD/4/bckR2HzEY0HKq2cT1sgKPmLjVMqhD2B03IVCH3xlV8uoILvwT2BT5V3ECBTyZy1eGTZ4EDb3gaPg3GtfAkcbAen4bDKj5VNelmU3bNN3EXLGj0rAxfRg5LuMHxcwAeIbvQIhrFUYzE9HHEXMJkFQBXNXRPLn8E/R74O8FLjCIgVuMAkZU0k35vMEx2IFk/pziEMSCUOGkIY0xWjoIfAEVgkQL0iNgzSPG/EPjx8p6kj6tevA1xhBR7OqoVzf4P3iSUcUj4B40mg7kASDhrIBKgV0O1jNHOSddM2k4mqMZSgNMLAZBdEGIWxqgLGAp5F4hWuyCh8fP+vxUlXYDiGCcpyhDqEYWcMgctlyjkgU0pJXZe7okGm2sEI8S+gD073bxcBVYxfKZbhaCMxqmVMo0pv7nPl3H3Z1YiI2wTIGSlywC7MHG2aeozoYmYu8K2t0lNzxnpBpGtjU5pMbcFiyWskdixs5UJtOcD5CTxNnUWnNS2etXQ6lWt7RX2ObJ0nGkVpRxHe+U7jD5J3QoZP4IIP6q/AeFrgfBxdOF1atkcNLA5qOUhSy85jMboC1hsOafEagF4gySKCx4fMBFswzTFqWjQ2SAOBdNH1K8fRb9BEL9emRYG+ZYRZ0njqMa4REDgIMLZs4NLDOVRm8NEv22nQVErok+k1QR7RQ3J2essQOK11wOfVUcAxnhFNojwAGwzCJeOJkZLfqn6WzEcSVS2cepgQpDkV7KlktMOJnJYEIkC6Y1SGuMo8yt6aNAxeV/QXeHyRHxbN/BqUDBHm3LH+RJUymC0ncAoEiC7iGn4oPgyKDaQrTCpJSi61+bul67tIfhRc6tP2Xj4rnsCKHQbidIYb0zlN+lAkYhw4kTFH4avr7oNwi2nNeMQAIGSyiZKrWWxPyYp4l0pRecEbn4V2zpOuGUMEd5Oi+UqmU6L1GKwt988Pj6Fr0DFrnI1VOqv04rH+uoN/Mo6HTsWDHrgJxlTaFO8FGnoprWgnNPN0eZTp0a1EKqAgDw3o9HJBVmnTVRUQijlmOpmx7gOHP0e+KQcZNoFnyB7EDgN/gBowkUQ6yzjbboGS0p5SWe6U725P9umGioqXAlUyO9aJmYhjahWNKVWck2GqChOUuDJWFDFmXEt1gbgWqx0RlUCtbrA/0J25y89RA4ins2R9eTAb/Lx+fr6Rqtw3aBMKxMfQbDELOUqcANfc4fCaWKoGVgrxzCv2wVGaaIV7hu2zkdL20lRJVArRK8svKWKCGnJqsLHAnwtq2lU9mp16rL0sO5XWl971UeD6iPf4l1HrttuGthXs4fsa93PBVf25Rlz2DAuY0oUyvc8iQDjg+pfe+X+zFWH0d+wpr8McVr0NzD6Gzb2N6jrz5f9jQ735xv9+af1p/TpH+xvG1fMiMbarFB8V+ZFHjOKcDgbveZ+Ylxp9GCFj5X56bfp5+MrQUEGEQlDHfARiAMezZkgsdnTaUJxrzc8ALn9nn8IcWv9iAjGR3XxbOGKRm8W8dY4XJFzPTVeMZFUrDJ+21KOSvFJZmnVRZNIfHaamOQMkjSBIhqsVWOWIPTr1j7FjGohondQxDXTRbOOgZRZ+sej1okGvh3gg8NFXNZySOMYJikKQP7fcfrQDX9wKNJwD4cvfN1OU/ncrlFWp3GtZVsQHvKh4siCI5MEgcwJHBsS8ehNBLNbwQHpbGrWA7SKR+CREb+V4f8QoHKZT+dMR2Uhf+PqqdqOI8BYooN9We/Vg1xbs7BjG2RR57hpINaVy1gg6BpHESI2pe/FyZZp1hVl47g3NwsShsyh1ErFf9Vwmn17d+e5RyUuq5lVLZ+SG6JKrNni1WMa7nG4EMdAHLLdpN2aFWxRTdYQWyI9kW9LHXFUFbHeCiaO15P4sEtLLSqWV2ITxqtNsqkp5YxeqSO1yP8GMmRpbT3Z6o3qk622Ms3rNoctlh2FCKdJDJ8DkKVSBe8mjYRlmQRNA6AkMkn+uU05Xj7nSbU6MhugDyrmLwMMLI69BRqCOLIy6PvuJgUIpqgLzCenDqtKdn2zwVXNH5k3OzI91U7c5FvPyMQyQUsTcXQIzEZ1+bJhD8jjpJg/g78xhALA5bZBtrbuyn0Fyjbgz8KouiBkOE3AlEZoB9QAYME9lOcpUy2jdnB3p5RbU/7JPXWnSMPaQ7nOHItl1Oo17DNkDbxi/0rZqUr0ol0CSYSiL9Vc1/ER6OGVVztIOHb9YY0ipKeweNNQntcNQEKlhVQwKIOZYVuYaaFacShLqpcK6+XP4jCjP6z0nJVqfXdVuTR0z61A4RvyaIDiiY3IoyjOI05xsTRqmTVuM+JvIqIYjLcV89UNChq2Rdn2rGEp/Td3FHKvmtPVKkalncA60hg/HiTka0weMFm1abACsu7JzCuAbdWjJeytweJj+rfaR2uVnlBdU/T/Gxw34lb3OJw/Dc8vfwQ/M5rAFeQoCxgUYYTFsav4WcQPFPy2PE8B2iUxDjFXaYviLo8Ti8s84A/ydJojL0gBuTxniMiAQ5zoaj0NQctZCFrZRqfGONQpID0dUfOk+12yX8Dj8UsLuxl8fzIWjvg7ZK3k97rfr/b+y83ciC/+y4XRo67vXteNANOvOezyF5EQ/G2pTimLYyKAU7UbIk91yLUwuPjHjdsBf5SbpiuYAOcjUP4DcvCPG7kHuF+kGscJK+PdfW2IYjEhFZJhso8L6peYh/j7fTiukaFFAkuuDcdvKB74KDIT5PeXuNpv6yOwtrjv90wQvq26s0f/Ma2rR684fyyO8DN1GCzbGdvgKIrRGy9O2s8jMfbyiojlvKWKoKfqBHG2TXP52xYjDraE4zgLqSkDNEGkCxjlkKMUpBtK+Tp+BuI+h2TpQGrurUQKArjkeVq2MMv7s/szq93LTZ4PuhZcuZD6YJySrhyNrm5GeNlDM7ddiV7VFZ0ntHjAYk8pfSidEJCa7uQT6VLKADEBhDoMJQjm2yAnVdvnpV6RlKom71vnp9qMcvvQLhvrV0PB8XFYycr2KZw245/vdL+KZS2TdDK3bu9KS02KUQ6y6Xtx7UZo9bZ8Hj2qr9GtulYmzodnSAvE8RcVgYndsgu0gyHPJwtdKpTOkhYiuut0wUJeX0AkBel2wRWSKRk0IKM0dgQ/iZOGjMaxdVdBxB9Xjft7dadqSod6+m0P9RzIsohbsTmSbTC5GLhMvFlg5EWP6+ZNuz03+cQfWSd+RSulrTKzlaAsT91xc2sI8fUt9tW/1W5F35bFOjQ6bXcoyor4NdvjMw6tV1Nmr4vF9BzsqQ3kl1synWOyRgzztz4rcTizeZqiLVK9Ya6q29oLH8thw12wvUNoNecqplaH7N229Q9437p2WjvE7isFKW38vFKYprbae/hjsxevFr/5kuMb6OSoDo5SVBvL7x+xYO0lC8eTh597m9S56pQ9/v4Ae8NhZIFWVnff+lzd0Sf22hwCbD7QfPpRt0Pnuq/bOWSvc8woibGpGxrPO+a01RvxcujG0cHdu/43U5P17s7x6dFRD0yzi/xdoKZZdu8ZCCMWbzSQt/fTLlBx4QKytHo1uHgZwJqmvO7+ned/o2OsdbcK9emxn5vld3ociJ7zBrSwuaudKK+Np2v0ksHqExbJ71xJTUxK+jpoyAba8t6i6qlo+cab43mr9FN994pruxSQt81xwmFywl09r93Mab4karyjIlvt8udE+Lp0u9hgzVjt137lS2MOHgjMXiHT9sLlS+OrBn7XI+Bt5k6ta6mDwZem93p0QfPrQazi+8dc83k1Ruxfw9NpFqzCfHaKk0YodhIcPogyRh+xvKtsnFyubSMLxsT1YxmMta4h1EWPuf5cajbCMKarAwMxPvG+1fG6FSkJjpNmfsbN94w9i8xBkOdxC48GvuZ543Gy+1DkjOUXew2Hr7ebRRU5JEb2vasu2P9xe57X+WBnvqTA/RUwLVVRyaHF4h1g+SsTFnRXK5Xise7Is51T3/3PcMqguPtSl66Ro1B+F4ms6kCGoBJTGkiboSg7R6A2S656YLqGZIUiZ4ljlAJxLhCk280GsmcZCYELdX455c/i+n3pzQn7ek4qcrHfCYSbV3VOfAFIWcDyOyKOXPy88s5X/SLMoul+8/Fwu1SveZvEwQTYS6PJ1HRtf/1WtfpbvWbp7N3Lu38D",
+      "base64"
+    )).toString("utf8");
+    const legacyDir = path.join(upgradeTmp, "legacy");
+    const legacyThemePath = path.join(legacyDir, "themes", "chatgpt-app.json");
+    fs.mkdirSync(path.dirname(legacyThemePath), { recursive: true });
+    fs.writeFileSync(legacyThemePath, v010ThemeRaw);
+    const upgRes = installThemeAt(legacyDir, { officialOnly: false, createSettingsIfMissing: true });
+    assert.equal(upgRes.backupPath, null, "Upgrading known unmodified historical v0.1.x theme must not create a false user-custom backup");
+    assert.equal(uninstallTheme(legacyDir).action, "removed", "Uninstalling after v0.1.x -> v0.2.0 upgrade must cleanly remove enhancer theme");
+
+    // User-edited pre-layer v0.1.x theme (containing --cx-surface & --cx-ink-1) must NOT be misidentified as unmodified or deleted
+    const legacyEditedDir = path.join(upgradeTmp, "legacy-edited");
+    const legacyEditedPath = path.join(legacyEditedDir, "themes", "chatgpt-app.json");
+    fs.mkdirSync(path.dirname(legacyEditedPath), { recursive: true });
+    const legacyEditedObj = JSON.parse(v010ThemeRaw);
+    legacyEditedObj.css += "\n/* user custom v0.1.0 css edit */\n";
+    fs.writeFileSync(legacyEditedPath, JSON.stringify(legacyEditedObj, null, 2) + "\n");
+    assert.equal(uninstallTheme(legacyEditedDir).action, "kept-custom-theme", "Uninstalling over edited legacy v0.1.x theme must never delete user edits");
+    assert(fs.readFileSync(legacyEditedPath, "utf8").includes("user custom v0.1.0 css edit"));
+    const legacyEditedInstall = installThemeAt(legacyEditedDir, { officialOnly: false, createSettingsIfMissing: true });
+    assert(legacyEditedInstall.backupPath && fs.existsSync(legacyEditedInstall.backupPath), "Installing over edited legacy v0.1.x theme must back up user CSS");
+    assert.equal(uninstallTheme(legacyEditedDir).action, "restored-backup");
+    assert(fs.readFileSync(legacyEditedPath, "utf8").includes("user custom v0.1.0 css edit"));
+
+    const customDir = path.join(upgradeTmp, "custom");
+    const customThemePath = path.join(customDir, "themes", "chatgpt-app.json");
+    fs.mkdirSync(path.dirname(customThemePath), { recursive: true });
+    fs.writeFileSync(customThemePath, JSON.stringify({ name: "My Custom Theme", css: ":root { color: red; }" }));
+    const custRes = installThemeAt(customDir, { officialOnly: false, createSettingsIfMissing: true });
+    assert(custRes.backupPath && fs.existsSync(custRes.backupPath), "Genuine third-party theme at same ID must be backed up");
+    assert.equal(uninstallTheme(customDir).action, "restored-backup", "Uninstalling must restore backed up third-party theme");
+    assert.equal(JSON.parse(fs.readFileSync(customThemePath, "utf8")).name, "My Custom Theme");
+    assert.equal(getThemeStatus(customDir).hasBackup, false);
+
+    // User-edited CSS inside chatgpt-app.json + prior defaultTheme must both survive direct uninstall, reinstall & uninstall
+    const editedDir = path.join(upgradeTmp, "edited-theme");
+    fs.mkdirSync(path.join(editedDir, "themes"), { recursive: true });
+    fs.writeFileSync(
+      path.join(editedDir, "settings.json"),
+      JSON.stringify({ defaultTheme: "tokyo-night", defaultThemeSetAt: "2026-01-01T00:00:00.000Z" }, null, 2)
+    );
+    installThemeAt(editedDir, { officialOnly: false });
+    assert.equal(JSON.parse(fs.readFileSync(path.join(editedDir, "settings.json"), "utf8")).defaultTheme, "chatgpt-app");
+    const themeStateObj = JSON.parse(fs.readFileSync(path.join(editedDir, ".t3code-enhancer-theme-state"), "utf8"));
+    assert.equal(themeStateObj.enhancerVersion, require("../lib/version.cjs").ENHANCER_VERSION, "Theme state must record standardized enhancerVersion");
+    assert.equal(uninstallTheme(editedDir).action, "removed");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(editedDir, "settings.json"), "utf8")).defaultTheme, "tokyo-night", "Uninstall must restore pre-install defaultTheme");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(editedDir, "settings.json"), "utf8")).defaultThemeSetAt, "2026-01-01T00:00:00.000Z");
+
+    installThemeAt(editedDir, { officialOnly: false });
+    const editedThemeFile = path.join(editedDir, "themes", "chatgpt-app.json");
+    const editedObj = JSON.parse(fs.readFileSync(editedThemeFile, "utf8"));
+    editedObj.css += "\n/* user custom edit */\n";
+    fs.writeFileSync(editedThemeFile, JSON.stringify(editedObj, null, 2) + "\n");
+    const directUninst = uninstallTheme(editedDir);
+    assert.equal(directUninst.action, "kept-custom-theme", "Direct uninstall must preserve user-customized theme edits");
+    assert(fs.existsSync(editedThemeFile) && fs.readFileSync(editedThemeFile, "utf8").includes("user custom edit"));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(editedDir, "settings.json"), "utf8")).defaultTheme, "tokyo-night", "Direct uninstall keeping custom theme must still restore pre-install defaultTheme");
+    const reInst = installThemeAt(editedDir, { officialOnly: false });
+    assert(reInst.backupPath && fs.existsSync(reInst.backupPath), "Reinstalling over edited theme must back up customized CSS");
+    const reUninst = uninstallTheme(editedDir);
+    assert.equal(reUninst.action, "restored-backup");
+    assert(fs.readFileSync(editedThemeFile, "utf8").includes("user custom edit"), "Uninstall after reinstall must restore backed-up custom CSS");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(editedDir, "settings.json"), "utf8")).defaultTheme, "tokyo-night", "Restoring backed-up enhancer edit must still restore pre-install defaultTheme");
+
+    // Existing third-party backup + live edits -> direct uninstall saves live edits AND restores third-party;
+    // existing third-party backup + live edits + reinstall -> uninstall restores latest user edit FIRST (keeping third-party backup) & restores defaultTheme
+    const stackDir = path.join(upgradeTmp, "stack-theme");
+    const stackThemeFile = path.join(stackDir, "themes", "chatgpt-app.json");
+    fs.mkdirSync(path.dirname(stackThemeFile), { recursive: true });
+    fs.writeFileSync(path.join(stackDir, "settings.json"), JSON.stringify({ defaultTheme: "solarized", defaultThemeSetAt: "2026-02-02T00:00:00.000Z" }));
+    fs.writeFileSync(stackThemeFile, JSON.stringify({ name: "My Third-Party Theme", css: ":root { color: blue; }" }));
+    installThemeAt(stackDir, { officialOnly: false });
+    const stackLive1 = JSON.parse(fs.readFileSync(stackThemeFile, "utf8"));
+    stackLive1.css += "\n/* unsaved live css edit 1 */\n";
+    fs.writeFileSync(stackThemeFile, JSON.stringify(stackLive1, null, 2) + "\n");
+    const uninstPreserving = uninstallTheme(stackDir);
+    assert.equal(uninstPreserving.action, "restored-backup");
+    assert(uninstPreserving.preservedPath && fs.existsSync(uninstPreserving.preservedPath), "Direct uninstall with existing backup must save live edits before restoring backup");
+    assert(fs.readFileSync(uninstPreserving.preservedPath, "utf8").includes("unsaved live css edit 1"));
+    assert.equal(JSON.parse(fs.readFileSync(stackThemeFile, "utf8")).name, "My Third-Party Theme");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(stackDir, "settings.json"), "utf8")).defaultTheme, "solarized");
+
+    installThemeAt(stackDir, { officialOnly: false });
+    const stackLive2 = JSON.parse(fs.readFileSync(stackThemeFile, "utf8"));
+    stackLive2.css += "\n/* edited before reinstall 2 */\n";
+    fs.writeFileSync(stackThemeFile, JSON.stringify(stackLive2, null, 2) + "\n");
+    installThemeAt(stackDir, { officialOnly: false });
+    const lifoUninst = uninstallTheme(stackDir);
+    assert.equal(lifoUninst.action, "restored-backup");
+    assert(fs.readFileSync(stackThemeFile, "utf8").includes("edited before reinstall 2"), "Uninstall after reinstall must restore latest user edit backup first");
+    assert.equal(lifoUninst.remainingBackups.length >= 1, true, "Older third-party backup must remain preserved on disk");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(stackDir, "settings.json"), "utf8")).defaultTheme, "solarized");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(stackDir, "settings.json"), "utf8")).defaultThemeSetAt, "2026-02-02T00:00:00.000Z");
+
+    // Legacy 0.1.11 managed Linux install status must guide upgrade cleanly instead of crashing inspectInstall
+    const legacyLinuxPaths = linuxCli.getLinuxPaths({ XDG_DATA_HOME: path.join(upgradeTmp, "xdg") }, upgradeTmp);
+    fs.mkdirSync(path.join(legacyLinuxPaths.installDirectory, "squashfs-root", "resources"), { recursive: true });
+    fs.writeFileSync(path.join(legacyLinuxPaths.installDirectory, linuxCli.MANAGED_FILE), "0.1.11\n");
+    fs.writeFileSync(path.join(legacyLinuxPaths.installDirectory, linuxCli.APP_ASAR), "not-an-asar");
+    const origLog = console.log;
+    let statusOutput = "";
+    console.log = (...args) => { statusOutput += args.join(" ") + "\n"; };
+    try {
+      linuxCli.status(legacyLinuxPaths);
+    } finally {
+      console.log = origLog;
+    }
+    assert(statusOutput.includes("v0.1.0 / v0.1.1"), "Linux status() should explain upgrade path for legacy managed installs");
+
+    // Legacy incompatible macOS managed install status should also degrade gracefully
+    const legacyMacPaths = macosCli.getMacosPaths(upgradeTmp);
+    fs.mkdirSync(path.join(legacyMacPaths.installDirectory, "Contents", "Resources"), { recursive: true });
+    fs.writeFileSync(path.join(legacyMacPaths.installDirectory, macosCli.INFO_PLIST), '<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>');
+    fs.writeFileSync(path.join(legacyMacPaths.installDirectory, macosCli.APP_ASAR), "not-an-asar");
+    // Ensure inspectInstall throws without crashing macosCli.status when bundle is unmanaged vs managed:
+    assert.throws(() => macosCli.status(undefined, legacyMacPaths), /安装位置已被其他应用占用|plutil/);
+  } finally {
+    fs.rmSync(upgradeTmp, { recursive: true, force: true });
+  }
+}
 
 function floatingRuntimeIsExternal(asar) {
   return hostWithRuntime(asar, workspaceFloatingPanels).assets.some((a) => /\/t3e-floating-panels-ui-[0-9a-f]{8}\.js$/.test(a.key));
@@ -329,6 +831,91 @@ function verifyExternalFloatingRuntime(asar) {
   assert.deepEqual(plain(ui.defaultChatFloatFrame({ width: 1100, height: 700 })), { x: 688, y: 208, width: 396, height: 476 });
   assert.equal(tabs.tabDroppedOutside({ top: 32, bottom: 64 }, 48, 96), true);
   assert.equal(tabs.tabDroppedOutside({ top: 32, bottom: 64 }, 48, 74), false);
+  // Floating panels must read live store surfaces (ja.surfaces), not exit-presence surfaces that empty on rightPanelStore.close()
+  assert.match(host.text, /T3WorkspacePanels,\{threadKey:[\w$]+,panelProps:T3panelProps,surfaces:[\w$]+\.surfaces,/, "T3WorkspacePanels must receive live store surfaces so floating the last tab stays open");
+  const floatAssetText = host.assets.find((a) => /\/t3e-floating-panels-ui-/.test(a.key)).text;
+  assert(floatAssetText.includes("T3FloatContext.Provider, { value: null"), "T3SurfaceMount must isolate embedded subagent threads from parent T3FloatContext");
+  assert(floatAssetText.includes("activeSurfaceId: surface.id"), "Floating surfaces must keep activeSurfaceId bound so linked-thread stays visible");
+  assert(floatAssetText.includes("inset-inline: -1px auto; width: 6px;"), "Split divider separator must not overlap the adjacent scrollbar");
+  assert(floatAssetText.includes("t3e-floating-preview-frame") && !floatAssetText.includes("t3e-floating-preview-actions"),
+    "Floating browser must persist its frame and use the full header drag bar instead of cramped subheader overlay buttons");
+  assert(floatAssetText.includes("t3e-layout-swap-btn") && !floatAssetText.includes("t3e-divider-swap-btn"),
+    "Layout swap control must live in the panel top toolbar instead of a floating pill on the vertical divider");
+  assert.match(host.text, /T3PanelToolbar,\{fullscreen:[\w$]+,sheet:[\w$]+,maximize:/,
+    "T3PanelToolbar must receive sheet prop to hide layout swap in compact sheet mode");
+  assert.match(host.text, /cornerRadius=floating\?\([\w$.]+\.cornerRadius\|\|13\):[\w$.]+\.cornerRadius/,
+    "Floating browser presentation must pass rounded inner cornerRadius (13px) to native webview host");
+  assert(
+    floatAssetText.includes('background: var(--cx-selected, rgba(0, 0, 0, 0.08)) !important;') &&
+      !floatAssetText.includes('background: var(--cx-accent-soft, color-mix(in srgb, var(--cx-accent, var(--primary)) 12%, transparent)) !important;'),
+    "Active topbar chat toolbar toggle buttons must use neutral gray instead of blue accent"
+  );
+  // Verify T3ChatColumnShell does not crash when rendered inside an embedded side-chat (T3FloatContext = null)
+  const floatRuntime = ui.createFloatingPanelsRuntime({
+    React: {
+      Fragment: Symbol("Fragment"),
+      memo: (fn) => fn,
+      createContext: (def) => ({ _def: def, Provider: "Provider" }),
+      useContext: () => null,
+      useRef: (init) => ({ current: init }),
+      useState: (init) => [typeof init === "function" ? init() : init, () => {}],
+      useEffect() {},
+      useLayoutEffect() {},
+      useCallback: (fn) => fn,
+      useMemo: (fn) => fn(),
+    },
+    jsx: (type, props) => ({ type, props: props || {} }),
+    jsxs: (type, props) => ({ type, props: props || {} }),
+    useI18n: () => (s) => s,
+    rightPanelStore: { getState: () => ({}), subscribe: () => () => {} },
+    getPanelState: () => ({ open: false, surfaces: [], activeSurfaceId: null }),
+  });
+  const nullCtxShell = floatRuntime.T3ChatColumnShell({ className: "chat", maximizedAway: false, workState: "idle", children: null });
+  assert.equal(nullCtxShell.props["data-chat-column"], true, "T3ChatColumnShell must render cleanly when T3FloatContext is null (side chat)");
+  let swapCalls = 0;
+  const mockCtx = {
+    swapped: false,
+    chatFloat: null,
+    chatSelected: false,
+    showMainChat: () => {},
+    toggleSwap: () => { swapCalls += 1; },
+    labels: { swapLayout: "Swap layout", pillIdle: "Main chat" },
+  };
+  const toolbarRuntime = ui.createFloatingPanelsRuntime({
+    React: {
+      Fragment: Symbol("Fragment"),
+      memo: (fn) => fn,
+      createContext: (def) => ({ _def: def, Provider: "Provider" }),
+      useContext: () => mockCtx,
+      useRef: (init) => ({ current: init }),
+      useState: (init) => [typeof init === "function" ? init() : init, () => {}],
+      useEffect() {},
+      useLayoutEffect() {},
+      useCallback: (fn) => fn,
+      useMemo: (fn) => fn(),
+    },
+    jsx: (type, props) => ({ type, props: props || {} }),
+    jsxs: (type, props) => ({ type, props: props || {} }),
+    Tooltip: "Tooltip",
+    TooltipTrigger: "TooltipTrigger",
+    TooltipPopup: "TooltipPopup",
+    useI18n: () => (s) => s,
+    rightPanelStore: { getState: () => ({}), subscribe: () => () => {} },
+    getPanelState: () => ({ open: false, surfaces: [], activeSurfaceId: null }),
+  });
+  const splitToolbar = toolbarRuntime.T3PanelToolbar({ fullscreen: false, sheet: false, maximize: "MAX", toggle: "TOG" });
+  const splitActions = splitToolbar.props.children[1].props.children;
+  assert.equal(splitActions[0].type, toolbarRuntime.T3LayoutSwapButton, "Split panel toolbar must render T3LayoutSwapButton");
+  assert.equal(splitActions[1], "MAX");
+  assert.equal(splitActions[2], "TOG");
+  const swapTooltip = toolbarRuntime.T3LayoutSwapButton();
+  assert.equal(swapTooltip.props.children[1].props.side, "bottom");
+  const swapBtnEl = swapTooltip.props.children[0].props.render;
+  assert.equal(swapBtnEl.props.className, "t3e-layout-swap-btn");
+  swapBtnEl.props.onClick({ stopPropagation() {} });
+  assert.equal(swapCalls, 1);
+  assert.equal(toolbarRuntime.T3PanelToolbar({ fullscreen: true, sheet: false, maximize: "MAX", toggle: "TOG" }).props.children[1].props.children[0], null);
+  assert.equal(toolbarRuntime.T3PanelToolbar({ fullscreen: false, sheet: true, maximize: "MAX", toggle: "TOG" }).props.children[1].props.children[0], null);
 }
 
 function verifyFloatingPanelPortal(asar) {
@@ -447,7 +1034,7 @@ function verifyWorkspaceToolbar(asar) {
   assert(!source.includes("data-t3e-fixed-actions"), "Top-right fixed actions overlay should be removed");
   const dividerSwap = T3DividerSwapButton();
   assert.equal(dividerSwap.type, "Tooltip");
-  assert.equal(dividerSwap.props.children[1].props.side, "left");
+  assert.equal(dividerSwap.props.children[1].props.side, "right");
   const swapBtn = dividerSwap.props.children[0].props.render;
   assert.equal(swapBtn.props.className, "t3e-divider-swap-btn");
   assert.equal(swapBtn.props["aria-pressed"], true);
@@ -478,7 +1065,8 @@ function verifyWorkspaceToolbar(asar) {
   assert.equal(T3PanelToolbar({ fullscreen: true, maximize, toggle }).props.children[0].props["aria-pressed"], true);
   assert.match(source, /\[data-t3e-workspace\] \[data-chat-header\] \.t3e-chat-toolbar button svg[\s\S]*width: 15px !important; height: 15px !important;/);
   assert.match(source, /\[data-t3e-workspace\] > \[data-preview-panel-mode=\\?"inline\\?"\][\s\S]*z-index: 2; isolation: isolate;/);
-  assert.match(source, /\.t3e-divider-swap-btn \{[\s\S]*opacity: 0; pointer-events: none;/, "Divider swap button must stay hidden until divider hover");
+  assert.match(source, /\.t3e-divider-swap-btn \{[\s\S]*--t3e-swap-tx: -100%;[\s\S]*left: -1px;[\s\S]*opacity: 0; pointer-events: none;/, "Divider swap button must sit on the chat side of the divider so Browser WebContentsView cannot slice it");
+  assert.match(source, /\[data-t3e-swap=\\?"true\\?"\] > \[data-preview-panel-mode=\\?"inline\\?"\] > \.t3e-divider-swap-btn \{[\s\S]*--t3e-swap-tx: 100%;[\s\S]*right: -1px;/, "Swapped divider swap button must sit on the right chat side away from left Browser WebContentsView");
   assert.match(source, /\[data-preview-panel-mode=\\?"inline\\?"\] > \[role=\\?"separator\\?"\]:hover:not\(:active\) ~ \.t3e-divider-swap-btn[\s\S]*opacity: 1; pointer-events: auto;/, "Hovering vertical separator must reveal swap button");
   const plc = findUniqueEntry(asar, patch.tabBarPatch.targetRegex, patch.tabBarPatch.id).content.toString("utf8");
   assert(plc.includes("children:[U,e.enhancerDividerSlot,re]"), "Panel divider must host enhancerDividerSlot");
@@ -661,7 +1249,7 @@ function verifyWorkspaceToolbar(asar) {
   const refs = [];
   let refCursor = 0;
   let stateVal = 0;
-  const shellCtx = { fullscreen: true, chatSelected: true, windows: [], bounds: { width: 1200, height: 800 }, deckTop: 0, chatMinimized: false, labels: {} };
+  const shellCtx = { fullscreen: true, chatSelected: true, bounds: { width: 1200, height: 800 }, deckTop: 0, chatMinimized: false, labels: {} };
   const T3ChatColumnShellFn = runInNewContext(
     shellMatch[0] + "\nT3ChatColumnShell",
     {
@@ -709,8 +1297,7 @@ function verifyWorkspaceToolbar(asar) {
   };
   renderShell(); // mount in expanded fullscreen
   shellCtx.chatSelected = false;
-  shellCtx.chatFloat = { id: "__t3e_main_chat__", frame: { x: 700, y: 200, width: 432, height: 580 } };
-  shellCtx.windows = [shellCtx.chatFloat];
+  shellCtx.chatFloat = { entry: { id: "__t3e_main_chat__", frame: { x: 700, y: 200, width: 432, height: 580 } }, level: 1 };
   scroller.clientWidth = 432;
   scroller.clientHeight = 580;
   renderShell(); // switch to floating mini-chat while at bottom
@@ -866,7 +1453,18 @@ function verifyResponsiveBrowserLayout(asar) {
   const layoutMode = main.match(/const T3ResponsiveViewport=[^;]+;/);
   const layoutSelector = main.match(/C=e=>\{let t=e\.byTabId\[i\];return\{[^}]+\}\}/);
   const layoutOverride = main.match(/if\(w\.responsive\)o=T3ResponsiveViewport;/);
-  assert(store && layoutMode && layoutSelector && layoutOverride, "Missing responsive browser viewport wiring");
+  const overlayAnchor = main.indexOf("responsive:t3Responsive=!1,");
+  const overlayStyleFn = overlayAnchor >= 0 ? createPatchContext(null, null, main).findEnclosingFunction(overlayAnchor) : null;
+  assert(store && layoutMode && layoutSelector && layoutOverride && overlayStyleFn, "Missing responsive browser viewport or corner clipping wiring");
+  assert(main.includes("cornerRadius:w.cornerRadius,responsive:w.responsive,zIndex:w.zIndex"), "Webview host must pass responsive flag to overlay style helper");
+  const computeOverlayStyle = runInNewContext(`(${overlayStyleFn.source})`, { TE: -1e5 });
+  const floatingStyle = computeOverlayStyle({ active: true, cornerRadius: 13, responsive: true, rect: { x: 10, y: 20, width: 400, height: 420 }, hiddenSize: { width: 400, height: 420 }, renderingActive: true, zIndex: 34 });
+  assert.equal(floatingStyle.borderRadius, undefined, "Responsive floating browser should only round bottom corners, not top corners below the toolbar");
+  assert.equal(floatingStyle.borderBottomLeftRadius, 13);
+  assert.equal(floatingStyle.borderBottomRightRadius, 13);
+  assert.equal(floatingStyle.clipPath, "inset(0 round 0 0 13px 13px)");
+  const pipStyle = computeOverlayStyle({ active: true, cornerRadius: 12, responsive: false, rect: { x: 10, y: 20, width: 320, height: 200 }, hiddenSize: { width: 320, height: 200 }, renderingActive: true, zIndex: 48 });
+  assert.equal(pipStyle.borderRadius, 12);
   const defaults = findUniqueEntry(asar, /\/browserDefaults-[\w-]+\.js$/, "browser layout").content.toString("utf8");
   const layout = defaults.match(/function it\(e,t,n=1\)\{[\s\S]+?(?=function ot\()/);
   assert(layout, "Missing native browser viewport calculation");
@@ -1075,7 +1673,7 @@ function verifyInlineEditDetail(asar) {
     "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-before\n+RECOVERED\n"
   } };
   const recovered = render();
-  assert.match(recovered, /Turn Git diff/);
+  assert.match(recovered, /Turn (?:net )?Git diff/);
   assert.match(recovered, /is-add.*RECOVERED/);
   assert.doesNotMatch(recovered, /UNRELATED/);
   assert.deepEqual(rowStats(), cardTree().props.children[0].props.children[0].props.children[1],
@@ -1087,11 +1685,53 @@ function verifyInlineEditDetail(asar) {
   assert.doesNotMatch(render(), /RECOVERED/);
   assert.equal(checkpointRequest, null);
 
+  // Verify working-tree fallback for in-progress or uncheckpointed file_change edits
+  const wtCardRuntime = loadRuntimeModule("inline-diff-ui").exports.createInlineDiffRuntime({
+    React: {
+      memo: (fn) => fn,
+      useEffect() {},
+      useMemo: (fn) => fn(),
+      useRef: (init) => ({ current: init }),
+      useState: (init) => [typeof init === "function" ? init() : init, () => {}],
+    },
+    jsx: (type, props) => ({ type, props: props || {} }),
+    jsxs: (type, props) => ({ type, props: props || {} }),
+    resolveRelPath: (p) => String(p || "").replace(/^\/?C:\/work\/project\//i, ""),
+    useCheckpointSummaries: () => [],
+    useCheckpointDiff: () => ({ data: null, isPending: false }),
+    parseCheckpointDiff: (patch) => {
+      const files = [...String(patch || "").matchAll(/diff --git a\/([^\s]+) b\/([^\s]+)/g)].map((m) => ({ name: m[2] }));
+      return files.length ? { kind: "files", files } : null;
+    },
+    reviewQueries: {
+      diffPreview: (args) => args,
+    },
+    useQuery: (q) => ({
+      isPending: false,
+      data: q?.input?.sourceKind === "working-tree"
+        ? { sources: [{ kind: "working-tree", diff: "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+LIVE_WT_LINE\n" }] }
+        : null,
+    }),
+  });
+  const wtRendered = JSON.stringify(wtCardRuntime.T3InlineFileDiffCard({
+    item: { type: "file_change", fileName: "C:/work/project/README.md", runId: "live-turn" },
+    projectedItem: { sourceThreadId: "t1", sourceItemId: "i1", item: { type: "file_change", runId: "live-turn" } },
+    detail: { environmentId: "env", pending: false },
+    workspaceRoot: "C:/work/project",
+    cwd: "C:/work/project",
+  }));
+  assert.match(wtRendered, /Working tree/);
+  assert.match(wtRendered, /LIVE_WT_LINE/);
+  assert(
+    code.includes("reviewQueries:") && code.includes("useQuery:"),
+    "inline-file-diff bridge must pass reviewQueries and useQuery for working-tree fallback"
+  );
+
   // Verify DiffPanel sideRevealPatch for single-file, multi-file, and blank tool-call -> turn/unstaged fallback
   const diffPanel = findUniqueEntry(asar, inlineFileDiff.sideRevealPatch.targetRegex, inlineFileDiff.id + "-side").content.toString("utf8");
   assert.match(diffPanel, /createSideRevealHelpers\(\{\s*extractToolPatch:\s*[\w$]+,\s*parsePatch:\s*[\w$]+,\s*getFileName:\s*[\w$]+,?\s*\}\)/, "Missing side-reveal runtime bridge");
   const revealMatch = diffPanel.match(
-    /\/\* T3_INLINE_FILE_DIFF_SIDE_REVEAL_V\d+ \*\/let t3RawZ=V,t3Fb=[\s\S]+?;[\s\S]*?(vr=t3RawZ\?\.revealRequestId[\s\S]+?,yr=t3RawZ\?\.revealRequestId\?\?\([^)]+\)),[\s\S]*?(Qi=e=>\{[^}]+\}),t\[76\][\s\S]*?(let path=\(\(\)=>\{[\s\S]+?\}\)\(\);if\(!path\)\{xa\.current=null;return\}let e=JSON\.stringify\(\[K,path,yr\]\);xa\.current!==e&&ba\(path\)&&\(xa\.current=e\))/
+    /\/\* T3_INLINE_FILE_DIFF_SIDE_REVEAL_V\d+ \*\/let t3RawZ=V,t3Fb=[\s\S]*?(let gr=B.kind===`turn`\?B.turnId:t3Fb\?\.turnId\?\?null,[^;]+),br;[\s\S]*?(if\(vr\|\|t3RawZ\?\.revealRequestId\)vr=t3ResolveRevealPath\(vr,Z,Ji,F,!t3GitMode&&Boolean\(t3RawZ\?\.revealRequestId\)\);)[\s\S]*?(Qi=e=>\{let t=A\(e\);return!ze\|\|t===vr\|\|!Ye\(t\)\})[\s\S]*?(xa\.current!==e&&ba\(vr\)&&\(xa\.current=e\))/
   );
   assert(revealMatch, "Missing updated DiffPanel sideRevealPatch injection");
   const fallbackFns = loadRuntimeModule("inline-diff-ui").exports.createSideRevealHelpers({
@@ -1108,53 +1748,46 @@ function verifyInlineEditDetail(asar) {
   assert.equal(fallbackFns.t3DiffMatchesTarget("src/App.ts", "src/app.ts", "C:\\repo"), true);
   assert.equal(fallbackFns.t3DiffMatchesTarget("/repo/src/app.ts", "src/app.ts", "/repo"), true);
   const emptyTool = { type: "file_change", runId: "run-5", changes: [{ path: "src/app.ts", operation: "modify" }], oldStr: "a", newStr: "b" };
+  const project = { cwd: "/repo", workspaceRoot: "/repo", isRepo: true, canReadFiles: true, projectMeta: { environmentId: "env-1" } };
+  const turns = [{ runId: "run-5", checkpointTurnCount: 2 }];
   const turnFb = fallbackFns.t3PickToolDiffFallback({
-    rawZ: { kind: "tool-call", filePath: "src\\app.ts", revealRequestId: "r1" },
-    sn: { isPending: false },
-    cn: emptyTool,
-    I: "/repo",
-    ln: true,
-    P: true,
-    N: { environmentId: "env-1" },
-    V: [{ runId: "run-5", checkpointTurnCount: 2 }],
+    ...project, turns,
+    rawTarget: { kind: "tool-call", filePath: "src\\app.ts", revealRequestId: "r1" },
+    toolQuery: { isPending: false },
+    toolItem: emptyTool,
   });
   assert.deepEqual(JSON.parse(JSON.stringify(turnFb)), { mode: "turn", turn: { runId: "run-5", checkpointTurnCount: 2 }, turnId: "run-5", canUnstaged: true });
   const unstagedFb = fallbackFns.t3PickToolDiffFallback({
-    rawZ: { kind: "tool-call", filePath: "src/app.ts", turnId: "run-live", preferGitFallback: true, revealRequestId: "r2" },
-    sn: { isPending: true },
-    cn: undefined,
-    I: "/repo",
-    ln: true,
-    P: true,
-    N: { environmentId: "env-1" },
-    V: [{ runId: "run-4", checkpointTurnCount: 1 }],
+    ...project, turns,
+    rawTarget: { kind: "tool-call", filePath: "src/app.ts", turnId: "run-live", preferGitFallback: true, revealRequestId: "r2" },
+    toolQuery: { isPending: true },
   });
   assert.deepEqual(JSON.parse(JSON.stringify(unstagedFb)), { mode: "unstaged", turn: null, turnId: null, canUnstaged: true });
   const validToolFb = fallbackFns.t3PickToolDiffFallback({
-    rawZ: { kind: "tool-call", filePath: "src/app.ts", revealRequestId: "r3" },
-    sn: { isPending: false },
-    cn: { type: "file_change", runId: "run-5", diffStr: "diff --git a/src/app.ts b/src/app.ts\n@@ -1 +1 @@\n-a\n+b\n" },
-    I: "/repo",
-    ln: true,
-    P: true,
-    N: { environmentId: "env-1" },
-    V: [{ runId: "run-5", checkpointTurnCount: 2 }],
+    ...project, turns,
+    rawTarget: { kind: "tool-call", filePath: "src/app.ts", revealRequestId: "r3" },
+    toolQuery: { isPending: false },
+    toolItem: { type: "file_change", runId: "run-5", diffStr: "diff --git a/src/app.ts b/src/app.ts\n@@ -1 +1 @@\n-a\n+b\n" },
   });
   assert.equal(validToolFb, null, "Tool calls with an intact diffStr must remain in isolated tool-call mode");
   assert.equal(
-    fallbackFns.t3PatchHasFile("diff --git a/other.ts b/other.ts\n", "src/app.ts", false, (s) => s),
+    fallbackFns.t3CheckpointHasFile({ diff: "diff --git a/other.ts b/other.ts\n" }, "src/app.ts", false, "/repo"),
     false,
     "Turn checkpoint diff lacking the clicked file should allow working-tree unstaged fallback"
   );
   const uncollapsed = [];
   const scrolled = [];
   const revealRunner = runInNewContext(
-    `(function(t3RawZ, V, B, ze, Ji, K, xa, ba, Ye, A, t3GitMode) {
-      const g = "/repo";
-      let ${revealMatch[1]};
-      let ${revealMatch[2]};
-      ${revealMatch[3]};
-      return { vr, yr, path, Qi };
+    `(function(t3RawZ, B, ze, Ji, K, xa, ba, Ye, A, t3GitMode) {
+      const F = "C:/repo";
+      const Z = Ji.map(({ fileDiff }) => fileDiff);
+      const t3Fb = null;
+      ${revealMatch[1]};
+      ${revealMatch[2]}
+      let ${revealMatch[3]};
+      const e = JSON.stringify([K, vr, yr]);
+      ${revealMatch[4]};
+      return { vr, yr, Qi };
     })`,
     { ...fallbackFns }
   );
@@ -1172,7 +1805,6 @@ function verifyInlineEditDetail(asar) {
   };
   const dpOut = revealRunner(
     { kind: "tool-call", filePath: "tests\\b.test.ts", revealRequestId: "r-win" },
-    null,
     { kind: "tool-call" },
     true,
     Ji,
@@ -1184,14 +1816,12 @@ function verifyInlineEditDetail(asar) {
     "turn"
   );
   assert.equal(dpOut.vr, "tests/b.test.ts");
-  assert.equal(dpOut.path, "tests/b.test.ts");
   assert.equal(dpOut.Qi(Ji[1].fileDiff), true, "Revealed test file must not be hidden when diffHideTestFiles is enabled");
   assert.deepEqual(uncollapsed, ["k2"]);
   assert.deepEqual(scrolled, ["k2"]);
   // Single-file fallback even if filePath differs from git diff header name (non-fallback mode)
   const singleOut = revealRunner(
     { kind: "tool-call", filePath: "other-name.ts", revealRequestId: "r-one" },
-    { kind: "tool-call" },
     { kind: "tool-call" },
     false,
     [Ji[0]],
@@ -1202,7 +1832,7 @@ function verifyInlineEditDetail(asar) {
     (fd) => fd.name,
     null
   );
-  assert.equal(singleOut.path, "src/a.ts");
+  assert.equal(singleOut.vr, "src/a.ts");
   assert.deepEqual(uncollapsed, ["k2", "k1"]);
 
   // Verify background review.* RPCs (review.getDiffPreview etc.) do not trigger the 15s slow-request warning toast
@@ -1262,8 +1892,9 @@ function findNodes(node, pred, out = []) {
 
 function verifyUsageRingsUX(asar) {
   const chat = findUniqueEntry(asar, usageRings.targetRegex, usageRings.id).content.toString("utf8");
-  assert.match(chat, /T3ComposerCtxProvider,\{canAttach:Io,[^}]*providerInstanceId:oi,/);
-  assert.match(chat, /T3RingsCtxProvider,\{providerInstanceId:tc,/);
+  assert.match(chat, /T3ComposerCtxProvider,\{canAttach:Io,/);
+  assert.match(chat, /T3ComposerQuotaRingMemo,\{providerInstanceId:oi,activeModel:di\}/);
+  assert.match(chat, /T3RingsCtxProvider,\{threadRef:la,providerInstanceId:tc,/);
   assert.match(chat, /providerTurns:q\?\.providerTurns,activeProviderThreadId:q\?\.thread\?\.activeProviderThreadId/);
   const runtimeSource = fs.readFileSync(path.join(__dirname, "..", "lib", "runtime", "usage-rings-ui.mjs"), "utf8");
   assert.match(runtimeSource, /\.t3e-slider-fill \{[\s\S]*?z-index: 1;/);
@@ -1285,26 +1916,88 @@ function verifyUsageRingsUX(asar) {
   assert(paceTable, "Missing the host pace label table");
   assert.equal(bridgeBindings.paceLabels, paceTable[1], "paceLabels must be the host pace label table");
   assert.notEqual(bridgeBindings.paceLabels, bridgeBindings.getLimitsUnavailable, "paceLabels and getLimitsUnavailable are different host bindings");
-  const { tokenize, parseImports } = require("../lib/js-ast.cjs");
+  const { tokenize, parseImports, parseExports, getTopLevelDeclSource } = require("../lib/js-ast.cjs");
+  const chatImports = parseImports(tokenize(chat));
   const runtimeChunkLocals = new Set(
-    parseImports(tokenize(chat))
+    chatImports
       .filter((imp) => /(?:^|\/)runtime-[\w-]+\.js$/.test(imp.specifier))
       .flatMap((imp) => imp.specifiers.map((s) => s.local))
   );
-  for (const key of ["resolveAccountLimits", "getWindowLeftPct", "getWindowPace", "getWindowTimeLeft", "SkillIcon"]) {
+  for (const key of ["resolveAccountLimits", "getWindowLeftPct", "getWindowPace", "getWindowTimeLeft"]) {
     assert(runtimeChunkLocals.has(bridgeBindings[key]), `${key} must be imported from the host runtime chunk, not a stale fallback name`);
   }
+  // Verify useModelTraits binds to the controller hook (returning selectValue/changeSelect/changeBoolean), not the pure resolver
+  const traitsImp = chatImports.find((imp) => imp.specifiers.some((s) => s.local === bridgeBindings.useModelTraits));
+  assert(traitsImp, `useModelTraits (${bridgeBindings.useModelTraits}) must be imported from host utils`);
+  const traitsSpec = traitsImp.specifiers.find((s) => s.local === bridgeBindings.useModelTraits);
+  const traitsChunkKey = path.posix.join("apps/server/dist/client/assets", path.posix.basename(traitsImp.specifier));
+  const traitsChunkText = entryText(asar, asar.byKey.get(traitsChunkKey));
+  const traitsExp = parseExports(traitsChunkText).find((ex) => ex.exported === traitsSpec.imported);
+  const traitsDecl = traitsExp ? getTopLevelDeclSource(traitsChunkText, traitsExp.local) : "";
+  assert(
+    traitsDecl.includes("selectValue:") && traitsDecl.includes("changeSelect:") && traitsDecl.includes("changeBoolean:"),
+    `useModelTraits (${bridgeBindings.useModelTraits} -> ${traitsSpec.imported}) must resolve to the traits hook with selectValue/changeSelect/changeBoolean`
+  );
+  // Verify useI18n resolves to the M(...) payload decoder ($_source) and useFormatMessage to plain ICU formatter
+  const resolveUtilsDecl = (localName, label) => {
+    const imp = chatImports.find((entry) => entry.specifiers.some((s) => s.local === localName));
+    assert(imp, `${label} (${localName}) must be imported from host utils`);
+    const spec = imp.specifiers.find((s) => s.local === localName);
+    const chunkKey = path.posix.join("apps/server/dist/client/assets", path.posix.basename(imp.specifier));
+    const chunkText = entryText(asar, asar.byKey.get(chunkKey));
+    const exp = parseExports(chunkText).find((e) => e.exported === spec.imported);
+    return exp ? getTopLevelDeclSource(chunkText, exp.local) : "";
+  };
+  const i18nDecl = resolveUtilsDecl(bridgeBindings.useI18n, "useI18n");
+  assert(i18nDecl.includes("$_source"), "useI18n must resolve to the M(...) message decoder containing $_source");
+  const fmtMsgDecl = resolveUtilsDecl(bridgeBindings.useFormatMessage, "useFormatMessage");
+  assert(fmtMsgDecl.includes("ICU") && !fmtMsgDecl.includes("$_source"), "useFormatMessage must resolve to the plain ICU formatter");
+  // Verify threadAtoms resolves to the entities thread-atom registry (threadAtom + quietThreadAtom)
+  // and atomRegistry resolves to the Effect-Atom Registry (.subscribe + Provider value)
+  const resolveChunkExport = (localName, label) => {
+    const imp = chatImports.find((entry) => entry.specifiers.some((s) => s.local === localName));
+    assert(imp, `${label} (${localName}) must be imported in ThreadRouteView`);
+    const spec = imp.specifiers.find((s) => s.local === localName);
+    const chunkKey = path.posix.join("apps/server/dist/client/assets", path.posix.basename(imp.specifier));
+    const chunkText = entryText(asar, asar.byKey.get(chunkKey));
+    const exp = parseExports(chunkText).find((e) => e.exported === spec.imported);
+    assert(exp, `${label} (${spec.imported}) must be exported by ${chunkKey}`);
+    return { exp, chunkText, chunkKey };
+  };
+  const taResolved = resolveChunkExport(bridgeBindings.threadAtoms, "threadAtoms");
+  assert(
+    taResolved.chunkText.includes(`${taResolved.exp.local}.threadAtom(`) &&
+      taResolved.chunkText.includes(`${taResolved.exp.local}.quietThreadAtom(`),
+    "threadAtoms must resolve to the entities export providing threadAtom() and quietThreadAtom()"
+  );
+  const regResolved = resolveChunkExport(bridgeBindings.atomRegistry, "atomRegistry");
+  assert(
+    regResolved.chunkText.includes(`${regResolved.exp.local}.subscribe(`) &&
+      regResolved.chunkText.includes(`{value:${regResolved.exp.local}}`),
+    "atomRegistry must resolve to the global Effect-Atom Registry (.subscribe + Context value)"
+  );
 
   const jsx = (type, props) => ({ type, props: props || {} });
   let activeRingsCtx = null;
-  let activeComposerCtx = null;
+  let quotaSelection;
   let activeContextWindow = null;
   let activeThreadStats = null;
+  let activeLiveSpeed = null;
   const states = [];
   let stateCursor = 0;
   let openArg = true;
   const memoSlots = [];
   let memoCursor = 0;
+  const effectSlots = [];
+  let effectCursor = 0;
+  let pendingEffects = [];
+  const flushEffects = () => {
+    const queue = pendingEffects.splice(0);
+    for (const item of queue) {
+      effectSlots[item.idx].cleanup?.();
+      effectSlots[item.idx].cleanup = item.fn() || null;
+    }
+  };
   let paceMock = null;
   let timeLeftMock = null;
 
@@ -1313,13 +2006,15 @@ function verifyUsageRingsUX(asar) {
     document: { getElementById: () => null, head: { appendChild() {} }, querySelector: () => ({}), createElement: () => ({ style: {}, set textContent(v) {} }) },
     window: { requestAnimationFrame: () => {} },
     navigator: {},
+    setTimeout,
+    clearTimeout,
   };
   const React = {
-    createContext: (def) => ({ _def: def }),
+    createContext: (def) => ({ _def: def, Provider: Symbol("ContextProvider") }),
     useContext: (ctx) => {
-      if (ctx === sandbox.T3ComposerCtx) return activeComposerCtx;
       if (ctx === sandbox.T3ContextWindowCtx) return activeContextWindow;
       if (ctx === sandbox.T3ThreadStatsCtx) return activeThreadStats;
+      if (ctx === sandbox.T3LiveSpeedCtx) return activeLiveSpeed;
       return activeRingsCtx;
     },
     useState: (init) => {
@@ -1328,7 +2023,13 @@ function verifyUsageRingsUX(asar) {
       return [states[idx], (v) => { states[idx] = typeof v === "function" ? v(states[idx]) : v; }];
     },
     useRef: (init) => ({ current: init }),
-    useEffect: () => {},
+    useEffect: (fn, deps) => {
+      const idx = effectCursor++;
+      const prev = effectSlots[idx];
+      const same = prev && Array.isArray(deps) && Array.isArray(prev.deps) && deps.length === prev.deps.length && deps.every((d, i) => Object.is(d, prev.deps[i]));
+      effectSlots[idx] = { deps, cleanup: prev?.cleanup ?? null };
+      if (!same) pendingEffects.push({ idx, fn });
+    },
     useMemo: (fn, deps) => {
       const idx = memoCursor++;
       const prev = memoSlots[idx];
@@ -1340,20 +2041,30 @@ function verifyUsageRingsUX(asar) {
     },
     useCallback: (fn, deps) => React.useMemo(() => fn, deps),
   };
+  let useModelTraitsImpl = () => ({ selectDescriptors: [], booleanDescriptors: [], selectValue: () => "high" });
+  let findEffortTraitImpl = () => ({ effort: { kind: "select", descriptor: { id: "reasoning", defaultValue: "medium" } } });
+  let findSpeedTraitImpl = () => ({ speedSelect: null, fastToggle: null });
+  let getSelectChoicesImpl = () => [{ id: "low", label: "Low" }, { id: "medium", label: "Medium" }, { id: "high", label: "High" }, { id: "max", label: "Max" }];
   const host = {
     React,
     jsx,
     jsxs: jsx,
     Fragment: Symbol("Fragment"),
-    useI18n: () => (v) => v,
-    useFormatMessage: () => (v) => String(v),
+    useI18n: () => (v) => (typeof v === "string" ? v.replace(/:eyJ[A-Za-z0-9+/=]+$/, "") : v),
+    useFormatMessage: () => (v, params) => {
+      let s = String(v);
+      if (params) {
+        for (const [k, val] of Object.entries(params)) s = s.replace(`{${k}}`, String(val));
+      }
+      return s;
+    },
     useLocale: () => "en-US",
     useMinuteNow: () => "2026-11-25T00:00",
     useSettingsSelector: () => () => "",
     timestampFormatSelector: null,
     formatCompactTokens: String,
-    formatDuration: () => "2h",
-    formatTimestamp: () => "",
+    formatDuration: (_ms, fmt) => (typeof fmt === "function" ? fmt("2h:eyJkYXlzIjowLCJob3VycyI6Mn0=") : "2h"),
+    formatTimestamp: () => "12/1 23:44",
     paceLabels: { ahead: "Ahead of pace", on: "On pace", under: "Under pace" },
     resolveAccountLimits: () => null,
     getLimitsUnavailable: () => null,
@@ -1372,10 +2083,10 @@ function verifyUsageRingsUX(asar) {
     PlusIcon: "PlusIcon",
     ProviderIcon: "Yd",
     composerDraftStore: () => null,
-    useModelTraits: () => ({ selectDescriptors: [], booleanDescriptors: [], selectValue: () => "high" }),
-    findEffortTrait: () => ({ effort: { kind: "select", descriptor: { id: "reasoning", defaultValue: "medium" } } }),
-    findSpeedTrait: () => ({ speedSelect: null, fastToggle: null }),
-    getSelectChoices: () => [{ id: "low", label: "Low" }, { id: "medium", label: "Medium" }, { id: "high", label: "High" }, { id: "max", label: "Max" }],
+    useModelTraits: (...args) => useModelTraitsImpl(...args),
+    findEffortTrait: (...args) => findEffortTraitImpl(...args),
+    findSpeedTrait: (...args) => findSpeedTraitImpl(...args),
+    getSelectChoices: (...args) => getSelectChoicesImpl(...args),
     isProviderReady: () => true,
     preventDefault: () => {},
   };
@@ -1392,10 +2103,13 @@ function verifyUsageRingsUX(asar) {
   memoCursor = 0;
   const emptyArr = [];
   const providerProps = { providerInstanceId: "p1", providers: emptyArr, sources: emptyArr, contextWindow: null, activeModel: "m1", runs: emptyArr, messages: emptyArr, turnItems: emptyArr, children: "c" };
+  stateCursor = 0;
   const rNode1 = sandbox.T3RingsCtxProvider(providerProps);
+  stateCursor = 0;
   memoCursor = 0;
   const rNode2 = sandbox.T3RingsCtxProvider(providerProps);
   assert.equal(rNode1.props.value, rNode2.props.value, "T3RingsCtx value must stay referentially identical across unrelated ChatView renders");
+  stateCursor = 0;
   memoCursor = 0;
   const newWindow = { usedTokens: 40 };
   const newTurnItems = [{ type: "file_change" }];
@@ -1403,9 +2117,13 @@ function verifyUsageRingsUX(asar) {
   assert.equal(rNode3.props.value, rNode2.props.value, "Context or history updates must not notify quota consumers");
   assert.equal(rNode3.props.children.props.value, newWindow);
   assert.equal(rNode3.props.children.props.children.props.value.turnItems, newTurnItems);
+  states.length = 0;
   memoSlots.length = 0;
+  effectSlots.length = 0;
+  pendingEffects.length = 0;
   stateCursor = 0;
   memoCursor = 0;
+  effectCursor = 0;
   const closedPlusTree = sandbox.T3ComposerPlusMenu();
   const plusPopup = findNodes(closedPlusTree, (n) => n.type === "PopoverContent")[0];
   assert.equal(plusPopup.props.children, null, "Closed T3ComposerPlusMenu must not mount or compute T3ComposerPlusMenuBody");
@@ -1451,14 +2169,16 @@ function verifyUsageRingsUX(asar) {
     { instanceId: "claude-vps", displayName: "Claude VPS" },
   ];
   activeRingsCtx = { providerInstanceId: "codex-1", activeModel: "gpt-6", providers, sources: [] };
-  activeComposerCtx = { providerInstanceId: "ag-2", activeModel: "claude-opus-4-6-thinking" };
+  quotaSelection = { providerInstanceId: "ag-2", activeModel: "claude-opus-4-6-thinking" };
   stateCursor = 0;
-  let ringTree = sandbox.T3ComposerQuotaRing();
+  let ringTree = sandbox.T3ComposerQuotaRing(quotaSelection);
   assert.match(JSON.stringify(ringTree), /Antigravity2.*40%/);
-  const popCard = sandbox.T3QuotaPopoverCard({ limits: providers[1].usageLimits, now: Date.parse("2026-11-25T00:00:00Z"), tFn: (v) => v, fmtFn: (v) => String(v), activeKey: "cg-5h:cg-7d", providerName: "Antigravity2", onClose: () => {} });
+  const paired = usageRings.t3PairUsageWindows(providers[1].usageLimits.windows);
+  const popoverProps = { paired, now: Date.parse("2026-11-25T00:00:00Z"), tFn: (v) => v, fmtFn: (v) => String(v), activeQuota: paired.find(({ key }) => key === "cg-5h:cg-7d"), providerName: "Antigravity2", onClose: () => {} };
+  const popCard = sandbox.T3QuotaPopoverCard(popoverProps);
   assert.match(JSON.stringify(popCard), /Antigravity2 · Live quota/);
   sandbox.document.documentElement = { lang: "zh-CN" };
-  const popCardZh = sandbox.T3QuotaPopoverCard({ limits: providers[1].usageLimits, now: Date.parse("2026-11-25T00:00:00Z"), tFn: (v) => v, fmtFn: (v) => String(v), activeKey: "cg-5h:cg-7d", providerName: "Antigravity2", onClose: () => {} });
+  const popCardZh = sandbox.T3QuotaPopoverCard(popoverProps);
   assert.match(JSON.stringify(popCardZh), /Antigravity2 · 实时配额/);
   const turn = {
     providerThreadId: "active", status: "completed",
@@ -1498,6 +2218,112 @@ function verifyUsageRingsUX(asar) {
     assert.equal(metricValue(incompleteCard, "speed")[0], "—");
     assert.equal(metricValue(incompleteCard, "speed")[1], null);
   }
+  // Provider without detailed token breakdown (e.g. Antigravity ACP) & in-progress Turn 1:
+  // context occupancy renders while rate/total tokens/cache hit show "—" with provider hint.
+  activeThreadStats = {
+    runs: [{}],
+    messages: [{}],
+    activeProviderThreadId: "ag-thread",
+    turnItems: Array(12).fill({ type: "command_execution" }),
+    providerTurns: [{ providerThreadId: "ag-thread", status: "running", turnTokenUsage: { usageStatus: "unavailable" } }],
+  };
+  memoCursor = 0;
+  const acpRunningCard = sandbox.T3ContextPopoverCard({
+    usage: { usedTokens: 354760, maxTokens: 1048576, usedPercentage: 34, autoCompactThreshold: null },
+    loc: "zh-CN",
+  });
+  assert.equal(metricValue(acpRunningCard, "activity")[0], "1 轮 · 12 步");
+  for (const key of ["speed", "tokens", "cache"]) {
+    const metricEl = findNodes(acpRunningCard, (node) => node.props?.["data-metric"] === key)[0];
+    assert.equal(metricValue(acpRunningCard, key)[0], "—");
+    assert.equal(metricEl.props.title, "当前提供方未上报此项明细指标");
+  }
+  // Per-turn pairs must NEVER fabricate totals by mixing Turn A inputTokens with Turn B outputTokens,
+  // while still summing turns that each reported a complete pair on their own.
+  activeThreadStats = {
+    runs: [{}, {}],
+    messages: [{}],
+    activeProviderThreadId: "disjoint-only-thread",
+    turnItems: [],
+    providerTurns: [
+      { providerThreadId: "disjoint-only-thread", status: "completed", turnTokenUsage: { usageStatus: "complete", inputTokens: 1000 } },
+      { providerThreadId: "disjoint-only-thread", status: "completed", turnTokenUsage: { usageStatus: "complete", outputTokens: 100 } },
+    ],
+  };
+  memoCursor = 0;
+  const disjointOnlyCard = sandbox.T3ContextPopoverCard({
+    usage: { usedTokens: 1000, maxTokens: 200000, usedPercentage: 1, autoCompactThreshold: null },
+    loc: "zh-CN",
+  });
+  assert.equal(metricValue(disjointOnlyCard, "tokens")[0], "—", "Disjoint turn input/output fields without a complete pair must not fabricate total tokens");
+  assert.equal(metricValue(disjointOnlyCard, "cache")[0], "—", "Turns lacking cachedInputTokens must not fabricate cache hit rate");
+
+  // Mixed turns where Turn 1 only has cache pair, Turn 2 only output, Turn 3 complete IO:
+  // each metric sums only valid per-turn pairs (never cross-turn mixing) and annotates partial turn coverage.
+  activeThreadStats = {
+    runs: [{}, {}, {}],
+    messages: [{}],
+    activeProviderThreadId: "mixed-thread",
+    turnItems: [{ type: "command_execution" }],
+    providerTurns: [
+      { providerThreadId: "mixed-thread", status: "completed", turnTokenUsage: { usageStatus: "complete", inputTokens: 1000, cachedInputTokens: 100 } },
+      { providerThreadId: "mixed-thread", status: "completed", turnTokenUsage: { usageStatus: "complete", outputTokens: 100 } },
+      { providerThreadId: "mixed-thread", status: "completed", turnTokenUsage: { usageStatus: "complete", inputTokens: 500, outputTokens: 50 } },
+    ],
+  };
+  memoCursor = 0;
+  const disjointCard = sandbox.T3ContextPopoverCard({
+    usage: { usedTokens: 1000, maxTokens: 200000, usedPercentage: 1, autoCompactThreshold: null },
+    loc: "zh-CN",
+  });
+  assert.equal(metricValue(disjointCard, "tokens")[0], "550", "Must sum only complete per-turn IO pairs without mixing disjoint turns");
+  assert.equal(metricValue(disjointCard, "cache")[0], "10.0%", "Must average only complete per-turn cache pairs without diluting denominator");
+  assert.match(String(findNodes(disjointCard, (n) => n.props?.["data-metric"] === "tokens")[0].props.title || ""), /1\/3/);
+
+  // Completed turn omitting tokenUsage/unavailable, plus interrupted/failed/cancelled/promptDropped turns:
+  // must skip failed/unavailable turns cleanly and accumulate remaining valid completed turns.
+  activeThreadStats = {
+    runs: [{}, {}, {}, {}, {}, {}],
+    messages: [{}],
+    activeProviderThreadId: "partial-thread",
+    turnItems: [],
+    providerTurns: [
+      { providerThreadId: "partial-thread", status: "completed", turnTokenUsage: { usageStatus: "complete", inputTokens: 100, outputTokens: 20, cachedInputTokens: 50 } },
+      { providerThreadId: "partial-thread", status: "completed", turnTokenUsage: { usageStatus: "complete", inputTokens: 200, outputTokens: 80, cachedInputTokens: 100 } },
+      { providerThreadId: "partial-thread", status: "completed", turnTokenUsage: null },
+      { providerThreadId: "partial-thread", status: "interrupted", turnTokenUsage: { usageStatus: "partial", inputTokens: 999, outputTokens: 1 } },
+      { providerThreadId: "partial-thread", status: "failed", turnTokenUsage: { usageStatus: "unavailable" } },
+      { providerThreadId: "partial-thread", status: "completed", promptDropped: true, turnTokenUsage: { usageStatus: "complete", inputTokens: 5000, outputTokens: 500 } },
+    ],
+  };
+  memoCursor = 0;
+  const missingTurnCard = sandbox.T3ContextPopoverCard({
+    usage: { usedTokens: 300, maxTokens: 200000, usedPercentage: 1, autoCompactThreshold: null, inputTokens: 200, outputTokens: 80, cachedInputTokens: 100, totalProcessedTokens: null },
+    loc: "zh-CN",
+  });
+  assert.equal(metricValue(missingTurnCard, "tokens")[0], "400", "Must accumulate valid completed turns (120 + 280) and beat single-turn usage fallback (280)");
+  assert.equal(metricValue(missingTurnCard, "cache")[0], "50.0%", "Must compute cumulative avg cache hit (150 / 300) across valid completed turns");
+  const missingTokNode = findNodes(missingTurnCard, (n) => n.props?.["data-metric"] === "tokens")[0];
+  assert.match(String(missingTokNode.props.title || ""), /2\/3/);
+
+  // Hourly + Weekly pairing must label dynamically as 1h / 7d (never hardcoded 5h / 7d)
+  const hourlyWeeklyPaired = usageRings.t3PairUsageWindows([
+    { id: "claude-hourly", label: "Claude Hourly", usedPercent: 15, resetsAt: "2026-11-25T01:00:00Z" },
+    { id: "claude-weekly", label: "Claude Weekly", usedPercent: 30, resetsAt: "2026-12-01T00:00:00Z" },
+  ]);
+  assert.equal(hourlyWeeklyPaired.length, 1);
+  assert.equal(hourlyWeeklyPaired[0].kind, "dual");
+  const hwPopJson = JSON.stringify(sandbox.T3QuotaPopoverCard({
+    paired: hourlyWeeklyPaired,
+    now: Date.parse("2026-11-25T00:00:00Z"),
+    tFn: (v) => v,
+    fmtFn: (v) => String(v),
+    activeQuota: hourlyWeeklyPaired[0],
+    providerName: "",
+    onClose: () => {},
+  }));
+  assert(hwPopJson.includes("1h ") && hwPopJson.includes("7d "), "Quota popover must label hourly window dynamically as 1h");
+  assert(!hwPopJson.includes("5h"), "Hourly+Weekly pair must NEVER be mislabeled 5h");
   activeContextWindow = usage;
   activeThreadStats = stats;
   states.length = 0;
@@ -1508,21 +2334,490 @@ function verifyUsageRingsUX(asar) {
   const openContextPopup = findNodes(openContextRing, (node) => node.type === "PopoverContent")[0];
   assert.equal(openContextPopup.props.children.type, sandbox.T3ContextPopoverCard);
   assert.equal(openContextPopup.props.children.props.usage, usage);
+
+  // Live unified tok/s streaming across reasoning -> tool pause -> assistant_message + Turn-1 null contextWindow
+  states.length = 0;
+  memoSlots.length = 0;
+  effectSlots.length = 0;
+  const runProviderTree = (statsInput, ctxWin = null) => {
+    stateCursor = 0;
+    memoCursor = 0;
+    effectCursor = 0;
+    pendingEffects.length = 0;
+    const providerTree = sandbox.T3RingsCtxProvider({
+      providerInstanceId: "ag-live",
+      providers: [],
+      sources: [],
+      contextWindow: ctxWin,
+      activeModel: "gemini-4-hydrogen",
+      ...statsInput,
+      children: { type: "Child", props: {} },
+    });
+    const speedProvider = findNodes(providerTree, (node) => node.type === sandbox.T3LiveSpeedCtx.Provider)[0];
+    return speedProvider.props.value;
+  };
+  const liveTurn = {
+    id: "turn-stream-1",
+    providerThreadId: "ag-thread",
+    status: "running",
+    startedAt: "2026-11-25T00:00:00.000Z",
+  };
+  const r0 = {
+    id: "r-0",
+    type: "reasoning",
+    providerTurnId: liveTurn.id,
+    streaming: true,
+    startedAt: "2026-11-25T00:00:00.200Z",
+    updatedAt: "2026-11-25T00:00:00.200Z",
+    text: "Thinking step one: check code",
+  };
+  // 1) First chunk with startedAt === updatedAt in reasoning-only turn immediately emits live tok/s
+  const speedFrame1 = runProviderTree({
+    runs: [{}],
+    messages: [],
+    activeProviderThreadId: "ag-thread",
+    providerTurns: [liveTurn],
+    turnItems: [r0],
+  });
+  assert(speedFrame1 && speedFrame1.value > 0 && speedFrame1.idle === false, "First reasoning chunk must produce immediate live tok/s");
+  // Composer pill renders live tok/s even while Turn-1 contextWindow is still null, and popover handles usage === null
+  const composerStatesStart = states.length;
   activeContextWindow = null;
+  activeThreadStats = { runs: [{}], messages: [], activeProviderThreadId: "ag-thread", providerTurns: [liveTurn], turnItems: [r0] };
+  activeLiveSpeed = speedFrame1;
+  stateCursor = composerStatesStart;
+  memoCursor = 0;
+  const livePillNoCtx = sandbox.T3ComposerContextRing();
+  assert(livePillNoCtx, "Composer pill must render live speed even when contextWindow is null");
+  const livePillJson = JSON.stringify(livePillNoCtx);
+  assert(livePillJson.includes("tok/s") && !livePillJson.includes("≈") && !livePillJson.includes("字符/秒"));
+  livePillNoCtx.props.onOpenChange(true);
+  stateCursor = composerStatesStart;
+  memoCursor = 0;
+  const openNoCtxCard = findNodes(sandbox.T3ComposerContextRing(), (node) => node.type === "PopoverContent")[0].props.children;
+  assert.equal(openNoCtxCard.type, sandbox.T3ContextPopoverCard);
+  const renderedNoCtxCard = sandbox.T3ContextPopoverCard({ usage: null, loc: "zh-CN" });
+  const noCtxSpeedNode = findNodes(renderedNoCtxCard, (node) => node.props?.["data-metric"] === "speed")[0];
+  assert.match(JSON.stringify(noCtxSpeedNode), /实时输出速度/);
+  assert.equal(metricValue(renderedNoCtxCard, "speed")[1].props.children, "tok/s");
+
+  // 2) Streaming growth -> 3s tool call pause preserves statistical mean (never drops to 0 or drags rate down) -> resumed assistant_message accumulates cleanly
+  // Preserve provider hook slots only while stepping through frames
+  states.length = composerStatesStart;
+  memoSlots.length = 0;
+  const r1 = {
+    ...r0,
+    updatedAt: "2026-11-25T00:00:01.200Z",
+    text: "Thinking step one: check code".repeat(8),
+  };
+  const speedFrame2 = runProviderTree({
+    runs: [{}],
+    messages: [],
+    activeProviderThreadId: "ag-thread",
+    providerTurns: [liveTurn],
+    turnItems: [r1],
+  });
+  assert(speedFrame2.value > 20 && speedFrame2.active === true, `Expected active streaming speed > 20, got ${speedFrame2.value}`);
+  const toolWait = {
+    id: "cmd-1",
+    type: "command_execution",
+    providerTurnId: liveTurn.id,
+    status: "running",
+    startedAt: "2026-11-25T00:00:01.300Z",
+    updatedAt: "2026-11-25T00:00:04.500Z",
+  };
+  const speedToolIdle = runProviderTree({
+    runs: [{}],
+    messages: [],
+    activeProviderThreadId: "ag-thread",
+    providerTurns: [liveTurn],
+    turnItems: [{ ...r1, streaming: false }, toolWait],
+  });
+  assert(
+    Math.abs(speedToolIdle.value - speedFrame2.value) < 0.01 && speedToolIdle.value > 20,
+    `Tool wait must preserve active output statistical mean without dropping to 0 or dragging down (got ${speedToolIdle.value} vs ${speedFrame2.value})`
+  );
+  assert.equal(speedToolIdle.idle, true);
+  const resumedReply = {
+    id: "msg-item-1",
+    type: "assistant_message",
+    providerTurnId: liveTurn.id,
+    messageId: "msg-1",
+    streaming: true,
+    textOmitted: true,
+    text: "",
+    startedAt: "2026-11-25T00:00:04.600Z",
+    updatedAt: "2026-11-25T00:00:04.600Z",
+  };
+  const speedResumed = runProviderTree({
+    runs: [{}],
+    messages: [{ id: "msg-1", text: "你好世界，这是工具执行完毕后立刻继续流式输出的正文。", updatedAt: "2026-11-25T00:00:04.800Z" }],
+    activeProviderThreadId: "ag-thread",
+    providerTurns: [liveTurn],
+    turnItems: [{ ...r1, streaming: false }, { ...toolWait, status: "completed", completedAt: "2026-11-25T00:00:04.600Z" }, resumedReply],
+  });
+  assert(speedResumed.value >= 25 && speedResumed.idle === false, `Resumed output must stay at real model output speed without tool pause drag, got ${speedResumed.value}`);
+
+  // 3) Composer pill displays context percentage alongside tok/s (replacing raw used-token count like 252k/37k)
+  activeContextWindow = usage;
+  activeLiveSpeed = speedResumed;
+  states.length = composerStatesStart;
+  stateCursor = composerStatesStart;
+  memoCursor = 0;
+  const combinedLivePill = sandbox.T3ComposerContextRing();
+  const combinedText = JSON.stringify(combinedLivePill);
+  assert(
+    combinedText.includes("56%") && combinedText.includes("tok/s") && !combinedText.includes(String(usage.usedTokens)),
+    `Composer pill must show context % + tok/s and replace raw token count (got ${combinedText})`
+  );
+
+  // 4) Finished turn without complete turnTokenUsage falls back to streamed output tok/s when text items exist,
+  //    and composer pill continues showing context % + completed-turn tok/s outside
+  activeLiveSpeed = null;
+  const acpFinishedStats = {
+    runs: [{}],
+    messages: [{ id: "msg-1", text: "你好世界，测试一段完整的回答内容输出速率。", updatedAt: "2026-11-25T00:00:06.000Z" }],
+    activeProviderThreadId: "ag-thread",
+    providerTurns: [{
+      id: "turn-done-no-usage",
+      providerThreadId: "ag-thread",
+      status: "completed",
+      startedAt: "2026-11-25T00:00:00.000Z",
+      completedAt: "2026-11-25T00:00:06.000Z",
+      turnTokenUsage: { usageStatus: "unavailable" },
+    }],
+    turnItems: [
+      { id: "msg-done", type: "assistant_message", providerTurnId: "turn-done-no-usage", messageId: "msg-1", textOmitted: true, text: "", startedAt: "2026-11-25T00:00:04.000Z", completedAt: "2026-11-25T00:00:06.000Z" },
+    ],
+  };
+  memoSlots.length = 0;
+  const acpFinishedCard = renderContextCard(acpFinishedStats);
+  assert.notEqual(metricValue(acpFinishedCard, "speed")[0], "—", "Finished turn with real streamed output must compute fallback tok/s");
+  assert.equal(metricValue(acpFinishedCard, "speed")[1].props.children, "tok/s");
+  states.length = composerStatesStart;
+  stateCursor = composerStatesStart;
+  memoCursor = 0;
+  const finishedOuterPill = JSON.stringify(sandbox.T3ComposerContextRing());
+  assert(
+    finishedOuterPill.includes("56%") && finishedOuterPill.includes("tok/s") && !finishedOuterPill.includes(String(usage.usedTokens)),
+    "Completed-turn composer pill must replace concrete token count with tok/s alongside context %"
+  );
+
+  // 5) Real T3 Code 0.1.12 Effect DateTime.Utc + quietThreadAtom regression:
+  //    - Effect Schema DateTimeUtc decodes timestamps into `{ _tag: "Utc", epochMilliseconds, toString() => "DateTime.Utc(...)" }`
+  //      where `Date.parse(obj)` returns NaN!
+  //    - ThreadRouteView's `q` comes from quietThreadAtom (which strips `text` & `updatedAt` from reasoning/assistant_message).
+  {
+    const mkUtc = (iso) => ({
+      _tag: "Utc",
+      epochMilliseconds: Date.parse(iso),
+      toString() { return `DateTime.Utc(${iso})`; },
+      toJSON() { return iso; },
+    });
+    assert(Number.isNaN(Date.parse(mkUtc("2026-11-26T10:05:07.422Z"))), "Sanity check: Date.parse on Effect DateTime.Utc must be NaN");
+
+    const atomValues = new Map();
+    const atomListeners = new Map();
+    let activeSubCount = 0;
+    const mockThreadAtoms = {
+      threadAtom: ({ environmentId, threadId }) => `${environmentId}:${threadId}`,
+    };
+    const mockAtomRegistry = {
+      get: (key) => atomValues.get(key) ?? null,
+      subscribe: (key, fn, opts) => {
+        if (!atomListeners.has(key)) atomListeners.set(key, new Set());
+        atomListeners.get(key).add(fn);
+        activeSubCount++;
+        if (opts?.immediate) fn(atomValues.get(key) ?? null);
+        return () => {
+          const set = atomListeners.get(key);
+          if (set && set.delete(fn)) activeSubCount--;
+        };
+      },
+      push: (key, val) => {
+        atomValues.set(key, val);
+        for (const fn of [...(atomListeners.get(key) || [])]) fn(val);
+      },
+    };
+    const liveSandbox = {
+      ...sandbox,
+      setTimeout: undefined,
+      clearTimeout: undefined,
+    };
+    const liveRuntime = loadRuntimeModule("usage-rings-ui", liveSandbox).exports.createUsageRingsRuntime({
+      ...host,
+      threadAtoms: mockThreadAtoms,
+      atomRegistry: mockAtomRegistry,
+    });
+    const origCtx = {
+      T3ContextWindowCtx: sandbox.T3ContextWindowCtx,
+      T3ThreadStatsCtx: sandbox.T3ThreadStatsCtx,
+      T3LiveSpeedCtx: sandbox.T3LiveSpeedCtx,
+    };
+    sandbox.T3ContextWindowCtx = liveRuntime.T3ContextWindowCtx;
+    sandbox.T3ThreadStatsCtx = liveRuntime.T3ThreadStatsCtx;
+    sandbox.T3LiveSpeedCtx = liveRuntime.T3LiveSpeedCtx;
+
+    states.length = 0;
+    memoSlots.length = 0;
+    effectSlots.length = 0;
+    pendingEffects.length = 0;
+
+    const stripQuiet = (items) =>
+      items.map((item) => {
+        if (item.type !== "reasoning" && item.type !== "assistant_message") return item;
+        const { text: _t, updatedAt: _u, ...rest } = item;
+        return rest;
+      });
+
+    const refA = { environmentId: "env-local", threadId: "thread-A" };
+    const refB = { environmentId: "env-local", threadId: "thread-B" };
+    const keyA = mockThreadAtoms.threadAtom(refA);
+    const keyB = mockThreadAtoms.threadAtom(refB);
+
+    const turnA = {
+      id: "turn-a-1",
+      providerThreadId: "pt-new",
+      status: "running",
+      startedAt: mkUtc("2026-11-26T10:05:00.691Z"),
+    };
+    const quietPropsA = {
+      threadRef: refA,
+      providerInstanceId: "ag-live",
+      providers: [],
+      sources: [],
+      contextWindow: null,
+      activeModel: "gemini-4-neon",
+      runs: [{ startedAt: mkUtc("2026-11-26T10:05:00.585Z"), completedAt: null }],
+      messages: [],
+      activeProviderThreadId: "pt-old",
+      providerTurns: [turnA],
+      turnItems: stripQuiet([
+        { id: "r-a0", type: "reasoning", providerTurnId: turnA.id, streaming: true, startedAt: mkUtc("2026-11-26T10:05:01.000Z"), updatedAt: mkUtc("2026-11-26T10:05:01.000Z"), text: "stripped" },
+      ]),
+      children: { type: "Child", props: {} },
+    };
+    const renderLiveProvider = (props) => {
+      stateCursor = 0;
+      memoCursor = 0;
+      effectCursor = 0;
+      liveRuntime.T3RingsCtxProvider(props);
+      flushEffects();
+      stateCursor = 0;
+      memoCursor = 0;
+      effectCursor = 0;
+      const postTree = liveRuntime.T3RingsCtxProvider(props);
+      const statsNode = findNodes(postTree, (n) => n.type === liveRuntime.T3ThreadStatsCtx.Provider)[0];
+      const speedNode = findNodes(postTree, (n) => n.type === liveRuntime.T3LiveSpeedCtx.Provider)[0];
+      return { statsVal: statsNode.props.value, speedVal: speedNode.props.value };
+    };
+
+    // Push live Effect DateTime.Utc reasoning frame while quietPropsA stays stripped
+    const rA0 = {
+      id: "r-a0",
+      type: "reasoning",
+      providerTurnId: turnA.id,
+      streaming: true,
+      startedAt: mkUtc("2026-11-26T10:05:01.000Z"),
+      updatedAt: mkUtc("2026-11-26T10:05:01.000Z"),
+      text: "Inspecting Effect DateTime.Utc and quietThreadAtom stripping in ThreadRouteView",
+    };
+    mockAtomRegistry.push(keyA, {
+      environmentId: refA.environmentId,
+      projection: {
+        thread: { activeProviderThreadId: "pt-old" },
+        providerTurns: [turnA],
+        turnItems: [rA0],
+        messages: [],
+      },
+    });
+    const res1 = renderLiveProvider(quietPropsA);
+    assert.equal(activeSubCount, 1, "T3RingsCtxProvider must subscribe to threadAtom");
+    assert(
+      res1.speedVal && res1.speedVal.value > 0 && res1.speedVal.idle === false,
+      `Live atom subscription with DateTime.Utc must emit tok/s (got ${JSON.stringify(res1.speedVal)})`
+    );
+
+    // Proposed plan markdown streaming also drives statistical mean tok/s
+    const planItem = {
+      id: "plan-a1",
+      type: "proposed_plan",
+      providerTurnId: turnA.id,
+      streaming: true,
+      startedAt: mkUtc("2026-11-26T10:05:01.300Z"),
+      updatedAt: mkUtc("2026-11-26T10:05:02.200Z"),
+      markdown: "## Plan\n".repeat(30),
+    };
+    mockAtomRegistry.push(keyA, {
+      environmentId: refA.environmentId,
+      projection: {
+        thread: { activeProviderThreadId: "pt-new" },
+        providerTurns: [turnA],
+        turnItems: [{ ...rA0, streaming: false }, planItem],
+        messages: [],
+      },
+    });
+    const resPlan = renderLiveProvider(quietPropsA);
+    assert(resPlan.speedVal && resPlan.speedVal.value > 20 && resPlan.speedVal.idle === false, "proposed_plan markdown streaming must drive live tok/s");
+
+    // 20s tool wait must preserve the statistical mean (idle=true, value unchanged & never dragged down by tool duration)
+    const cmdA = {
+      id: "cmd-a1",
+      type: "command_execution",
+      providerTurnId: turnA.id,
+      status: "running",
+      startedAt: mkUtc("2026-11-26T10:05:02.300Z"),
+      updatedAt: mkUtc("2026-11-26T10:05:22.300Z"),
+    };
+    mockAtomRegistry.push(keyA, {
+      environmentId: refA.environmentId,
+      projection: {
+        thread: { activeProviderThreadId: "pt-new" },
+        providerTurns: [turnA],
+        turnItems: [{ ...rA0, streaming: false }, { ...planItem, streaming: false }, cmdA],
+        messages: [],
+      },
+    });
+    const resIdle = renderLiveProvider(quietPropsA);
+    assert(
+      Math.abs(resIdle.speedVal.value - resPlan.speedVal.value) < 0.01 && resIdle.speedVal.value > 20,
+      `20s tool wait must keep active-output mean intact, got ${resIdle.speedVal?.value} vs ${resPlan.speedVal?.value}`
+    );
+    assert.equal(resIdle.speedVal?.idle, true);
+
+    // Exact reproduction of real Gemini 4 Neon Turn 2 with Effect DateTime.Utc:
+    // 5s TTFT (10:05:00.691 -> 10:05:05.703), 1.719s visible output (10:05:05.703 -> 10:05:07.422),
+    // outputTokens=169, reasoningTokens=63 (no reasoning turnItem) -> visible rate = (169-63)/1.719 = 61.7 tok/s, run duration = 6.9 秒!
+    const doneTurnNeon = {
+      id: "turn-neon-2",
+      providerThreadId: "pt-new",
+      status: "completed",
+      startedAt: mkUtc("2026-11-26T10:05:00.691Z"),
+      completedAt: mkUtc("2026-11-26T10:05:07.422Z"),
+      turnTokenUsage: { usageStatus: "complete", inputTokens: 36770, outputTokens: 169, reasoningTokens: 63, cachedInputTokens: 0 },
+    };
+    const neonMsgItem = {
+      id: "am-neon-2",
+      type: "assistant_message",
+      providerTurnId: doneTurnNeon.id,
+      messageId: "m-neon-2",
+      streaming: false,
+      startedAt: mkUtc("2026-11-26T10:05:05.703Z"),
+      completedAt: mkUtc("2026-11-26T10:05:07.422Z"),
+      updatedAt: mkUtc("2026-11-26T10:05:07.422Z"),
+      text: "你好！这是一个用于测试真实输出速率的示例回复内容。".repeat(6),
+    };
+    mockAtomRegistry.push(keyA, {
+      environmentId: refA.environmentId,
+      projection: {
+        thread: { activeProviderThreadId: "pt-new" },
+        providerTurns: [doneTurnNeon],
+        turnItems: [neonMsgItem],
+        messages: [{ id: "m-neon-2", text: neonMsgItem.text, updatedAt: mkUtc("2026-11-26T10:05:07.422Z") }],
+      },
+    });
+    const resDone = renderLiveProvider({
+      ...quietPropsA,
+      runs: [{ startedAt: mkUtc("2026-11-26T10:05:00.585Z"), completedAt: mkUtc("2026-11-26T10:05:07.496Z") }],
+      providerTurns: [doneTurnNeon],
+      activeProviderThreadId: "pt-new",
+      turnItems: stripQuiet([neonMsgItem]),
+      messages: [],
+    });
+    assert.equal(resDone.speedVal, null, "Completed turn must clear live speed");
+    activeThreadStats = resDone.statsVal;
+    activeLiveSpeed = null;
+    activeContextWindow = { usedTokens: 36939, maxTokens: 1048576, usedPercentage: 3.52 };
+    memoSlots.length = 0;
+    memoCursor = 0;
+    const donePopover = liveRuntime.T3ContextPopoverCard({ usage: activeContextWindow, loc: "zh-CN" });
+    const doneSpeedNum = Number(String(metricValue(donePopover, "speed")[0]).replace(/,/g, ""));
+    assert(
+      doneSpeedNum >= 55 && doneSpeedNum <= 68,
+      `Completed turn with DateTime.Utc must compute real model output rate (~61.7 tok/s excluding 5s TTFT), got ${metricValue(donePopover, "speed")[0]}`
+    );
+    assert.equal(metricValue(donePopover, "speed")[1].props.children, "tok/s");
+    assert(JSON.stringify(donePopover).includes("6.9 秒"), "Completed run duration with DateTime.Utc must render 6.9 秒 instead of vanishing");
+
+    // Outer composer pill shows "3.5% · 61.7 tok/s" (replacing raw "36939"/"37k")
+    const pillStatesStart = states.length;
+    stateCursor = pillStatesStart;
+    memoCursor = 0;
+    const neonPillJson = JSON.stringify(liveRuntime.T3ComposerContextRing());
+    assert(
+      neonPillJson.includes("3.5%") && neonPillJson.includes("61.7 tok/s") && !neonPillJson.includes("36939"),
+      `Outer composer pill must show 3.5% + 61.7 tok/s without concrete token count, got ${neonPillJson}`
+    );
+
+    // Mid-turn thread switch into a long-running turn (2000 tokens over 40s = ~50 tok/s) must NOT spike
+    states.length = pillStatesStart;
+    const longTurnB = {
+      id: "turn-b-long",
+      providerThreadId: "pt-b",
+      status: "running",
+      startedAt: mkUtc("2026-11-26T10:00:00.000Z"),
+    };
+    const longTextB = "word ".repeat(1600);
+    mockAtomRegistry.push(keyB, {
+      environmentId: refB.environmentId,
+      projection: {
+        thread: { activeProviderThreadId: "pt-b" },
+        providerTurns: [longTurnB],
+        turnItems: [{
+          id: "am-b1",
+          type: "assistant_message",
+          providerTurnId: longTurnB.id,
+          streaming: true,
+          startedAt: mkUtc("2026-11-26T10:00:00.000Z"),
+          updatedAt: mkUtc("2026-11-26T10:00:40.000Z"),
+          text: longTextB,
+        }],
+        messages: [],
+      },
+    });
+    const resB = renderLiveProvider({ ...quietPropsA, threadRef: refB, providerTurns: [longTurnB], turnItems: [] });
+    assert.equal(activeSubCount, 1, "Switching threadRef must unsubscribe previous threadAtom before subscribing new one");
+    assert(
+      resB.speedVal && resB.speedVal.value >= 45 && resB.speedVal.value <= 55,
+      `Switching into 40s running turn (~50 tok/s) must yield exact ~50 tok/s without spike, got ${resB.speedVal?.value}`
+    );
+
+    // Switching back from streaming Thread B to idle Thread A must immediately yield null without leaking Thread B speed
+    stateCursor = 0;
+    memoCursor = 0;
+    effectCursor = 0;
+    const preEffectBackToA = liveRuntime.T3RingsCtxProvider({ ...quietPropsA, threadRef: refA, providerTurns: [doneTurnNeon] });
+    const preEffectSpeedA = findNodes(preEffectBackToA, (n) => n.type === liveRuntime.T3LiveSpeedCtx.Provider)[0].props.value;
+    assert.equal(preEffectSpeedA, null, "Switching threads must not flash previous thread live speed even before effects flush");
+    flushEffects();
+    assert.equal(activeSubCount, 1);
+
+    for (const slot of effectSlots) slot?.cleanup?.();
+    assert.equal(activeSubCount, 0, "Unmounting T3RingsCtxProvider must unsubscribe threadAtom");
+    sandbox.T3ContextWindowCtx = origCtx.T3ContextWindowCtx;
+    sandbox.T3ThreadStatsCtx = origCtx.T3ThreadStatsCtx;
+    sandbox.T3LiveSpeedCtx = origCtx.T3LiveSpeedCtx;
+    effectSlots.length = 0;
+    pendingEffects.length = 0;
+  }
+
+  activeContextWindow = null;
+  activeLiveSpeed = null;
+  memoSlots.length = 0;
   states.length = 0;
   stateCursor = 0;
   delete sandbox.document.documentElement;
-  activeComposerCtx = { providerInstanceId: "ag-2", activeModel: "gemini-4-hydrogen" };
+  quotaSelection = { providerInstanceId: "ag-2", activeModel: "gemini-4-hydrogen" };
   stateCursor = 0;
-  ringTree = sandbox.T3ComposerQuotaRing();
+  ringTree = sandbox.T3ComposerQuotaRing(quotaSelection);
   assert.match(JSON.stringify(ringTree), /Antigravity2.*95%/);
-  activeComposerCtx = { providerInstanceId: "codex-1", activeModel: "gpt-6" };
+  quotaSelection = { providerInstanceId: "codex-1", activeModel: "gpt-6" };
   stateCursor = 0;
-  ringTree = sandbox.T3ComposerQuotaRing();
+  ringTree = sandbox.T3ComposerQuotaRing(quotaSelection);
   assert.match(JSON.stringify(ringTree), /Codex.*90%/);
-  activeComposerCtx = { providerInstanceId: "claude-vps", activeModel: "claude-sonnet-4-6" };
+  quotaSelection = { providerInstanceId: "claude-vps", activeModel: "claude-sonnet-4-6" };
   stateCursor = 0;
-  assert.equal(sandbox.T3ComposerQuotaRing(), null);
+  assert.equal(sandbox.T3ComposerQuotaRing(quotaSelection), null);
 
   // 3) T3UnifiedModelControls: switch Harness updates quota bar & model rows, model pick returns to effort without closing
   states.length = 0;
@@ -1588,6 +2883,362 @@ function verifyUsageRingsUX(asar) {
   assert.deepEqual(openEvents, [], "Choosing a model must NOT close the popover");
   tree = renderControls();
   assert(findNodes(tree, (n) => n.props && n.props.className === "t3e-effort-card").length === 1, "Must return to effort view after picking model");
+
+  // 4) Reset default effort across Codex (select+serviceTier), Claude (high default + fastMode), Antigravity/ACP (caps.currentValue), OpenCode (t3:default), and boolean thinking
+  const createStatefulTraitsDriver = (spec) => {
+    let options = Array.isArray(spec.initialOptions) ? spec.initialOptions.slice() : [];
+    const dispatches = [];
+    const buildCtrl = () => {
+      const rawDescriptors = spec.optionDescriptors.map((d) => {
+        const sel = options.find((o) => o.id === d.id);
+        return sel ? { ...d, currentValue: sel.value } : { ...d };
+      });
+      return {
+        caps: { optionDescriptors: spec.optionDescriptors },
+        descriptors: rawDescriptors,
+        selectDescriptors: rawDescriptors.filter((d) => d.type === "select"),
+        booleanDescriptors: rawDescriptors.filter((d) => d.type === "boolean"),
+        primarySelectDescriptor: rawDescriptors.find((d) => d.type === "select") ?? null,
+        ultrathinkPromptControlled: Boolean(spec.ultrathinkPromptControlled),
+        ultrathinkInBodyText: Boolean(spec.ultrathinkInBodyText),
+        modelIsUnavailable: false,
+        selectValue(desc) {
+          if (!desc) return "";
+          if (this.ultrathinkPromptControlled && desc.id === this.primarySelectDescriptor?.id) return "ultrathink";
+          const sel = options.find((o) => o.id === desc.id);
+          if (sel && typeof sel.value === "string") return sel.value;
+          if (desc.id === "variant" && desc.options?.some((o) => o.id === "t3:default")) return "t3:default";
+          if (typeof desc.currentValue === "string" && desc.currentValue) return desc.currentValue;
+          return desc.options?.find((o) => o.isDefault)?.id ?? "";
+        },
+        changeSelect(desc, optionId) {
+          dispatches.push({ kind: "select", id: desc.id, value: optionId });
+          if (desc.promptInjectedValues?.includes(optionId) || (this.ultrathinkInBodyText && desc.id === this.primarySelectDescriptor?.id)) {
+            return;
+          }
+          // Intentionally mirror real Q3 (useModelTraits): compute from snapshot rawDescriptors (stale on double sync calls!)
+          options = rawDescriptors
+            .map((d) => (d.id === desc.id ? { ...d, currentValue: optionId } : d))
+            .filter((d) => d.currentValue !== undefined)
+            .map((d) => ({ id: d.id, value: d.currentValue }));
+        },
+        changeBoolean(id, val) {
+          dispatches.push({ kind: "boolean", id, value: Boolean(val) });
+          options = rawDescriptors
+            .map((d) => (d.id === id ? { ...d, currentValue: Boolean(val) } : d))
+            .filter((d) => d.currentValue !== undefined)
+            .map((d) => ({ id: d.id, value: d.currentValue }));
+        },
+      };
+    };
+    const resetRender = (modelId, instId = "inst-1") => {
+      states.length = 0;
+      memoSlots.length = 0;
+      effectSlots.length = 0;
+      pendingEffects.length = 0;
+      return () => {
+        stateCursor = 0;
+        memoCursor = 0;
+        effectCursor = 0;
+        const t = sandbox.T3UnifiedModelControls({
+          traits: { provider: spec.provider || "codex", instanceId: instId, model: modelId },
+          instanceEntries: [{ instanceId: instId, driverKind: spec.provider || "codex", displayName: spec.provider || "Codex", enabled: true }],
+          modelOptionsByInstance: new Map([[instId, [{ slug: modelId, name: modelId }]]]),
+          activeInstanceId: instId,
+          activeModel: modelId,
+          disabled: false,
+          open: true,
+          onOpenChange: () => {},
+        });
+        flushEffects();
+        return t;
+      };
+    };
+    return { buildCtrl, resetRender, dispatches, getOptions: () => options };
+  };
+
+  let activeDriver = null;
+  useModelTraitsImpl = () => activeDriver.buildCtrl();
+  findEffortTraitImpl = (selects, bools) => {
+    const filteredSelects = selects.filter((d) => d.id !== "serviceTier");
+    const filteredBools = bools.filter((d) => d.id !== "fastMode" && d.id !== "ultracode");
+    const effort =
+      filteredSelects.map((d) => ({ kind: "select", descriptor: d })).find((e) => e.descriptor.role === "reasoning" || ["reasoning", "reasoningEffort", "effort", "variant"].includes(e.descriptor.id)) ||
+      filteredBools.map((d) => ({ kind: "boolean", descriptor: d })).find((e) => e.descriptor.id === "thinking") ||
+      null;
+    return { effort };
+  };
+  findSpeedTraitImpl = (selects, bools) => ({
+    speedSelect: selects.find((d) => d.id === "serviceTier") ?? null,
+    fastToggle: bools.find((d) => d.id === "fastMode") ?? null,
+  });
+  getSelectChoicesImpl = (desc) => desc?.options ?? [];
+
+  const clickResetBtn = (node) => {
+    const btn = findNodes(node, (n) => n.type === "button" && n.props && /Reset default effort|恢复默认思考深度/.test(String(n.props["aria-label"] || "")))[0];
+    assert(btn, "Reset default effort button must render in effort card");
+    btn.props.onClick();
+  };
+
+  // 4a) Codex with serviceTier already default + reasoningEffort changed to xhigh -> must NOT be overwritten by serviceTier
+  activeDriver = createStatefulTraitsDriver({
+    provider: "codex",
+    optionDescriptors: [
+      {
+        id: "reasoningEffort",
+        type: "select",
+        role: "reasoning",
+        options: [
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium", isDefault: true },
+          { id: "high", label: "High" },
+          { id: "xhigh", label: "Extra High" },
+        ],
+      },
+      {
+        id: "serviceTier",
+        type: "select",
+        options: [
+          { id: "default", label: "Standard", isDefault: true },
+          { id: "fast", label: "Fast" },
+        ],
+      },
+    ],
+    initialOptions: [{ id: "reasoningEffort", value: "xhigh" }, { id: "serviceTier", value: "default" }],
+  });
+  let renderFn = activeDriver.resetRender("gpt-6.2-sol", "codex");
+  let resetTree = renderFn();
+  clickResetBtn(resetTree);
+  resetTree = renderFn();
+  assert.deepEqual(
+    activeDriver.dispatches,
+    [{ kind: "select", id: "reasoningEffort", value: "medium" }],
+    "Codex reset must dispatch only reasoningEffort=medium when serviceTier is already default"
+  );
+  assert.equal(activeDriver.getOptions().find((o) => o.id === "reasoningEffort")?.value, "medium");
+
+  // 4b) Codex with BOTH xhigh AND fast serviceTier -> sequences effort then serviceTier across commits
+  activeDriver = createStatefulTraitsDriver({
+    provider: "codex",
+    optionDescriptors: [
+      {
+        id: "reasoningEffort",
+        type: "select",
+        role: "reasoning",
+        options: [
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium", isDefault: true },
+          { id: "high", label: "High" },
+          { id: "xhigh", label: "Extra High" },
+        ],
+      },
+      {
+        id: "serviceTier",
+        type: "select",
+        options: [
+          { id: "default", label: "Standard", isDefault: true },
+          { id: "fast", label: "Fast" },
+        ],
+      },
+    ],
+    initialOptions: [{ id: "reasoningEffort", value: "xhigh" }, { id: "serviceTier", value: "fast" }],
+  });
+  renderFn = activeDriver.resetRender("gpt-6.2-sol", "codex");
+  resetTree = renderFn();
+  clickResetBtn(resetTree);
+  resetTree = renderFn();
+  resetTree = renderFn();
+  assert.deepEqual(
+    activeDriver.dispatches,
+    [
+      { kind: "select", id: "reasoningEffort", value: "medium" },
+      { kind: "select", id: "serviceTier", value: "default" },
+    ],
+    "Codex reset with Fast active must reset both reasoningEffort and serviceTier across renders without overwriting"
+  );
+  assert.equal(activeDriver.getOptions().find((o) => o.id === "reasoningEffort")?.value, "medium");
+  assert.equal(activeDriver.getOptions().find((o) => o.id === "serviceTier")?.value, "default");
+
+  // 4c) Claude Opus with high isDefault at index 2 (not index 1) + fastMode true
+  activeDriver = createStatefulTraitsDriver({
+    provider: "claudeAgent",
+    optionDescriptors: [
+      {
+        id: "effort",
+        type: "select",
+        role: "reasoning",
+        promptInjectedValues: ["ultrathink"],
+        options: [
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium" },
+          { id: "high", label: "High", isDefault: true },
+          { id: "max", label: "Max" },
+          { id: "ultrathink", label: "Ultrathink" },
+        ],
+      },
+      { id: "fastMode", type: "boolean", currentValue: false },
+    ],
+    initialOptions: [{ id: "effort", value: "max" }, { id: "fastMode", value: true }],
+  });
+  renderFn = activeDriver.resetRender("claude-opus-4-6", "claude-1");
+  resetTree = renderFn();
+  clickResetBtn(resetTree);
+  resetTree = renderFn();
+  resetTree = renderFn();
+  assert.deepEqual(
+    activeDriver.dispatches,
+    [
+      { kind: "select", id: "effort", value: "high" },
+      { kind: "boolean", id: "fastMode", value: false },
+    ],
+    "Claude Opus reset must pick isDefault=high (index 2) and turn off fastMode"
+  );
+
+  // 4d) Antigravity / ACP descriptor lacking isDefault flags -> uses ctrl.caps.optionDescriptors currentValue
+  activeDriver = createStatefulTraitsDriver({
+    provider: "antigravity",
+    optionDescriptors: [
+      {
+        id: "reasoningEffort",
+        type: "select",
+        role: "reasoning",
+        currentValue: "high",
+        options: [
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium" },
+          { id: "high", label: "High" },
+        ],
+      },
+    ],
+    initialOptions: [{ id: "reasoningEffort", value: "low" }],
+  });
+  renderFn = activeDriver.resetRender("gemini-4-hydrogen", "ag-1");
+  resetTree = renderFn();
+  clickResetBtn(resetTree);
+  assert.deepEqual(
+    activeDriver.dispatches,
+    [{ kind: "select", id: "reasoningEffort", value: "high" }],
+    "ACP model without isDefault must restore catalog currentValue from caps.optionDescriptors"
+  );
+
+  // 4e) OpenCode variant ("t3:default") and Claude boolean thinking toggle (caps currentValue=true)
+  activeDriver = createStatefulTraitsDriver({
+    provider: "opencode",
+    optionDescriptors: [
+      {
+        id: "variant",
+        type: "select",
+        role: "reasoning",
+        options: [
+          { id: "t3:default", label: "Default" },
+          { id: "minimal", label: "Minimal" },
+          { id: "high", label: "High" },
+        ],
+      },
+    ],
+    initialOptions: [{ id: "variant", value: "high" }],
+  });
+  renderFn = activeDriver.resetRender("opencode-model", "oc-1");
+  resetTree = renderFn();
+  clickResetBtn(resetTree);
+  assert.deepEqual(activeDriver.dispatches, [{ kind: "select", id: "variant", value: "t3:default" }]);
+
+  activeDriver = createStatefulTraitsDriver({
+    provider: "claudeAgent",
+    optionDescriptors: [{ id: "thinking", type: "boolean", currentValue: true }],
+    initialOptions: [{ id: "thinking", value: false }],
+  });
+  renderFn = activeDriver.resetRender("claude-haiku-4-5", "claude-1");
+  resetTree = renderFn();
+  clickResetBtn(resetTree);
+  assert.deepEqual(activeDriver.dispatches, [{ kind: "boolean", id: "thinking", value: true }]);
+
+  // 4f) Delayed effort commit (1 extra render before updated effort lands) must wait rather than firing speed prematurely
+  let deferApply = true;
+  const innerDriver = createStatefulTraitsDriver({
+    provider: "codex",
+    optionDescriptors: [
+      {
+        id: "reasoningEffort",
+        type: "select",
+        role: "reasoning",
+        options: [
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium", isDefault: true },
+          { id: "high", label: "High" },
+        ],
+      },
+      {
+        id: "serviceTier",
+        type: "select",
+        options: [
+          { id: "default", label: "Standard", isDefault: true },
+          { id: "fast", label: "Fast" },
+        ],
+      },
+    ],
+    initialOptions: [{ id: "reasoningEffort", value: "high" }, { id: "serviceTier", value: "fast" }],
+  });
+  let deferredPendingCommit = null;
+  const origUseTraits = useModelTraitsImpl;
+  useModelTraitsImpl = () => {
+    const ctrl = innerDriver.buildCtrl();
+    const origChangeSelect = ctrl.changeSelect.bind(ctrl);
+    return {
+      ...ctrl,
+      changeSelect(desc, id) {
+        if (deferApply && desc.id === "reasoningEffort") {
+          innerDriver.dispatches.push({ kind: "select", id: desc.id, value: id });
+          deferredPendingCommit = () => origChangeSelect(desc, id);
+          return;
+        }
+        origChangeSelect(desc, id);
+      },
+    };
+  };
+  renderFn = innerDriver.resetRender("gpt-6.2-sol", "codex");
+  resetTree = renderFn();
+  clickResetBtn(resetTree);
+  assert.equal(innerDriver.dispatches.length, 1, "Initial click only dispatches effort reset");
+  // Frame 1..6: effort still un-committed across many unrelated re-renders -> must NEVER burn retries or fire prematurely
+  for (let frame = 0; frame < 6; frame++) {
+    resetTree = renderFn();
+    assert.equal(innerDriver.dispatches.length, 1, `Speed reset must wait at intermediate frame ${frame + 1} while effortNeedsReset is still true`);
+  }
+  // Commit delayed effort update -> speed reset fires cleanly without stalling at medium + fast
+  deferApply = false;
+  deferredPendingCommit();
+  innerDriver.dispatches.pop();
+  resetTree = renderFn();
+  resetTree = renderFn();
+  assert.deepEqual(innerDriver.dispatches, [
+    { kind: "select", id: "reasoningEffort", value: "medium" },
+    { kind: "select", id: "serviceTier", value: "default" },
+  ]);
+  assert.equal(innerDriver.getOptions().find((o) => o.id === "serviceTier")?.value, "default");
+  useModelTraitsImpl = origUseTraits;
+
+  // 4g) Prompt-injected-only descriptor with no regular options must disable effort reset instead of picking index 0
+  activeDriver = createStatefulTraitsDriver({
+    provider: "claudeAgent",
+    optionDescriptors: [
+      {
+        id: "effort",
+        type: "select",
+        role: "reasoning",
+        promptInjectedValues: ["ultrathink"],
+        options: [{ id: "ultrathink", label: "Ultrathink" }],
+      },
+    ],
+    ultrathinkPromptControlled: true,
+    initialOptions: [],
+  });
+  renderFn = activeDriver.resetRender("claude-sonnet-4-6", "claude-1");
+  resetTree = renderFn();
+  const disabledReset = findNodes(resetTree, (n) => n.type === "button" && n.props && /Reset default effort|恢复默认思考深度/.test(String(n.props["aria-label"] || "")))[0];
+  assert.equal(disabledReset.props["aria-disabled"], "true", "Prompt-injected-only effort must keep reset button disabled");
+  disabledReset.props.onClick();
+  assert.deepEqual(activeDriver.dispatches, [], "Prompt-injected-only effort must not dispatch index 0");
 }
 
 function verifyLinuxSupport(patchedAsarPath) {
@@ -1808,6 +3459,20 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
   const layoutWithoutComposer = newChatLayout.apply(baselineChat);
   assert(layoutWithoutComposer.includes("trailing:(0,$.jsx)(BF,"), "new-chat-layout must preserve trailing permissions when usage-rings is omitted");
 
+  // Verify new-chat-layout binds the Combobox trigger (not an outer TooltipTrigger wrapper) to data-draft-project-trigger
+  const trayStart = layoutWithoutComposer.indexOf("function T3NewChatTray(");
+  assert(trayStart >= 0, "new-chat-layout must emit T3NewChatTray");
+  const traySrc = layoutWithoutComposer.slice(trayStart);
+  const trayTriggers = [...traySrc.matchAll(/\(0,\s*[A-Za-z_$][\w$]*\.jsxs?\)\(([A-Za-z_$][\w$]*),\s*\{\s*render:\s*\(0,\s*[A-Za-z_$][\w$]*\.jsx\)\("button",\s*\{[^}]+\}\),\s*"data-draft-project-trigger":\s*""/g)].map((m) => m[1]);
+  assert.equal(trayTriggers.length, 2, "T3NewChatTray must render both selected and empty project triggers");
+  const comboboxImportLine = baselineChat.match(/import\{([^}]+)\}from"\.\/combobox-[^"]+"/)?.[1] || "";
+  for (const trig of trayTriggers) {
+    assert(
+      new RegExp(`\\bas\\s+${trig.replaceAll("$", "\\$")}\\b`).test(comboboxImportLine),
+      `T3NewChatTray project trigger (${trig}) must come from the combobox chunk, not a TooltipTrigger wrapper`
+    );
+  }
+
   // Verify sidebar-new-chat guards null/negative activeSearchResultIndex
   const mainJs = findUniqueEntry(verifiedAsar, sidebarNewChat.targetRegex, sidebarNewChat.id).content.toString("utf8");
   assert(mainJs.includes('typeof g === "number" && g >= 0 && g < h'));
@@ -1842,8 +3507,9 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
   assert.equal(macParsed.preset, "clean");
   assert.equal(macParsed.input, "/Applications/Custom.app");
   assert.equal(macParsed.flags.has("--shared-data"), true);
-  assert.equal(macosCli.selectMacosPatches(false, { preset: "clean" }).selectedPatches.some((p) => p.id === "macos-user-data"), true);
-  assert.equal(macosCli.selectMacosPatches(true, { preset: "clean" }).selectedPatches.some((p) => p.id === "macos-user-data"), false);
+  const macosCleanPlan = resolveInstallPlan(ALL_PATCHES, { preset: "clean" });
+  assert.equal(macosCli.selectMacosPatches(macosCleanPlan, false).some((p) => p.id === "macos-user-data"), true);
+  assert.equal(macosCli.selectMacosPatches(macosCleanPlan, true).some((p) => p.id === "macos-user-data"), false);
 
   const macTmp = fs.mkdtempSync(path.join(os.tmpdir(), "t3e-mac-test-"));
   try {
@@ -1992,6 +3658,51 @@ function verifySameFileFolding(asar) {
     { wasOpen: false, id: "r1:file-fold" },
     { wasOpen: true, id: "r1:file-fold" },
   ]);
+
+  // Verify T3SameFileGroup falls back to checkpoint net diff stats when individual edits omit diffStr (e.g. Antigravity)
+  const cpGroupRuntime = loadRuntimeModule("timeline-ui").exports.createTimelineRuntime({
+    React: {
+      Fragment: Symbol("Fragment"),
+      use: (ctx) => ctx,
+      useState: (init) => [typeof init === "function" ? init() : init, () => {}],
+      useEffect() {},
+      useMemo: (fn) => fn(),
+    },
+    jsx: (type, props) => ({ type, props: props || {} }),
+    jsxs: (type, props) => ({ type, props: props || {} }),
+    Fragment: Symbol("Fragment"),
+    workGroupCtx: { state: { expandedEntries: new Set() } },
+    timelineCtx: { activeThreadEnvironmentId: "env-1", markdownCwd: "/repo" },
+    useI18n: () => (s) => s,
+    WorkRow: "WorkRow",
+    WorkIcon: "WorkIcon",
+    ChevronRight: "ChevronRight",
+    Timestamp: "Timestamp",
+    WorkEntryRow: "WorkEntryRow",
+    useCheckpointSummaries: () => [{ runId: "turn-4", checkpointTurnCount: 4 }],
+    useCheckpointDiff: () => ({
+      data: { diff: "diff --git a/themes/chatgpt-app.json b/themes/chatgpt-app.json\n--- a/themes/chatgpt-app.json\n+++ b/themes/chatgpt-app.json\n@@ -135 +135 @@\n-old\n+new1\n+new2\n" },
+      isPending: false,
+    }),
+    parseCheckpointDiff: (patch) => {
+      const files = [...String(patch || "").matchAll(/diff --git a\/([^\s]+) b\/([^\s]+)/g)].map((m) => ({ name: m[2] }));
+      return files.length ? { kind: "files", files } : null;
+    },
+  });
+  const cpGroupTree = JSON.stringify(cpGroupRuntime.T3SameFileGroup({
+    group: {
+      id: "e1:file-fold",
+      kind: "edit",
+      filePath: "themes/chatgpt-app.json",
+      entries: [
+        { id: "e1", projectedItem: { sourceThreadId: "t1", item: { type: "file_change", runId: "turn-4" } } },
+        { id: "e2", projectedItem: { sourceThreadId: "t1", item: { type: "file_change", runId: "turn-4" } } },
+      ],
+    },
+    workspaceRoot: "/repo",
+  }));
+  assert.match(cpGroupTree, /"\+2"/);
+  assert.match(cpGroupTree, /"-1"/);
 }
 
 function verifyDesktopTray(desktopAsar) {
@@ -2119,6 +3830,72 @@ function verifyDesktopTray(desktopAsar) {
     assert.equal(quitCount, 1);
     assert.equal(tray.isDestroyed(), true);
     assert.equal(sandbox.t3ShouldHideToTrayOnClose(mockWin), false);
+
+    // Verify Linux (.png icon priority + 22x22 resize for >32px + click listener) and macOS (18x18 resize + no click listener + leave-full-screen before hide)
+    for (const plat of ["linux", "darwin"]) {
+      const resizeCalls = [];
+      const created = [];
+      const platSandbox = {
+        activeLocale: "zh",
+        __dirname: tmpDir,
+        process: { platform: plat },
+        node_fs: fs,
+        node_path: path,
+        electron: {
+          Tray: class {
+            constructor(image) { this.image = image; this.listeners = new Map(); this.destroyed = false; created.push(this); }
+            setToolTip() {}
+            setContextMenu(m) { this.menu = m; }
+            on(ev, fn) { this.listeners.set(ev, fn); }
+            isDestroyed() { return this.destroyed; }
+            destroy() { this.destroyed = true; }
+          },
+          Menu: { buildFromTemplate: (tpl) => tpl },
+          nativeImage: {
+            createFromPath: (p) => ({
+              path: p,
+              isEmpty: () => !p || !p.endsWith(".png"),
+              getSize: () => ({ width: 64, height: 64 }),
+              resize: (opts) => { resizeCalls.push(opts); return { path: p, resized: opts, isEmpty: () => false }; },
+            }),
+          },
+          app: { getPreferredSystemLanguages: () => ["en-US"] },
+        },
+      };
+      runInNewContext(runtimeCode + "\nObject.assign(globalThis, { t3RegisterTrayHooks, t3EnsureTray, t3HideWindowToTray });", platSandbox);
+      const winListeners = new Map();
+      let platVisible = true;
+      let fullScreen = plat === "darwin";
+      const platWin = {
+        isDestroyed: () => false,
+        isVisible: () => platVisible,
+        isMinimized: () => false,
+        isFullScreen: () => fullScreen,
+        once: (ev, fn) => winListeners.set(ev, fn),
+        setFullScreen: (v) => { fullScreen = v; },
+        hide: () => { platVisible = false; },
+      };
+      platSandbox.t3RegisterTrayHooks({
+        environment: { platform: plat, stateDir: tmpDir, displayName: "T3 Code" },
+        iconPaths: { ico: { _tag: "Some", value: "/app/icon.ico" }, png: { _tag: "Some", value: "/app/icon.png" } },
+        getMainWindow: () => platWin,
+        showMainWindow: () => { platVisible = true; },
+      });
+      const platTray = platSandbox.t3EnsureTray();
+      assert(platTray && created.length === 1, `${plat}: tray must initialize`);
+      assert.equal(platTray.image.path, "/app/icon.png", `${plat}: must prefer .png icon`);
+      assert.deepEqual({ ...resizeCalls[0] }, plat === "darwin" ? { width: 18, height: 18 } : { width: 22, height: 22 }, `${plat}: icon resize mismatch`);
+      assert.equal(platTray.listeners.has("click"), plat !== "darwin", `${plat}: click handler expectation mismatch`);
+      platSandbox.t3HideWindowToTray(platWin);
+      if (plat === "darwin") {
+        assert.equal(fullScreen, false, "macOS must exit fullscreen before hiding to tray");
+        assert.equal(platVisible, true, "macOS must wait for leave-full-screen before hide()");
+        winListeners.get("leave-full-screen")();
+        assert.equal(platVisible, false, "macOS window must hide once leave-full-screen emits");
+      } else {
+        assert.equal(platVisible, false, "Linux window must hide immediately");
+      }
+    }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -2134,11 +3911,14 @@ function verifyFilesChangesExplorer(asar) {
   assert(feHost.text.includes(filesChangesExplorer.marker), "Missing files-changes-explorer marker");
   assert(feCode.includes('style: showChangesSplit && !allFilesOpen ? { display: "none" } : undefined'), "All files tree must stay mounted when collapsed");
   assert(feCode.includes('className: "t3e-fe-file-main"'), "Changed file row must expose native button separate from diff badge");
+  assert(feHost.text.includes("expandAllSyncRef:t3FeExpandRef") && feHost.text.includes("t3FeExpandRef.current?.("), "Header expand/collapse-all button must sync changed files tree");
   let gitCalls = 0;
   let treeScans = 0;
   let changesOpen = true;
+  let allFilesOpenState = true;
+  let collapsedDirsState = {};
   let stateCursor = 0;
-  const files = [{ path: "src/file.ts", insertions: 2, deletions: 1 }];
+  const files = [{ path: "src/sub/file.ts", insertions: 2, deletions: 1 }];
   files[Symbol.iterator] = function () {
     treeScans++;
     return Array.prototype[Symbol.iterator].call(this);
@@ -2148,7 +3928,13 @@ function verifyFilesChangesExplorer(asar) {
   const { t3BuildChangedFileTree, T3FeChangedTreeNodes, T3FilesChangesLayout } = loadRuntimeModule("files-explorer-ui").exports.createFilesExplorerRuntime({
     React: {
       Fragment: Symbol("Fragment"),
-      useState: (i) => [stateCursor++ === 0 ? changesOpen : i, () => {}],
+      useState: (i) => {
+        const idx = stateCursor++;
+        if (idx === 0) return [changesOpen, (v) => { changesOpen = typeof v === "function" ? v(changesOpen) : v; }];
+        if (idx === 1) return [allFilesOpenState, (v) => { allFilesOpenState = typeof v === "function" ? v(allFilesOpenState) : v; }];
+        if (idx === 2) return [collapsedDirsState, (v) => { collapsedDirsState = typeof v === "function" ? v(collapsedDirsState) : v; }];
+        return [i, () => {}];
+      },
       useEffect() {},
       useMemo: (f) => f(),
     },
@@ -2184,13 +3970,86 @@ function verifyFilesChangesExplorer(asar) {
   assert.equal(gitCalls, 0, "No Git status lookup without a thread that can open the Changes panel");
   stateCursor = 0;
   const threadRef = { environmentId: "env", threadId: "thread" };
-  T3FilesChangesLayout({ ...props, threadRef });
+  const expandAllSyncRef = { current: null };
+  T3FilesChangesLayout({ ...props, threadRef, expandAllSyncRef });
   assert.equal(gitCalls, 1);
   assert.equal(treeScans, 1);
+  assert.equal(typeof expandAllSyncRef.current, "function", "T3FilesChangesLayout must register expandAllSyncRef callback");
+  expandAllSyncRef.current(false);
+  assert.deepEqual({ ...collapsedDirsState }, { src: true, "src/sub": true }, "Collapse all must collapse all changed-file folders");
+  changesOpen = false;
+  expandAllSyncRef.current(true);
+  assert.equal(changesOpen, true, "Expand all must reopen changed-files section");
+  assert.deepEqual({ ...collapsedDirsState }, {}, "Expand all must clear collapsed changed-file folders");
   changesOpen = false;
   stateCursor = 0;
   T3FilesChangesLayout({ ...props, threadRef });
   assert.equal(treeScans, 1, "A collapsed changes pane skips rebuilding its file tree");
+  assert(
+    feHost.text.includes("data-item-flattened-subitems"),
+    "FilePreviewPanel must inject flattened-directory alignment CSS into @pierre/trees unsafeCSS"
+  );
+  // Verify all runtime fallback style injectors prepend instead of clobbering active theme Layer 3 CSS
+  for (const modName of ["inline-diff-ui", "files-explorer-ui", "timeline-ui", "floating-panels-ui", "usage-rings-ui"]) {
+    const src = fs.readFileSync(path.join(__dirname, "..", "lib", "runtime", modName + ".mjs"), "utf8");
+    assert(src.includes("document.head.prepend"), `${modName}.mjs must prepend fallback styles so theme Layer 3 takes precedence`);
+  }
+  const themeJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "themes", "chatgpt-app.json"), "utf8"));
+  assert(
+    themeJson.css.includes('[data-work-entry-id] > div:first-child[role="button"]') &&
+      themeJson.css.includes('[data-work-entry-id] > div > div.pb-2:not(.ms-7):not(:has(> .t3e-diff-card))'),
+    "themes/chatgpt-app.json Layer 2.2 must support 0.1.12 WorkRow nested toggle and detail wrappers"
+  );
+  assert(
+    !themeJson.css.includes("--chat-content-max-width: 48rem") &&
+      themeJson.css.includes('[data-testid="timeline-minimap"]'),
+    "themes/chatgpt-app.json must preserve native chat lane gutter and keep timeline-minimap visible"
+  );
+  assert(
+    themeJson.css.includes('[data-panel-layout-controls] :is(button, [data-slot="toggle"]):is([data-pressed], [aria-pressed="true"])') &&
+      !themeJson.css.includes('[data-surface-subheader]:has([data-file-breadcrumbs]) button[aria-pressed="true"] {\n  background: var(--cx-accent-soft)'),
+    "themes/chatgpt-app.json must style active topbar layout toggles in neutral gray"
+  );
+  assert(
+    themeJson.css.includes('[data-file-breadcrumbs] [data-slot="scroll-area-viewport"]') &&
+      themeJson.css.includes("direction: rtl !important;") &&
+      themeJson.css.includes("margin-inline: auto !important;") &&
+      themeJson.css.includes('[data-current-file-crumb="true"] span') &&
+      themeJson.css.includes("max-width: none !important;") &&
+      themeJson.css.includes("min-width: max-content !important;"),
+    "themes/chatgpt-app.json must center bounded file breadcrumbs, keep full current filename, and never clip the editor split button"
+  );
+  assert(
+    themeJson.css.includes('[data-slot="sidebar-rail"]') &&
+      themeJson.css.includes("top: calc(var(--workspace-topbar-height, 38px) + 14px) !important;"),
+    "themes/chatgpt-app.json must keep sidebar-rail below the top window bar and curved sheet corner"
+  );
+  assert(
+    themeJson.css.includes("1.6 Unified ChatGPT inputs") &&
+      themeJson.css.includes('[data-slot="input-control"][class*="border-input"]') &&
+      themeJson.css.includes('[data-slot="input-group"][class*="border-input"]') &&
+      themeJson.css.includes('[data-slot="textarea-control"][class*="border-input"]') &&
+      themeJson.css.includes('[data-slot="select-trigger"][class*="border-input"]') &&
+      themeJson.css.includes('[data-slot="number-field-group"][class*="border-input"]') &&
+      themeJson.css.includes(':where(') &&
+      themeJson.css.includes('.t3e-sb-search-box [data-slot="input-control"]'),
+    "themes/chatgpt-app.json must unify default inputs/textareas/selects/number fields with low-specificity :where() and reset sidebar nested input control"
+  );
+  for (const m of themeJson.css.matchAll(/:has\(/g)) {
+    let depth = 0;
+    let end = m.index + 5;
+    for (; end < themeJson.css.length; end++) {
+      if (themeJson.css[end] === "(") depth++;
+      else if (themeJson.css[end] === ")") {
+        if (depth === 0) break;
+        depth--;
+      }
+    }
+    assert(
+      !themeJson.css.slice(m.index + 5, end).includes(":has("),
+      `Nested :has() is invalid CSS and dropped by Chromium: ${themeJson.css.slice(Math.max(0, m.index - 40), end + 20)}`
+    );
+  }
 }
 
 function verifyNoTelemetryDesktop(desktopAsar) {
@@ -2223,7 +4082,10 @@ function verifyNoTelemetryDesktop(desktopAsar) {
   assert.equal(registrations.length, 1, "onBeforeRequest must be registered exactly once");
   const urls = [...registrations[0].filter.urls];
   assert(urls.some((u) => u.includes("posthog.com")), "PostHog URL filter missing");
+  assert(urls.some((u) => u.includes("ingest.t3.codes")), "T3 Code PostHog ingest URL filter missing");
   assert(urls.some((u) => u.includes("axiom.co")), "Axiom URL filter missing");
+  assert(urls.some((u) => u.includes("clerk-telemetry.com")), "Clerk telemetry URL filter missing");
+  assert(patch.legacyMarkers.includes("T3_NO_TELEMETRY_DESKTOP_V1"), "Legacy V1 desktop telemetry marker must stay recognized");
   let verdict = null;
   registrations[0].handler({ url: "https://us.i.posthog.com/e/" }, (result) => { verdict = result; });
   assert.deepEqual({ ...verdict }, { cancel: true }, "Telemetry requests must be cancelled");
@@ -2251,6 +4113,70 @@ function packAsarHeader(header) {
   [4, 8 + padded, 4 + padded, json.length].forEach((size, i) => prefix.writeUInt32LE(size, i * 4));
   json.copy(prefix, 16);
   return prefix;
+}
+
+const SLIM_EXTRA_CHUNKS_RE = /^apps\/server\/dist\/client\/assets\/(?:vcs|query|diffPanelStore|rightPanelStore|entities|queries|diffRendering|observeIntersection|useOpenLink)-[\w-]+\.js$/;
+
+// Build a slim real-content ASAR containing only package metadata, patch target chunks, their
+// 1-hop relative imports (+ export * re-exports), and ensureChunkImport sibling chunks.
+// Preserves 100% real T3 Code JS content & SHA-256 entry integrity while avoiding ~245 MB of
+// unrelated node_modules/media I/O during Suite 17/18 stress builds.
+function createSlimAsar(baseAsar, patches, outputPath) {
+  const keys = new Set();
+  for (const meta of ["package.json", "apps/server/package.json", "apps/desktop/package.json"]) {
+    if (baseAsar.byKey.has(meta)) keys.add(meta);
+  }
+  const targetKeys = [];
+  for (const p of patches) {
+    try {
+      const target = findPatchTarget(baseAsar, p);
+      if (target && !keys.has(target.key)) {
+        keys.add(target.key);
+        targetKeys.push(target.key);
+      }
+    } catch {}
+  }
+  for (const rec of baseAsar.entries) {
+    if (SLIM_EXTRA_CHUNKS_RE.test(rec.key)) keys.add(rec.key);
+  }
+  for (const k of targetKeys) {
+    const rec = baseAsar.byKey.get(k);
+    if (!rec) continue;
+    const text = entryText(baseAsar, rec);
+    for (const imp of parseImports(tokenize(text))) {
+      if (!imp.specifier.startsWith(".")) continue;
+      const depKey = resolveRelativeKey(k, imp.specifier);
+      if (baseAsar.byKey.has(depKey) && !keys.has(depKey)) {
+        keys.add(depKey);
+        const depText = entryText(baseAsar, baseAsar.byKey.get(depKey));
+        for (const m of depText.matchAll(/export\s*\*\s*from\s*["'](\.[^"']+)["']/g)) {
+          const reKey = resolveRelativeKey(depKey, m[1]);
+          if (baseAsar.byKey.has(reKey)) keys.add(reKey);
+        }
+      }
+    }
+  }
+  const header = { files: {} };
+  const chunks = [];
+  let offset = 0;
+  for (const key of keys) {
+    const rec = baseAsar.byKey.get(key);
+    const buf = readEntryBuffer(baseAsar, rec);
+    const parts = key.split("/");
+    let node = header;
+    for (let i = 0; i < parts.length - 1; i++) {
+      node = node.files[parts[i]] ||= { files: {} };
+    }
+    node.files[parts[parts.length - 1]] = {
+      size: buf.length,
+      offset: String(offset),
+      integrity: rec.entry.integrity,
+    };
+    chunks.push(buf);
+    offset += buf.length;
+  }
+  fs.writeFileSync(outputPath, Buffer.concat([packAsarHeader(header), ...chunks]));
+  return { path: outputPath, asar: readAsar(outputPath) };
 }
 
 function moveHeaderEntry(header, fromKey, toKey) {
@@ -2362,6 +4288,40 @@ function createServerMutant(baseAsar, outputPath) {
     return out;
   });
   const sibling = (key, name) => `${path.posix.dirname(key)}/${name}`;
+  // Rename actual exported + imported alias (useModelTraits in utils-*.js) to ensure cross-chunk semantic export/import resolution survives minifier alias shifts
+  const threadText = readEntryBuffer(baseAsar, baseAsar.byKey.get(threadRoute)).toString("utf8");
+  const utilsImp = [...threadText.matchAll(/import\s*\{([^}]+)\}\s*from\s*"\.\/(utils-[\w.-]+\.js)"/g)][0];
+  let mutatedUtilsKey = null;
+  if (utilsImp) {
+    mutatedUtilsKey = sibling(threadRoute, utilsImp[2]);
+    const utilsRec = baseAsar.byKey.get(mutatedUtilsKey);
+    const utilsText = utilsRec ? readEntryBuffer(baseAsar, utilsRec).toString("utf8") : "";
+    const ctx = createPatchContext(baseAsar, baseAsar.byKey.get(threadRoute), threadText);
+    const traitsRes = ctx.resolveImportedAlias(
+      /utils-.*\.js$/,
+      (_l, _t, _e, decl) => {
+        const d = decl(_l);
+        return Boolean(d && d.includes("selectValue:") && d.includes("changeSelect:") && d.includes("changeBoolean:"));
+      },
+      "mutant-useModelTraits"
+    );
+    const expMatchRe = traitsRes?.imported ? new RegExp(`\\bas\\s+${traitsRes.imported}(?=[,}])`) : null;
+    const expIdx = utilsText.lastIndexOf("export{");
+    if (expMatchRe && expIdx >= 0 && expMatchRe.test(utilsText.slice(expIdx)) && traitsRes.imported !== traitsRes.local) {
+      const renamedExport = `${traitsRes.imported}_M99`;
+      const renamedLocal = `${traitsRes.local}_M99`;
+      add(mutatedUtilsKey, (u) => {
+        const ei = u.lastIndexOf("export{");
+        return u.slice(0, ei) + u.slice(ei).replace(expMatchRe, `as ${renamedExport}`);
+      });
+      add(threadRoute, (t) =>
+        renameIdentifier(t, traitsRes.local, renamedLocal).replace(
+          new RegExp(`\\b${traitsRes.imported}\\s+as\\s+${renamedLocal}(?=[,}])`),
+          `${renamedExport} as ${renamedLocal}`
+        )
+      );
+    }
+  }
   const renames = [
     [runtimeLayer, sibling(runtimeLayer, "runtimeLayer-MUT99999.mjs")],
     [workflow, sibling(workflow, "WorkflowStore-MUT99999.mjs")],
@@ -2371,7 +4331,7 @@ function createServerMutant(baseAsar, outputPath) {
 }
 
 function createDesktopMutant(baseAsar, outputPath) {
-  const patches = applicablePatchesForArchive(baseAsar, ALL_PATCHES);
+  const patches = applicablePatchesForArchive(baseAsar, [noTelemetry.desktopPatch, desktopTray]);
   const edits = new Map([
     ["package.json", [bumpVersion]],
     [DESKTOP_MAIN_KEY, [
@@ -2425,12 +4385,26 @@ function verifyCrossVersionMutation(serverBaseline, desktopBaseline) {
     // 17.1 Mutated v0.1.99 server archive: renamed chunks, renamed minified identifiers, shifted memo slots.
     const serverMutant = createServerMutant(serverBaseline.asar, path.join(tmpRoot, "server-0.1.99.asar"));
     const mutantInspected = inspectArchive(serverMutant.path);
-    assertAutoAdapted(mutantInspected, 17, "server mutant");
+    assertAutoAdapted(mutantInspected, serverMutant.patches.length, "server mutant");
     const byId = new Map(mutantInspected.modules.map((m) => [m.id, m]));
     assert(byId.get("no-telemetry").key.endsWith("/runtimeLayer-MUT99999.mjs"), "runtimeLayer must be found through its semantic fingerprint after a hash rename");
     assert(byId.get("no-telemetry-relay").key.endsWith("/WorkflowStore-MUT99999.mjs"));
     assert(byId.get("no-telemetry-ui").key.endsWith("/SettingsPanels-MUT99999.js"));
     assert(/\/ThreadRouteView-[\w-]+\.js$/.test(byId.get("usage-rings").key));
+
+    // Sibling helper inserted between AnalyticsService make$... declaration and effect(AnalyticsService, ...) must survive no-telemetry patching
+    const rtEntry = findUniqueEntry(serverBaseline.asar, noTelemetry.targetRegex, "no-telemetry-sibling-test");
+    const rtOrig = rtEntry.content.toString("utf8");
+    const rtEffectMatch = rtOrig.match(/const\s+[A-Za-z_$][\w$]*\s*=\s*effect\(\s*AnalyticsService\s*,\s*[A-Za-z_$][\w$]*\s*\);/);
+    assert(rtEffectMatch);
+    const rtWithSibling = rtOrig.slice(0, rtEffectMatch.index) +
+      "const t3SiblingKeepHelper = () => 42;\nfunction t3UseSiblingHelper() { return t3SiblingKeepHelper(); }\n" +
+      rtOrig.slice(rtEffectMatch.index);
+    const rtPatchedWithSibling = noTelemetry.apply(rtWithSibling, createPatchContext(serverBaseline.asar, rtEntry, rtWithSibling));
+    assert(
+      rtPatchedWithSibling.includes("t3SiblingKeepHelper") && rtPatchedWithSibling.includes("t3UseSiblingHelper"),
+      "no-telemetry patch must only replace the make declaration and preserve sibling code before effect(AnalyticsService, ...)"
+    );
 
     const patchedServerPath = path.join(tmpRoot, "server-0.1.99.patched.asar");
     const serverReport = buildPatchedArchive(serverMutant.asar, adaptablePatches(serverMutant.patches), patchedServerPath);
@@ -2438,20 +4412,110 @@ function verifyCrossVersionMutation(serverBaseline, desktopBaseline) {
     assert(serverReport.every((r) => r.compat === "auto-adapted" && r.appVersion === MUTANT_VERSION), "Every mutated module must be built through auto-adaptation");
     const patchedServer = inspectArchive(patchedServerPath);
     assert.equal(patchedServer.appVersion, MUTANT_VERSION);
+    assert.equal(patchedServer.enhancerVersion, require("../lib/version.cjs").ENHANCER_VERSION, "Patched ASAR must persist standardized enhancerVersion");
+    assert.equal(getArchiveCompatibilityTier(patchedServer).tier, "auto-adapted", "Patched auto-adapted ASAR must persist auto-adapted tier in t3e-build-meta.json");
     assert.equal(summarizeModuleStates(patchedServer.modules.filter((m) => !hashOnlyPatchIds.has(m.id))).allInstalled, true, "Patched v0.1.99 server must report allInstalled");
     verifyRuntimeAssets(patchedServer.asar, ["timeline-ui", "inline-diff-ui", "usage-rings-ui", "files-explorer-ui"]);
+
+    // Verify ESM import linking checks final patched replacements (not stale baseline) & enforces default imports + wildcard re-exports
+    const modKeyA = "apps/server/dist/esm-mod-a.js";
+    const modKeyB = "apps/server/dist/esm-mod-b.js";
+    const modKeyC = "apps/server/dist/esm-mod-c.js";
+    const fixtureWithModsPath = path.join(tmpRoot, "esm-fixture-mods.asar");
+    writePatchedAsar(desktopBaseline.asar, [], fixtureWithModsPath, [
+      { key: modKeyA, content: Buffer.from('import defVal, { keepMe } from "./esm-mod-b.js";\nexport function runA() { return defVal() + keepMe(); }\n') },
+      { key: modKeyB, content: Buffer.from('export default function bDef() { return 1; }\nexport function keepMe() { return 2; }\nexport * from "./esm-mod-c.js";\n') },
+      { key: modKeyC, content: Buffer.from('export async function extraAsync() { return 3; }\nexport const firstV = 1, secondV = 2;\nexport * as nsC from "./esm-mod-b.js";\n') },
+    ]);
+    const modFixture = readAsar(fixtureWithModsPath);
+    // Patch B removes default export -> buildPatchedArchive must catch missing default import in patched A
+    const esmBadOut = path.join(tmpRoot, "esm-bad-default.asar");
+    assert.throws(
+      () => buildPatchedArchive(modFixture, [
+        {
+          id: "esm-a",
+          name: "esm-a",
+          marker: "T3_ESM_A",
+          legacyMarkers: [],
+          targetRegex: /^apps\/server\/dist\/esm-mod-a\.js$/,
+          targetSpec: { pathRegex: /^apps\/server\/dist\/esm-mod-a\.js$/, includes: ["keepMe"] },
+          originalHash: "0".repeat(64),
+          apply: (s) => `/* T3_ESM_A */\n${s}`,
+        },
+        {
+          id: "esm-b",
+          name: "esm-b",
+          marker: "T3_ESM_B",
+          legacyMarkers: [],
+          targetRegex: /^apps\/server\/dist\/esm-mod-b\.js$/,
+          targetSpec: { pathRegex: /^apps\/server\/dist\/esm-mod-b\.js$/, includes: ["bDef"] },
+          originalHash: "0".repeat(64),
+          apply: (s) => `/* T3_ESM_B */\n` + s.replace("export default function bDef() { return 1; }\n", ""),
+        },
+      ], esmBadOut),
+      /import "default" from \.\/esm-mod-b\.js/,
+      "buildPatchedArchive must verify default imports against final patched replacement modules"
+    );
+    assert(!fs.existsSync(esmBadOut));
+    // Positive check: patched A imports newly added export async fn + multi-var export through wildcard re-export & updated replacement B
+    const esmGoodOut = path.join(tmpRoot, "esm-good-link.asar");
+    buildPatchedArchive(modFixture, [
+      {
+        id: "esm-a",
+        name: "esm-a",
+        marker: "T3_ESM_A",
+        legacyMarkers: [],
+        targetRegex: /^apps\/server\/dist\/esm-mod-a\.js$/,
+        targetSpec: { pathRegex: /^apps\/server\/dist\/esm-mod-a\.js$/, includes: ["keepMe"] },
+        originalHash: "0".repeat(64),
+        apply: () => '/* T3_ESM_A */\nimport defVal, { extraAsync, secondV, newlyAdded } from "./esm-mod-b.js";\nexport function runA() { return [defVal, extraAsync, secondV, newlyAdded]; }\n',
+      },
+      {
+        id: "esm-b",
+        name: "esm-b",
+        marker: "T3_ESM_B",
+        legacyMarkers: [],
+        targetRegex: /^apps\/server\/dist\/esm-mod-b\.js$/,
+        targetSpec: { pathRegex: /^apps\/server\/dist\/esm-mod-b\.js$/, includes: ["bDef"] },
+        originalHash: "0".repeat(64),
+        apply: (s) => `/* T3_ESM_B */\nexport const newlyAdded = 9;\n${s}`,
+      },
+    ], esmGoodOut);
+    assert(fs.existsSync(esmGoodOut), "buildPatchedArchive must resolve newly added replacement exports, export async fn, comma declarators, and export *");
+    fs.unlinkSync(esmGoodOut);
+
+    // Missing/corrupt external runtime asset must mark host patch as outdated/invalid rather than installed
+    const corruptRtPath = path.join(tmpRoot, "server-corrupt-rt.asar");
+    const brokenRuntimeMod = patchedServer.asar.entries.find((e) => /\/t3e-usage-rings-ui-[0-9a-f]{8}\.js$/.test(e.key));
+    assert(brokenRuntimeMod, "Must emit t3e-usage-rings-ui runtime asset");
+    writePatchedAsar(patchedServer.asar, [{ key: brokenRuntimeMod.key, replacement: Buffer.from("export function corrupted() {}\n") }], corruptRtPath);
+    const brokenInspect = inspectArchive(corruptRtPath);
+    const brokenUsageMod = brokenInspect.modules.find((m) => m.id === "usage-rings");
+    assert.equal(brokenUsageMod.installed, false, "Tampered runtime asset must invalidate usage-rings installed status");
+    assert.equal(brokenUsageMod.outdated, true, "Tampered runtime asset must flag usage-rings as needing upgrade/repair");
+
+    // Unresolvable fixed dependency alias in ThreadRouteView must fail explicitly instead of silently emitting broken bridge bindings
+    const trEntry = findUniqueEntry(serverBaseline.asar, usageRings.targetRegex, "usage-rings-neg");
+    const brokenImportSrc = trEntry.content.toString("utf8").replace("qr as ", "MISSING_ALIAS as ");
+    assert.throws(
+      () => usageRings.apply(brokenImportSrc, createPatchContext(serverBaseline.asar, trEntry, brokenImportSrc)),
+      /Could not resolve Tooltip \(qr\) from utils/,
+      "Broken fixed export alias must throw explicit diagnostic error"
+    );
     const telemetryChunk = findUniqueEntry(patchedServer.asar, /\/runtimeLayer-MUT99999\.mjs$/, "mutated runtimeLayer").content.toString("utf8");
     assert(telemetryChunk.includes("const make$999 = gen$1(function* () {\n\t/* T3_NO_TELEMETRY_V1 */"), "Renamed AnalyticsService make$999 must be stubbed");
     assert(telemetryChunk.includes("BoolCfg$99(\"T3CODE_TELEMETRY_ENABLED\").pipe(withDefault(false))"), "Renamed Boolean$1 config helper must keep the default-off telemetry flag");
 
     // 17.1 Mutated v0.1.99 desktop archive (make$93 -> make$91).
     const desktopMutant = createDesktopMutant(desktopBaseline.asar, path.join(tmpRoot, "app-0.1.99.asar"));
-    assertAutoAdapted(inspectArchive(desktopMutant.path), 2, "desktop mutant");
+    assertAutoAdapted(inspectArchive(desktopMutant.path, desktopMutant.patches), desktopMutant.patches.length, "desktop mutant");
     const patchedDesktopPath = path.join(tmpRoot, "app-0.1.99.patched.asar");
-    const desktopReport = buildPatchedArchive(desktopMutant.asar, desktopMutant.patches, patchedDesktopPath);
-    assert.deepEqual(desktopReport.map((r) => r.id), ["no-telemetry-desktop", "desktop-tray"]);
+    const desktopAdaptPatches = adaptablePatches(desktopMutant.patches);
+    const desktopReport = buildPatchedArchive(desktopMutant.asar, desktopAdaptPatches, patchedDesktopPath);
+    assert.deepEqual(desktopReport.map((r) => r.id), desktopAdaptPatches.map((p) => p.id));
+    assert(desktopReport.some((r) => r.id === "no-telemetry-desktop") && desktopReport.some((r) => r.id === "desktop-tray"));
     assert(desktopReport.every((r) => r.compat === "auto-adapted"));
-    const patchedDesktop = inspectArchive(patchedDesktopPath);
+    const patchedDesktop = inspectArchive(patchedDesktopPath, desktopMutant.patches);
     assert.equal(summarizeModuleStates(patchedDesktop.modules).allInstalled, true, "Patched v0.1.99 desktop must report allInstalled");
     verifyNoTelemetryDesktop(patchedDesktop.asar);
     verifyDesktopTray(patchedDesktop.asar);
@@ -2464,10 +4528,10 @@ function verifyCrossVersionMutation(serverBaseline, desktopBaseline) {
     assert.equal(pristineServer.path, serverMutant.path, "A pristine v0.1.99 source is its own baseline");
     assert.equal(pristineServer.appVersion, MUTANT_VERSION);
     assert.throws(() => resolvePristineBaseline(mismatchPaths(patchedServerPath, serverBaseline.path), serverPatchSet), /找不到未修改的原版 T3 Code 0\.1\.99/, "A patched v0.1.99 source must not fall back to the v0.1.12 backup");
-    const pristineDesktop = resolvePristineBaseline(mismatchPaths(desktopMutant.path, desktopBaseline.path));
+    const pristineDesktop = resolvePristineBaseline(mismatchPaths(desktopMutant.path, desktopBaseline.path), desktopMutant.patches);
     assert.equal(pristineDesktop.path, desktopMutant.path);
-    assert.throws(() => resolvePristineBaseline(mismatchPaths(patchedDesktopPath, desktopBaseline.path)), /找不到未修改的原版 T3 Code 0\.1\.99/);
-    const matchingBackup = resolvePristineBaseline(mismatchPaths(patchedDesktopPath, desktopMutant.path));
+    assert.throws(() => resolvePristineBaseline(mismatchPaths(patchedDesktopPath, desktopBaseline.path), desktopMutant.patches), /找不到未修改的原版 T3 Code 0\.1\.99/);
+    const matchingBackup = resolvePristineBaseline(mismatchPaths(patchedDesktopPath, desktopMutant.path), desktopMutant.patches);
     assert.equal(matchingBackup.path, desktopMutant.path, "A same-version v0.1.99 backup is the correct baseline");
     assert.equal(matchingBackup.appVersion, MUTANT_VERSION);
 
@@ -2522,7 +4586,12 @@ function verifyCrossVersionMutation(serverBaseline, desktopBaseline) {
   }
 }
 
-if (process.argv[2] === "--unit") {
+const cliArgs = process.argv.slice(2);
+const flagUnit = cliArgs.includes("--unit");
+const flagFull = cliArgs.includes("--full");
+const explicitSource = cliArgs.find((arg) => !arg.startsWith("-")) || null;
+
+if (flagUnit) {
   console.log("\nUNIT TESTS PASSED.");
   return;
 }
@@ -2543,7 +4612,7 @@ function findDefaultVerifyAsar() {
   }
   return candidates.find((p) => p && fs.existsSync(p));
 }
-const source = process.argv[2] || findDefaultVerifyAsar();
+const source = explicitSource || findDefaultVerifyAsar();
 assert(source, "请提供原版 ASAR：node tests/verify.cjs <app.asar|server.asar>");
 const baseline = resolvePristineBaseline({
   source,
@@ -2553,6 +4622,9 @@ const baseline = resolvePristineBaseline({
 const siblingAppAsar = path.basename(source) === "server.asar"
   ? path.join(path.dirname(source), "app.asar")
   : null;
+const isCombinedInput =
+  baseline.asar.entries.some((e) => e.key.startsWith("apps/server/")) &&
+  baseline.asar.entries.some((e) => e.key === "apps/desktop/dist-electron/main.cjs");
 // Cross-version architecture: 19 patches = 17 server + 2 desktop (no-telemetry-desktop in privacy, desktop-tray in workspace).
 const desktopPatches = [noTelemetry.desktopPatch, desktopTray];
 assert(noTelemetry.desktopPatch, "no-telemetry must export the desktopPatch");
@@ -2560,16 +4632,22 @@ assert.equal(ALL_PATCHES.length, 19, "ALL_PATCHES must contain 17 server + 2 des
 assert.deepEqual(ALL_PATCHES.filter((p) => p.targetRegex.test("apps/desktop/dist-electron/main.cjs")).map((p) => p.id), ["no-telemetry-desktop", "desktop-tray"]);
 assert.equal(ALL_PATCHES.filter((p) => !p.targetRegex.test("apps/desktop/dist-electron/main.cjs")).length, 17);
 assert.deepEqual(PACKS.find((p) => p.id === "privacy").patchIds, ["no-telemetry", "no-telemetry-relay", "no-telemetry-client", "no-telemetry-ui", "no-telemetry-desktop"]);
-assert.equal(applicablePatchesForArchive(baseline.asar, ALL_PATCHES).length, 17, "server.asar must receive exactly the 17 server patches");
-const desktopBaseline = siblingAppAsar && fs.existsSync(siblingAppAsar)
-  ? resolvePristineBaseline({
-      source: siblingAppAsar,
-      backup: siblingAppAsar + ".before-t3code-enhancer",
-      legacyBackup: siblingAppAsar + ".before-timeline-collapse",
-    }, desktopPatches)
-  : null;
+assert.equal(
+  applicablePatchesForArchive(baseline.asar, ALL_PATCHES).length,
+  isCombinedInput ? 19 : 17,
+  isCombinedInput ? "Combined app.asar must receive all 19 patches" : "server.asar must receive exactly the 17 server patches"
+);
+const desktopBaseline = isCombinedInput
+  ? baseline
+  : (siblingAppAsar && fs.existsSync(siblingAppAsar)
+      ? resolvePristineBaseline({
+          source: siblingAppAsar,
+          backup: siblingAppAsar + ".before-t3code-enhancer",
+          legacyBackup: siblingAppAsar + ".before-timeline-collapse",
+        }, desktopPatches)
+      : null);
 const tmpOut = path.join(os.tmpdir(), `t3code-enhancer-test-${Date.now()}.asar`);
-const tmpDesktopOut = desktopBaseline ? path.join(os.tmpdir(), `t3code-enhancer-desktop-test-${Date.now()}.asar`) : null;
+const tmpDesktopOut = !isCombinedInput && desktopBaseline ? path.join(os.tmpdir(), `t3code-enhancer-desktop-test-${Date.now()}.asar`) : null;
 try {
   const baselineApplicable = applicablePatchesForArchive(baseline.asar, ALL_PATCHES);
   const report = buildPatchedArchive(baseline.asar, baselineApplicable, tmpOut);
@@ -2633,13 +4711,305 @@ try {
   console.log("16. Verifying files-changes-explorer tree normalization, search expand, and DOM structure...");
   verifyFilesChangesExplorer(verified);
   console.log("   OK");
-  console.log("17. Cross-Version Mutation & Auto-Adaptation Stress Test (synthetic v0.1.99 server + desktop archives)...");
-  assert(desktopBaseline, "Suite 17 needs the sibling app.asar next to server.asar");
-  verifyCrossVersionMutation(baseline, desktopBaseline);
-  console.log("   OK");
+  if (flagFull) {
+    assert(desktopBaseline, "Suite 17/18 needs the sibling app.asar next to server.asar");
+    const slimDir = fs.mkdtempSync(path.join(os.tmpdir(), "t3e-slim-"));
+    try {
+      const slimServer = createSlimAsar(baseline.asar, ALL_PATCHES, path.join(slimDir, "server-slim.asar"));
+      const slimDesktop = isCombinedInput
+        ? slimServer
+        : createSlimAsar(desktopBaseline.asar, macosCli.PATCHES, path.join(slimDir, "app-slim.asar"));
+      console.log("17. Cross-Version Mutation & Auto-Adaptation Stress Test (synthetic v0.1.99 server + desktop archives)...");
+      verifyCrossVersionMutation(slimServer, slimDesktop);
+      console.log("   OK");
+      console.log("18. Cross-platform (Windows dual-ASAR CLI transaction + Linux/macOS combined single-ASAR builds)...");
+      verifyCrossPlatformArchivesAndTransactions(slimServer, slimDesktop);
+      console.log("   OK");
+    } finally {
+      fs.rmSync(slimDir, { recursive: true, force: true });
+    }
+  } else {
+    console.log("   (Skipping heavy cross-version & transaction stress suites 17-18; run `npm run test:full` when needed)");
+  }
 } finally {
   if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
   if (tmpDesktopOut && fs.existsSync(tmpDesktopOut)) fs.unlinkSync(tmpDesktopOut);
+}
+
+function verifyCrossPlatformArchivesAndTransactions(serverBaseline, desktopBaseline) {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "t3e-xplat-"));
+  try {
+    // A. Compose macos-user-data + desktop-tray + no-telemetry-desktop on real 0.1.12 desktop main.cjs
+    const desktopHasServer = desktopBaseline.asar.entries.some((e) => e.key.startsWith("apps/server/"));
+    const macDeskOut = path.join(tmpRoot, "mac-desktop-only.asar");
+    const macDeskReport = buildPatchedArchive(
+      desktopBaseline.asar,
+      [noTelemetry.desktopPatch, desktopTray, macosCli.userDataPatch],
+      macDeskOut
+    );
+    assert.deepEqual(macDeskReport.map((r) => r.id), ["no-telemetry-desktop", "desktop-tray", "macos-user-data"]);
+    const macDeskOnlyCheck = inspectArchive(macDeskOut, [noTelemetry.desktopPatch, desktopTray, macosCli.userDataPatch]);
+    assert.equal(summarizeModuleStates(macDeskOnlyCheck.modules).allInstalled, true);
+    if (!desktopHasServer) {
+      const macDeskInspected = macosCli.inspectMacosModules(macDeskOut, false);
+      assert.equal(macDeskInspected.summary.allInstalled, true);
+      assert.equal(macDeskInspected.summary.autoAdapted, false);
+    }
+    const macDeskAsar = readAsar(macDeskOut);
+    verifyNoTelemetryDesktop(macDeskAsar);
+    verifyDesktopTray(macDeskAsar);
+
+    // B. Build synthetic combined Linux & macOS single-ASAR bundle (apps/server/* + apps/desktop/* inside app.asar)
+    const combinedRawPath = path.join(tmpRoot, "combined-raw.asar");
+    if (desktopHasServer) {
+      fs.copyFileSync(desktopBaseline.path, combinedRawPath);
+    } else {
+      const serverAdditions = serverBaseline.asar.entries
+        .filter((e) => e.key.startsWith("apps/server/"))
+        .map((e) => ({ key: e.key, content: readEntryBuffer(serverBaseline.asar, e) }));
+      writePatchedAsar(desktopBaseline.asar, [], combinedRawPath, serverAdditions);
+    }
+    const combinedRaw = readAsar(combinedRawPath);
+
+    // B1. Linux combined ASAR receives all 19 ALL_PATCHES (17 server + 2 desktop) + all 6 external runtime assets
+    const linuxCombinedOut = path.join(tmpRoot, "linux-combined.asar");
+    const linuxPatches = applicablePatchesForArchive(combinedRaw, ALL_PATCHES);
+    assert.equal(linuxPatches.length, 19, "Combined Linux app.asar must apply all 19 patches");
+    buildPatchedArchive(combinedRaw, linuxPatches, linuxCombinedOut);
+    const linuxVerified = readAsar(linuxCombinedOut);
+    verifyRuntimeAssets(linuxVerified, ["timeline-ui", "inline-diff-ui", "usage-rings-ui", "files-explorer-ui", "floating-panels-ui", "tab-bar-ui"]);
+
+    // B2. macOS combined ASAR receives all 20 macosCli.PATCHES (ALL_PATCHES + macos-user-data)
+    const macCombinedOut = path.join(tmpRoot, "macos-combined.asar");
+    const macPatches = applicablePatchesForArchive(combinedRaw, macosCli.PATCHES);
+    assert.equal(macPatches.length, 20, "Combined macOS app.asar must apply all 20 patches including macos-user-data");
+    buildPatchedArchive(combinedRaw, macPatches, macCombinedOut);
+    const macCombinedState = macosCli.inspectMacosModules(macCombinedOut, false);
+    assert.equal(macCombinedState.summary.allInstalled, true);
+    assert.equal(macCombinedState.summary.autoAdapted, false);
+    assert.equal(
+      inferRepairPlanOptions(macCombinedState.modules.filter((m) => m.id !== "macos-user-data"), { installed: true, managed: true, officialOnly: false }).preset,
+      "full"
+    );
+
+    // B3. Plan-shrink regression: installing workspace+composer then shrinking to workspace must NOT skip rebuild via matchesSelectedPatches
+    const shrinkWork = resolveInstallPlan(ALL_PATCHES, { packs: ["workspace"] }).selectedPatches;
+    const shrinkBoth = resolveInstallPlan(ALL_PATCHES, { packs: ["workspace", "composer"] }).selectedPatches;
+    const combinedBothOut = path.join(tmpRoot, "combined-both.asar");
+    buildPatchedArchive(combinedRaw, applicablePatchesForArchive(combinedRaw, shrinkBoth), combinedBothOut);
+    const bothInspected = inspectArchive(combinedBothOut);
+    assert.equal(
+      matchesSelectedPatches(bothInspected.modules, applicablePatchesForArchive(bothInspected.asar, shrinkBoth)),
+      true
+    );
+    assert.equal(
+      matchesSelectedPatches(bothInspected.modules, applicablePatchesForArchive(bothInspected.asar, shrinkWork)),
+      false,
+      "Shrinking selected packs must NOT falsely match when co-resident unselected module (usage-rings) is still installed"
+    );
+
+    // Real Linux plan-shrink rebuild via linuxCli.install without providing input
+    const shrinkXdg = path.join(tmpRoot, "shrink-xdg");
+    const shrinkLinuxPaths = linuxCli.getLinuxPaths({ XDG_DATA_HOME: shrinkXdg }, tmpRoot);
+    fs.mkdirSync(path.join(shrinkLinuxPaths.installDirectory, "squashfs-root", "resources"), { recursive: true });
+    const shrinkAppAsar = path.join(shrinkLinuxPaths.installDirectory, linuxCli.APP_ASAR);
+    fs.copyFileSync(combinedBothOut, shrinkAppAsar);
+    fs.copyFileSync(combinedRawPath, shrinkAppAsar + linuxCli.BACKUP_SUFFIX);
+    linuxCli.writeLauncherFiles(shrinkLinuxPaths.installDirectory, false, { disableTelemetry: false });
+    const origLogShrink = console.log;
+    console.log = () => {};
+    try {
+      linuxCli.install(null, { packs: ["workspace"] }, shrinkLinuxPaths);
+    } finally {
+      console.log = origLogShrink;
+    }
+    const shrunkInspect = linuxCli.inspectInstall(shrinkLinuxPaths);
+    assert.equal(shrunkInspect.modules.find((m) => m.id === "usage-rings").installed, false, "Plan shrink must remove usage-rings cleanly");
+    assert.equal(shrunkInspect.modules.find((m) => m.id === "new-chat-layout").installed, true, "Plan shrink must keep selected workspace patch");
+
+    // Linux repair preserves sub-pack exclusions (--packs workspace --no-desktop-tray) and rolls back app.asar on ENOTDIR theme failure
+    const linuxOrigLog2 = console.log;
+    console.log = () => {};
+    try {
+      linuxCli.install(null, { packs: ["workspace"], flags: new Set(["--no-desktop-tray"]) }, shrinkLinuxPaths);
+      linuxCli.repair(null, {}, shrinkLinuxPaths);
+    } finally {
+      console.log = linuxOrigLog2;
+    }
+    const linuxAfterRepair = linuxCli.inspectInstall(shrinkLinuxPaths);
+    assert.equal(linuxAfterRepair.modules.find((m) => m.id === "desktop-tray").installed, false, "Linux bare repair must preserve --no-desktop-tray");
+    assert.equal(linuxAfterRepair.modules.find((m) => m.id === "new-chat-layout").installed, true);
+    const linuxPreFailSha = digest(fs.readFileSync(shrinkAppAsar));
+    const linuxBadXdg = path.join(tmpRoot, "shrink-xdg-bad");
+    const linuxBadPaths = linuxCli.getLinuxPaths({ XDG_DATA_HOME: linuxBadXdg }, tmpRoot);
+    fs.mkdirSync(path.join(linuxBadPaths.installDirectory, "squashfs-root", "resources"), { recursive: true });
+    fs.copyFileSync(shrinkAppAsar, path.join(linuxBadPaths.installDirectory, linuxCli.APP_ASAR));
+    fs.copyFileSync(combinedRawPath, path.join(linuxBadPaths.installDirectory, linuxCli.APP_ASAR) + linuxCli.BACKUP_SUFFIX);
+    linuxCli.writeLauncherFiles(linuxBadPaths.installDirectory, false, { disableTelemetry: false });
+    const badSettingsPath = path.join(linuxBadPaths.profileDirectory, "t3-home", "userdata", "settings.json");
+    fs.mkdirSync(badSettingsPath, { recursive: true }); // ENOTDIR trigger
+    console.log = () => {};
+    try {
+      assert.throws(() => linuxCli.install(null, { preset: "clean" }, linuxBadPaths), /ENOTDIR|EISDIR|illegal operation/);
+    } finally {
+      console.log = linuxOrigLog2;
+    }
+    assert.equal(
+      digest(fs.readFileSync(path.join(linuxBadPaths.installDirectory, linuxCli.APP_ASAR))),
+      linuxPreFailSha,
+      "Linux inplace install must keep original app.asar untouched/rolled back if theme commit fails"
+    );
+
+    // C. Isolated Windows Dual-ASAR CLI transaction (install -> corrupt+repair -> byte-identical uninstall)
+    if (process.platform === "win32") {
+      const cliPath = path.join(__dirname, "..", "cli.cjs");
+      const fakeLocalAppData = path.join(tmpRoot, "localappdata");
+      const fakeT3Home = path.join(tmpRoot, "t3home");
+      const resDir = path.join(fakeLocalAppData, "Programs", "t3code", "resources");
+      fs.mkdirSync(resDir, { recursive: true });
+      const winServer = path.join(resDir, "server.asar");
+      const winApp = path.join(resDir, "app.asar");
+      fs.copyFileSync(serverBaseline.path, winServer);
+      fs.copyFileSync(desktopBaseline.path, winApp);
+      const origServerSha = digest(fs.readFileSync(winServer));
+      const origAppSha = digest(fs.readFileSync(winApp));
+      const isoEnv = { ...process.env, LOCALAPPDATA: fakeLocalAppData, T3CODE_HOME: fakeT3Home };
+
+      // build subcommand dry-run check
+      const { ENHANCER_VERSION, ENHANCER_TAG } = require("../lib/version.cjs");
+      const buildTarget = path.join(tmpRoot, "cli-built.asar");
+      const buildJson = JSON.parse(execFileSync(process.execPath, [cliPath, "build", buildTarget, "--preset", "clean"], { env: isoEnv, encoding: "utf8" }));
+      assert.equal(buildJson.enhancerVersion, ENHANCER_VERSION);
+      assert.equal(buildJson.enhancerTag, ENHANCER_TAG);
+      assert.equal(buildJson.preset, "clean");
+      assert.equal(buildJson.compatibility, "verified");
+      assert.equal(buildJson.modules.length, desktopHasServer ? 5 : 4);
+      assert(fs.existsSync(buildTarget));
+
+      // install --preset clean (dual-ASAR + theme + backups) -> repair corrupt app.asar -> uninstall --purge-backup
+      const origLocal = process.env.LOCALAPPDATA;
+      const origT3Home = process.env.T3CODE_HOME;
+      const desktopPatches = [noTelemetry.desktopPatch, desktopTray];
+      const origLog = console.log;
+      try {
+        process.env.LOCALAPPDATA = fakeLocalAppData;
+        process.env.T3CODE_HOME = fakeT3Home;
+        console.log = () => {};
+
+        cmdInstall(new Set(), null, { preset: "clean", assertClosed: () => {} });
+        assert.equal(digest(fs.readFileSync(winServer + ".before-t3code-enhancer")), origServerSha);
+        assert.equal(digest(fs.readFileSync(winApp + ".before-t3code-enhancer")), origAppSha);
+        assert(fs.existsSync(path.join(fakeT3Home, "userdata", "themes", "chatgpt-app.json")));
+        assert.equal(inspectArchive(winServer).enhancerVersion, ENHANCER_VERSION);
+        const appCleanInspected = inspectArchive(winApp, desktopPatches);
+        assert.equal(appCleanInspected.enhancerVersion, ENHANCER_VERSION);
+        const appCleanModules = appCleanInspected.modules;
+        assert.equal(appCleanModules.find((m) => m.id === "no-telemetry-desktop").installed, true);
+        assert.equal(appCleanModules.find((m) => m.id === "desktop-tray").installed, false);
+        assert.equal(summarizeModuleStates(appCleanModules).allRecognized, true);
+
+        // simulate corrupt app.asar + stale .tmp file -> repair recovers cleanly from backup while preserving clean preset
+        const staleTmp = winApp + ".00000000-0000-0000-0000-000000000000.tmp";
+        fs.writeFileSync(staleTmp, "stale");
+        fs.truncateSync(winApp, 12);
+        cmdRepair(new Set(), null, { assertClosed: () => {} });
+        assert(!fs.existsSync(staleTmp), "repair must clean up stale UUID .tmp staging files");
+        const repairedAppModules = inspectArchive(winApp, desktopPatches).modules;
+        assert.equal(repairedAppModules.find((m) => m.id === "no-telemetry-desktop").installed, true);
+        assert.equal(repairedAppModules.find((m) => m.id === "desktop-tray").installed, false);
+
+        // Corrupt 1 byte inside an ASAR payload entry (header still valid, ERR_ASAR_INTEGRITY) -> repair still recovers from same-version backup
+        const corruptEntryRec = findPatchTarget(readAsar(winServer), noTelemetry);
+        const hdrLen = readAsar(winServer).archive.readUInt32LE(4) + 8;
+        const absByteOffset = hdrLen + Number(corruptEntryRec.entry.offset) + 8;
+        const winServerBytes = fs.readFileSync(winServer);
+        winServerBytes[absByteOffset] = winServerBytes[absByteOffset] ^ 0xff;
+        fs.writeFileSync(winServer, winServerBytes);
+        cmdRepair(new Set(), null, { assertClosed: () => {} });
+        assert.equal(
+          inspectArchive(winServer).modules.find((m) => m.id === "no-telemetry").installed,
+          true,
+          "repair must recover from same-version backup when target script fails integrity check"
+        );
+
+        // uninstall --purge-backup restores byte-for-byte original SHA-256 on both ASARs
+        cmdUninstall(new Set(["--purge-backup"]), null, { assertClosed: () => {} });
+        assert.equal(digest(fs.readFileSync(winServer)), origServerSha);
+        assert.equal(digest(fs.readFileSync(winApp)), origAppSha);
+        assert(!fs.existsSync(winServer + ".before-t3code-enhancer"));
+        assert(!fs.existsSync(winApp + ".before-t3code-enhancer"));
+
+        // Sub-pack exclusion preservation: install --packs workspace --no-desktop-tray -> bare repair keeps desktop-tray off;
+        // and when shrinking from workspace (with backup) to --no-desktop-tray then corrupting app.asar, surviving server buildMeta.plan preserves exclusion
+        cmdInstall(new Set(["--no-desktop-tray"]), null, { packs: ["workspace"], assertClosed: () => {} });
+        assert.equal(inspectArchive(winApp, desktopPatches).modules.find((m) => m.id === "desktop-tray").installed, false);
+        assert.equal(inspectArchive(winServer).modules.find((m) => m.id === "new-chat-layout").installed, true);
+        cmdRepair(new Set(), null, { assertClosed: () => {} });
+        assert.equal(inspectArchive(winApp, desktopPatches).modules.find((m) => m.id === "desktop-tray").installed, false, "Bare repair must preserve --no-desktop-tray exclusion");
+
+        cmdInstall(new Set(), null, { packs: ["workspace"], assertClosed: () => {} });
+        assert.equal(inspectArchive(winApp, desktopPatches).modules.find((m) => m.id === "desktop-tray").installed, true);
+        cmdInstall(new Set(["--no-desktop-tray"]), null, { packs: ["workspace"], assertClosed: () => {} });
+        assert.equal(inspectArchive(winApp, desktopPatches).modules.find((m) => m.id === "desktop-tray").installed, false);
+        fs.truncateSync(winApp, 12);
+        cmdRepair(new Set(), null, { assertClosed: () => {} });
+        assert.equal(inspectArchive(winApp, desktopPatches).modules.find((m) => m.id === "desktop-tray").installed, false, "Bare repair with corrupt winApp must still read surviving winServer buildMeta.plan and exclude desktop-tray");
+        cmdUninstall(new Set(["--purge-backup"]), null, { assertClosed: () => {} });
+
+        // Theme ENOTDIR/EISDIR pre-commit failure AND post-rename mid-commit failure must BOTH leave winServer & winApp at orig SHA-256
+        const userdataDir = path.join(fakeT3Home, "userdata");
+        const blockingSettings = path.join(userdataDir, "settings.json");
+        fs.rmSync(blockingSettings, { recursive: true, force: true });
+        fs.mkdirSync(blockingSettings, { recursive: true });
+        assert.throws(() => cmdInstall(new Set(), null, { preset: "clean", assertClosed: () => {} }), /EISDIR|ENOTDIR|illegal operation/);
+        assert.equal(digest(fs.readFileSync(winServer)), origServerSha, "Theme EISDIR pre-commit failure must keep server.asar unchanged");
+        assert.equal(digest(fs.readFileSync(winApp)), origAppSha, "Theme EISDIR pre-commit failure must keep app.asar unchanged");
+        fs.rmSync(userdataDir, { recursive: true, force: true });
+        fs.writeFileSync(userdataDir, "not-a-directory");
+        assert.throws(() => cmdInstall(new Set(), null, { preset: "clean", assertClosed: () => {} }), /ENOTDIR|EEXIST/);
+        assert.equal(digest(fs.readFileSync(winServer)), origServerSha, "Theme ENOTDIR pre-commit failure must keep server.asar unchanged");
+        assert.equal(digest(fs.readFileSync(winApp)), origAppSha, "Theme ENOTDIR pre-commit failure must keep app.asar unchanged");
+        fs.rmSync(userdataDir, { recursive: true, force: true });
+
+        assert.throws(
+          () => runAsarTransaction(
+            [{ source: winServer, backup: winServer + ".bak" }, { source: winApp, backup: winApp + ".bak" }],
+            (_paths, staging) => fs.writeFileSync(staging, Buffer.from("mutated-staging")),
+            {
+              assertClosed: () => {},
+              afterCommit: () => {
+                const err = new Error("ENOTDIR simulated mid-commit failure");
+                err.code = "ENOTDIR";
+                throw err;
+              },
+            }
+          ),
+          /ENOTDIR simulated mid-commit failure/
+        );
+        assert.equal(digest(fs.readFileSync(winServer)), origServerSha, "Post-rename afterCommit failure must roll back server.asar byte-for-byte");
+        assert.equal(digest(fs.readFileSync(winApp)), origAppSha, "Post-rename afterCommit failure must roll back app.asar byte-for-byte");
+
+        if (!desktopHasServer) {
+          // Explicit single-file --asar on server-only ASAR prints skipped desktop patches notice
+          let singleAsarLog = "";
+          console.log = (...args) => { singleAsarLog += args.join(" ") + "\n"; };
+          cmdInstall(new Set(), winServer, { preset: "privacy-only", assertClosed: () => {} });
+          console.log = () => {};
+          assert(singleAsarLog.includes("no-telemetry-desktop"), "Single-file --asar install must warn about skipped desktop patch");
+          cmdUninstall(new Set(["--purge-backup"]), winServer, { assertClosed: () => {} });
+          assert.equal(digest(fs.readFileSync(winServer)), origServerSha);
+        }
+      } finally {
+        console.log = origLog;
+        if (origLocal === undefined) delete process.env.LOCALAPPDATA;
+        else process.env.LOCALAPPDATA = origLocal;
+        if (origT3Home === undefined) delete process.env.T3CODE_HOME;
+        else process.env.T3CODE_HOME = origT3Home;
+      }
+    }
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 }
 
 console.log("\nALL TESTS PASSED.");

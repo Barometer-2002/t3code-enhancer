@@ -13,12 +13,13 @@ const {
   ALL_PATCHES,
   matchesSelectedPatches,
   inferRepairPlanOptions,
+  applicablePatchesForArchive,
   inspectArchive,
   summarizeModuleStates,
   buildPatchedArchive,
 } = require("./lib/engine.cjs");
 const { digest, readAsar } = require("./lib/asar.cjs");
-const { withInstallDirectoryLock, retirePreviousInstall } = require("./lib/install-state.cjs");
+const { withInstallDirectoryLock, recoverPreviousInstall, replaceStagedInstall, cleanupStagingDirectories } = require("./lib/install-state.cjs");
 const {
   resolveInstallPlan,
   parsePlatformArgs,
@@ -30,9 +31,11 @@ const {
   prepareProfileAt,
   formatThemeStatusText,
   uninstallTheme,
+  reportThemeUninstall,
 } = require("./lib/theme-manager.cjs");
+const { ENHANCER_TAG, T3_BASELINE_VERSION } = require("./lib/version.cjs");
 
-const T3_VERSION = "0.1.12";
+const T3_VERSION = T3_BASELINE_VERSION;
 const T3_TEAM_ID = "ARK85ZXQ4Z";
 const DEFAULT_SOURCE = "/Applications/T3 Code (Beta).app";
 const BUNDLE_ID = "com.t3tools.t3code.enhancer";
@@ -179,21 +182,19 @@ function buildInfoPlistEnv(existingEnv = {}, sharedData = false, paths = getMaco
   return next;
 }
 
-function selectMacosPatches(sharedData, options = {}) {
-  const plan = resolveInstallPlan(ALL_PATCHES, options);
-  const selectedPatches = sharedData ? plan.selectedPatches : [...plan.selectedPatches, userDataPatch];
-  return { plan, selectedPatches };
+function selectMacosPatches(plan, sharedData) {
+  return sharedData ? plan.selectedPatches : [...plan.selectedPatches, userDataPatch];
 }
 
 function inspectMacosModules(asarPath, sharedData) {
   const expectedPatches = sharedData ? ALL_PATCHES : PATCHES;
-  const { modules, appVersion } = inspectArchive(asarPath, expectedPatches);
+  const { modules, appVersion, buildMeta } = inspectArchive(asarPath, expectedPatches);
   const summary = summarizeModuleStates(modules);
   assert(
     summary.allRecognized && (summary.hasKnownEnhancement || summary.allPristine),
     "安装目录中的补丁不完整或无法识别"
   );
-  return { modules, summary, appVersion };
+  return { modules, summary, appVersion, buildMeta };
 }
 
 function inspectInstall(paths = getMacosPaths()) {
@@ -201,15 +202,26 @@ function inspectInstall(paths = getMacosPaths()) {
   if (!fs.lstatSync(installDirectory, { throwIfNoEntry: false })) return null;
   assert(isManagedInstall(installDirectory), `安装位置已被其他应用占用：${installDirectory}`);
   const sharedData = usesSharedData(installDirectory);
-  const { modules, summary, appVersion } = inspectMacosModules(path.join(installDirectory, APP_ASAR), sharedData);
+  const { modules, summary, appVersion, buildMeta } = inspectMacosModules(path.join(installDirectory, APP_ASAR), sharedData);
   const currentEnv = readOptionalPlist(installDirectory, "LSEnvironment", "json", {});
   const themeStatus = getThemeStatus(getUserdataDir(sharedData, paths));
-  return { sharedData, modules, summary, currentEnv, themeStatus, appVersion };
+  return { sharedData, modules, summary, currentEnv, themeStatus, appVersion, buildMeta };
 }
 
 function status(existing, paths = getMacosPaths()) {
-  if (existing === undefined) existing = inspectInstall(paths);
   const { installDirectory, previousApp, profileDirectory } = paths;
+  if (existing === undefined) {
+    try {
+      existing = inspectInstall(paths);
+    } catch (err) {
+      if (isManagedInstall(installDirectory)) {
+        console.log(`检测到受管理的 macOS 安装 (${installDirectory})，当前包无法直接识别（${err.message}）。`);
+        console.log("若之前安装自更早版本（如 v0.1.1 的 0.1.11），请退出应用后运行 install（使用新版官方 T3 Code .app）升级，或运行 repair 修复。");
+        return;
+      }
+      throw err;
+    }
+  }
   if (!existing) {
     console.log(fs.lstatSync(previousApp, { throwIfNoEntry: false })
       ? `上次升级未完成，旧应用仍保存在 ${previousApp}。运行 node macos.cjs repair 可恢复。`
@@ -223,7 +235,7 @@ function status(existing, paths = getMacosPaths()) {
     : existing.summary.allRecognized
       ? "已验证 (verified)"
       : "不兼容 (incompatible)";
-  console.log(`T3 Code ${versionStr} macOS 增强版已安装 [兼容性: ${compatTier}]，${isRunning(paths, { allowMissing: true }) ? "运行中" : "未运行"}。`);
+  console.log(`T3 Code ${versionStr} macOS 增强版已安装 (t3code-enhancer ${ENHANCER_TAG}) [兼容性: ${compatTier}]，${isRunning(paths, { allowMissing: true }) ? "运行中" : "未运行"}。`);
   console.log(
     existing.summary.allInstalled
       ? "补丁：已是最新版（全部模块）。"
@@ -244,28 +256,10 @@ function status(existing, paths = getMacosPaths()) {
   }
 }
 
-function cleanupStaleMacosStaging(paths) {
-  if (!fs.existsSync(paths.applicationsDirectory)) return;
-  for (const name of fs.readdirSync(paths.applicationsDirectory)) {
-    if (/^\.t3code-enhancer-[A-Za-z0-9]{6}$/.test(name)) {
-      fs.rmSync(path.join(paths.applicationsDirectory, name), { recursive: true, force: true });
-    }
-  }
-}
-
 function withInstallLock(operation, paths = getMacosPaths()) {
   const { installDirectory, installLock, previousApp } = paths;
   return withInstallDirectoryLock(installLock, () => {
-    if (fs.lstatSync(previousApp, { throwIfNoEntry: false })) {
-      assert(isManagedInstall(previousApp), `无法确认旧应用备份：${previousApp}`);
-      if (fs.lstatSync(installDirectory, { throwIfNoEntry: false })) {
-        inspectInstall(paths);
-        retirePreviousInstall(previousApp);
-        assert(!fs.existsSync(previousApp), `无法清理旧应用备份：${previousApp}`);
-      } else {
-        fs.renameSync(previousApp, installDirectory);
-      }
-    }
+    recoverPreviousInstall(installDirectory, previousApp, isManagedInstall, () => inspectInstall(paths));
     return operation();
   });
 }
@@ -279,19 +273,21 @@ function envNeedsUpdate(currentEnv, expectedEnv) {
   return ka.some((k) => !Object.prototype.hasOwnProperty.call(b, k) || a[k] !== b[k]);
 }
 
-function install(input = DEFAULT_SOURCE, options = {}, paths = getMacosPaths()) {
+function install(input, options = {}, paths = getMacosPaths()) {
   const flags = options.flags || new Set();
-  const basePlan = resolveInstallPlan(ALL_PATCHES, {
+  const plan = resolveInstallPlan(ALL_PATCHES, {
     preset: options.preset || null,
     packs: options.packs || null,
     flags,
+    excludePatchIds: options.excludePatchIds || [],
+    exactPatchIds: options.exactPatchIds || null,
   });
   const requestedSharedData = flags.has("--shared-data") || options.sharedData === true;
-  if (basePlan.needsLayer3Warning) {
+  if (plan.needsLayer3Warning) {
     console.log("[提示] --official 仅安装 Layer 1 官方样式层，部分功能补丁的视觉样式可能不完整；纯官方主题建议配合 --preset theme-only 或 --preset clean 使用。");
   }
 
-  if (basePlan.themeOnly) return withInstallLock(() => {
+  if (plan.themeOnly) return withInstallLock(() => {
     let existing = null;
     try { existing = inspectInstall(paths); } catch {}
     const dirExists = Boolean(fs.lstatSync(paths.installDirectory, { throwIfNoEntry: false }));
@@ -301,21 +297,18 @@ function install(input = DEFAULT_SOURCE, options = {}, paths = getMacosPaths()) 
         ? usesSharedData(paths.installDirectory)
         : requestedSharedData;
     assert(!requestedSharedData || sharedData, "当前为独立配置模式，无需 --shared-data（如需切换请先卸载）");
-    const res = prepareProfile(sharedData, { officialOnly: basePlan.officialOnly }, paths);
-    console.log(`[主题] 已安装 chatgpt-app 主题（${basePlan.officialOnly ? "仅官方稳定层 Layer 1" : "完整分层主题 Layer 1-3"}） -> ${res.targetPath}`);
-    if (!res.activated) {
-      console.warn(`[提示] 主题已写入，但未能自动激活：${res.reason || "请检查设置文件后手动切换主题"}`);
-    }
+    const res = prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
+    console.log(`[主题] 已安装 chatgpt-app 主题（${plan.officialOnly ? "仅官方稳定层 Layer 1" : "完整分层主题 Layer 1-3"}） -> ${res.targetPath}`);
   }, paths);
 
   return withInstallLock(() => {
-    if (options.repair) cleanupStaleMacosStaging(paths);
+    if (options.repair) cleanupStagingDirectories(paths.applicationsDirectory);
     let existing = null;
     let existingCorrupt = false;
     try {
       existing = inspectInstall(paths);
     } catch (err) {
-      if (options.repair && isManagedInstall(paths.installDirectory)) {
+      if ((options.repair || input || fs.existsSync(DEFAULT_SOURCE)) && isManagedInstall(paths.installDirectory)) {
         existingCorrupt = true;
       } else {
         throw err;
@@ -328,23 +321,16 @@ function install(input = DEFAULT_SOURCE, options = {}, paths = getMacosPaths()) 
         ? usesSharedData(paths.installDirectory)
         : requestedSharedData;
     assert(!requestedSharedData || sharedData, "切换为共用数据模式前，请先卸载增强版");
-    const { plan, selectedPatches } = selectMacosPatches(sharedData, {
-      preset: options.preset || null,
-      packs: options.packs || null,
-      flags,
-    });
+    const selectedPatches = selectMacosPatches(plan, sharedData);
 
     const expectedEnv = buildInfoPlistEnv(existing?.currentEnv, sharedData, paths, { disableTelemetry: plan.telemetryDisabled });
     if (
-      existing && !options.repair &&
+      existing && !input && !options.repair &&
       matchesSelectedPatches(existing.modules, selectedPatches) &&
       !envNeedsUpdate(existing.currentEnv, expectedEnv)
     ) {
       if (plan.includeTheme) {
-        const themeRes = prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
-        if (!themeRes.activated) {
-          console.warn(`[提示] 主题已写入，但未能自动激活：${themeRes.reason || "请检查设置文件后手动切换主题"}`);
-        }
+        prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
       }
       return status(inspectInstall(paths), paths);
     }
@@ -360,6 +346,13 @@ function install(input = DEFAULT_SOURCE, options = {}, paths = getMacosPaths()) 
     const sourceVersion = readPlist(source, "CFBundleShortVersionString");
     assert(sourceVersion, `无法读取官方应用版本：${source}`);
     const staging = fs.mkdtempSync(path.join(paths.applicationsDirectory, ".t3code-enhancer-"));
+    const themeTx = plan.includeTheme
+      ? require("./lib/theme-manager.cjs").prepareThemeTransaction(getUserdataDir(sharedData, paths), {
+          officialOnly: plan.officialOnly,
+          activate: !sharedData,
+          createSettingsIfMissing: !sharedData,
+        })
+      : null;
     try {
       const app = path.join(staging, `${DISPLAY_NAME}.app`);
       execFileSync("ditto", [source, app]);
@@ -372,24 +365,22 @@ function install(input = DEFAULT_SOURCE, options = {}, paths = getMacosPaths()) 
       }
       console.log("构建并校验补丁…");
       const target = path.join(app, APP_ASAR);
-      const patched = target + ".patched";
-      if (selectedPatches.length > 0) {
-        const inspectedTarget = inspectArchive(target, selectedPatches);
-        const targetSummary = summarizeModuleStates(inspectedTarget.modules);
-        assert(targetSummary.allRecognized, `目标 ASAR 与补丁不兼容（版本 ${sourceVersion}），已中止安装。`);
-        const compatTier = targetSummary.autoAdapted ? "跨版本自动适配 (auto-adapted)" : "已验证 (verified)";
-        const detectedVer = inspectedTarget.appVersion || sourceVersion;
-        console.log(`[兼容性] 检测到版本 v${detectedVer} · ${compatTier}`);
-        const targetPatches = applicablePatchesForArchive(inspectedTarget.asar, selectedPatches);
-        if (targetPatches.length > 0) {
-          const report = buildPatchedArchive(inspectedTarget.asar, targetPatches, patched);
-          for (const r of report) {
-            const tag = r.compat === "auto-adapted" ? " (跨版本自动适配)" : "";
-            console.log(`  ✓ ${r.id} -> ${r.key}${tag}`);
-          }
-          fs.chmodSync(patched, fs.statSync(target).mode & 0o777);
-          fs.renameSync(patched, target);
+      const inspectedTarget = inspectArchive(target, selectedPatches);
+      const targetSummary = summarizeModuleStates(inspectedTarget.modules);
+      assert(targetSummary.allRecognized, `目标 ASAR 与补丁不兼容（版本 ${sourceVersion}），已中止安装。`);
+      const compatTier = targetSummary.autoAdapted ? "跨版本自动适配 (auto-adapted)" : "已验证 (verified)";
+      const detectedVer = inspectedTarget.appVersion || sourceVersion;
+      console.log(`[兼容性] 检测到版本 v${detectedVer} · ${compatTier}`);
+      const targetPatches = applicablePatchesForArchive(inspectedTarget.asar, selectedPatches);
+      if (targetPatches.length > 0) {
+        const patched = target + ".patched";
+        const report = buildPatchedArchive(inspectedTarget.asar, targetPatches, patched, { plan });
+        for (const r of report) {
+          const tag = r.compat === "auto-adapted" ? " (跨版本自动适配)" : "";
+          console.log(`  ✓ ${r.id} -> ${r.key}${tag}`);
         }
+        fs.chmodSync(patched, fs.statSync(target).mode & 0o777);
+        fs.renameSync(patched, target);
       }
       // Electron 的 ASAR 完整性值是头部 JSON 的 SHA-256。
       const { archive } = readAsar(target);
@@ -414,29 +405,21 @@ function install(input = DEFAULT_SOURCE, options = {}, paths = getMacosPaths()) 
         throw new Error(`本机 ad-hoc 重签名或签名校验失败：${msg}`, { cause: signErr });
       }
 
-      if (existing || existingCorrupt) {
+      const replacing = Boolean(existing || existingCorrupt);
+      if (replacing) {
         assert(!isRunning(paths, { allowMissing: existingCorrupt }), "请先退出 macOS 增强版，再运行升级或修复命令");
-        fs.renameSync(paths.installDirectory, paths.previousApp);
       }
-      try {
-        fs.renameSync(app, paths.installDirectory);
-      } catch (error) {
-        if (existing || existingCorrupt) {
-          try {
-            fs.renameSync(paths.previousApp, paths.installDirectory);
-          } catch (rollbackError) {
-            throw new Error(`安装失败，无法恢复原安装位置。旧应用仍保存在 ${paths.previousApp}（${rollbackError.message}）`, { cause: error });
+      replaceStagedInstall(app, paths.installDirectory, replacing ? paths.previousApp : null, themeTx ? {
+        afterCommit: () => {
+          const res = themeTx.commit();
+          if (!sharedData && !res.activated) {
+            console.warn("[提示] 主题已写入，但未能自动激活：请检查设置文件后手动切换主题");
           }
-        }
-        throw error;
-      }
-      if (existing || existingCorrupt) retirePreviousInstall(paths.previousApp);
+        },
+        onRollback: () => themeTx.rollback(),
+      } : undefined);
     } finally {
       fs.rmSync(staging, { recursive: true, force: true });
-    }
-    if (plan.includeTheme) {
-      const themeRes = prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
-      if (!themeRes.activated) console.warn(`[提示] 主题已写入，但未能自动激活：${themeRes.reason || "请检查设置文件后手动切换主题"}`);
     }
     return status(inspectInstall(paths), paths);
   }, paths);
@@ -452,13 +435,20 @@ function repair(input = DEFAULT_SOURCE, options = {}, paths = getMacosPaths()) {
     try { existing = inspectInstall({ ...paths, installDirectory }); } catch {}
     if (existing) {
       const coreModules = existing.modules.filter((m) => m.id !== "macos-user-data");
-      const inferred = inferRepairPlanOptions(coreModules, existing.themeStatus);
+      const inferred = inferRepairPlanOptions(
+        coreModules,
+        existing.themeStatus,
+        flags,
+        existing.buildMeta?.plan ? [existing.buildMeta.plan] : []
+      );
       if (inferred.officialOnly) flags.add("--official");
       if (inferred.patchOnly) flags.add("--patch-only");
       effectiveOptions = {
         ...effectiveOptions,
         preset: inferred.preset ?? undefined,
         packs: inferred.packs ?? undefined,
+        excludePatchIds: inferred.excludePatchIds,
+        exactPatchIds: inferred.exactPatchIds,
       };
     }
   }
@@ -467,12 +457,20 @@ function repair(input = DEFAULT_SOURCE, options = {}, paths = getMacosPaths()) {
 }
 
 function uninstall(flags = new Set(), paths = getMacosPaths()) {
+  if (flags.has("--theme-only")) {
+    if (flags.has("--keep-theme")) return;
+    return withInstallDirectoryLock(paths.installLock, () => {
+      const installed = [paths.installDirectory, paths.previousApp].find(isManagedInstall);
+      const sharedData = installed ? usesSharedData(installed) : flags.has("--shared-data");
+      reportThemeUninstall(getUserdataDir(sharedData, paths));
+    });
+  }
   return withInstallLock(() => {
     const { installDirectory, profileDirectory } = paths;
     const keepTheme = flags.has("--keep-theme");
     const purgeProfile = flags.has("--purge-profile");
     if (!fs.lstatSync(installDirectory, { throwIfNoEntry: false })) {
-      cleanupStaleMacosStaging(paths);
+      cleanupStagingDirectories(paths.applicationsDirectory);
       if (purgeProfile && fs.existsSync(profileDirectory)) {
         fs.rmSync(profileDirectory, { recursive: true, force: true });
         console.log(`已清理独立配置目录：${profileDirectory}`);
@@ -486,7 +484,7 @@ function uninstall(flags = new Set(), paths = getMacosPaths()) {
       uninstallTheme(getUserdataDir(sharedData, paths));
     }
     fs.rmSync(installDirectory, { recursive: true, force: true });
-    cleanupStaleMacosStaging(paths);
+    cleanupStagingDirectories(paths.applicationsDirectory);
     if (purgeProfile && !sharedData && fs.existsSync(profileDirectory)) {
       fs.rmSync(profileDirectory, { recursive: true, force: true });
       console.log(`已卸载 macOS 增强版并彻底清理独立配置目录：${profileDirectory}`);
@@ -507,7 +505,8 @@ function printUsage() {
   node macos.cjs install [<T3 Code.app>] [--preset <id>] [--packs <a,b>] [--shared-data] [--official] [--interactive]
   node macos.cjs repair  [<T3 Code.app>] [--preset <id>] [--packs <a,b>] [--official]
   node macos.cjs status
-  node macos.cjs uninstall [--keep-theme] [--purge-profile]
+  node macos.cjs uninstall [--theme-only] [--keep-theme] [--purge-profile]
+  node macos.cjs --version
 
 默认官方 App 路径：${DEFAULT_SOURCE}
 可选预设 (--preset)：full（默认完整版）| chat-lite（轻量对话）| clean（主题+去遥测）| privacy-only（纯去遥测）| theme-only（纯主题）
@@ -520,6 +519,10 @@ async function runMacosCli(argv) {
     printUsage();
     return;
   }
+  if (command === "version" || flags.has("--version")) {
+    console.log(require("./lib/version.cjs").formatVersionBanner());
+    return;
+  }
   assert(process.platform === "darwin", "仅支持 macOS");
   assert(process.getuid() !== 0, "请以桌面用户运行");
   assert(extra.length === 0, "命令参数不正确");
@@ -528,7 +531,7 @@ async function runMacosCli(argv) {
   if (command === "install") {
     if (flags.has("--banner")) {
       console.log("============================================================");
-      console.log("  T3 Code macOS 增强版安装与升级 (t3code-enhancer)");
+      console.log(`  T3 Code macOS 增强版安装与升级 (t3code-enhancer ${ENHANCER_TAG})`);
       console.log("============================================================\n");
     }
     if (flags.has("--interactive") && !preset && !packs && !flags.has("--theme-only")) {
@@ -539,7 +542,7 @@ async function runMacosCli(argv) {
         promptInputLabel: !input && !fs.existsSync(DEFAULT_SOURCE) ? "请输入官方 T3 Code (Beta).app 路径: " : "",
       });
       if (pick.action === "cancel") return;
-      const effectiveInput = input || pick.inputPath || DEFAULT_SOURCE;
+      const effectiveInput = input || pick.inputPath;
       if (pick.action === "repair") return repair(effectiveInput, { flags }, paths);
       if (pick.action === "uninstall") return uninstall(flags, paths);
       if (pick.officialOnly) flags.add("--official");
@@ -551,20 +554,20 @@ async function runMacosCli(argv) {
   if (command === "repair") {
     if (flags.has("--banner")) {
       console.log("============================================================");
-      console.log("  T3 Code macOS 增强版修复工具 (t3code-enhancer)");
+      console.log(`  T3 Code macOS 增强版修复工具 (t3code-enhancer ${ENHANCER_TAG})`);
       console.log("============================================================\n");
     }
     return repair(input, { flags, preset, packs }, paths);
   }
   if (command === "status") {
     assert(input === undefined, "命令参数不正确");
-    return status(inspectInstall(paths), paths);
+    return status(undefined, paths);
   }
   if (command === "uninstall") {
     assert(input === undefined, "命令参数不正确");
     if (flags.has("--banner")) {
       console.log("============================================================");
-      console.log("  T3 Code macOS 增强版卸载工具 (t3code-enhancer)");
+      console.log(`  T3 Code macOS 增强版卸载工具 (t3code-enhancer ${ENHANCER_TAG})`);
       console.log("============================================================\n");
     }
     return uninstall(flags, paths);
@@ -597,6 +600,10 @@ module.exports = {
   selectMacosPatches,
   matchesSelectedPatches,
   inspectMacosModules,
+  status,
+  install,
+  repair,
+  uninstall,
   prepareProfile,
   parseMacosArgs,
   runMacosCli,
