@@ -1,5 +1,7 @@
 # t3code-enhancer 架构蓝图与核心流程设计
 
+> [项目首页](../README.md) · [安装与使用教程](../使用教程.md) · [功能详解](FEATURES.md) · [隐私与安全](PRIVACY_AND_SECURITY.md) · [CLI 速查](CLI_REFERENCE.md) · [故障排查](TROUBLESHOOTING.md) · **架构蓝图** · [开发者约束](../AGENTS.md)
+>
 > 本文档面向 **AI Agent** 与 **接手开发者**，将整个仓库压缩为可直接导航、理解与安全修改的架构蓝图。硬性开发红线与真实踩坑清单见根目录 [AGENTS.md](../AGENTS.md)。
 
 ---

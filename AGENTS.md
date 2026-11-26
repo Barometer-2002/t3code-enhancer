@@ -65,7 +65,7 @@ T3 Code 前端由 Rolldown + React Compiler 构建，混淆名（如 `Cs`、`ve`
 ### 坑 1：`ThreadRouteView` 的 `q` 来自 `quietThreadAtom`，会剥离流式文本并抑制重渲染
 - **现象**：在 `ThreadRouteView` 读取 `q?.turnItems` 计算流式输出速度时，所有 `reasoning` 和 `assistant_message` 的 `text` 与 `updatedAt` 都是 `undefined`，且流式期间组件根本不重渲染。
 - **根因**：`entities` 中的 `quietThreadAtom(ref)` 专门做了两件事——剥离流式项的 `text`/`updatedAt`（`U_` 变换），并通过等价函数屏蔽文本变化触发的更新。
-- **正确做法**：**绝不能把 `ThreadRouteView` 主视图改成订阅 `threadAtom`**（会导致 ~80 KB 对话页 20 fps 全量重渲染）。应在独立轻量子 Provider（如 `T3RingsCtxProvider`）内通过 `atomRegistry.subscribe(threadAtoms.threadAtom(threadRef), cb, { immediate: true })` 单独订阅未剥离投影，节流（~160 ms）只更新隔离 Context（`T3LiveSpeedCtx`），利用透传 `children` 引用避免宿主子树重渲染；按需弹层通过 `atomRegistry.get(...)` 读取未剥离快照。
+- **正确做法**：**绝不能把 `ThreadRouteView` 主视图改成订阅 `threadAtom`**（会导致 ~80 KB 对话页 20 fps 全量重渲染）。应在独立轻量子 Provider（如 `T3RingsCtxProvider`）内通过 `atomRegistry.subscribe(threadAtoms.threadAtom(threadRef), cb, { immediate: true })` 单独订阅未剥离投影，按 `1000 ms` 统计间隔（`T3_SPEED_STAT_INTERVAL_MS`）只更新隔离 Context（`T3LiveSpeedCtx`），利用透传 `children` 引用避免宿主子树重渲染；按需弹层通过 `atomRegistry.get(...)` 读取未剥离快照。
 
 ### 坑 2：`useI18n` 与 `useFormatMessage` 不是同一个 Hook
 - 宿主 `utils-*.js` 同时导出两个国际化函数：
