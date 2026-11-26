@@ -2,7 +2,7 @@
 
 T3 Code 桌面版的主题与界面增强工具，提供安装、状态检测和卸载命令。
 
-适用于 T3 Code **0.1.11** 的 **Windows 桌面版**、**Linux x86_64 官方 AppImage** 和 **macOS 官方版**。Linux 和 macOS 版会安装一个独立的增强版副本。
+适用于 **Windows 桌面版（T3 Code 0.1.11 / 0.1.12）**、**Linux x86_64 官方 AppImage（0.1.11）** 和 **macOS 官方版（0.1.11）**。Linux 和 macOS 版会安装一个独立的增强版副本。
 
 从 [GitHub Releases](https://github.com/Barometer-2002/t3code-enhancer/releases/latest) 下载安装 ZIP。安装、卸载和界面截图见 [使用教程](使用教程.md)。
 
@@ -97,7 +97,7 @@ open "$HOME/Applications/T3 Code Enhancer.app"
 ## 安全保障
 - 安装前自动备份纯净原版为 `server.asar.before-t3code-enhancer`（若此前已安装过旧版 `patch-timeline-collapse.cjs`，会自动继承其纯净原版备份，绝不覆盖原版）。
 - 写入前自动进行 ESM 语法检查、SHA-256 块完整性重算、以及所有未修改文件的逐字节一致性校验。
-- T3 Code 后续版本更新覆盖 `server.asar` 时，可先运行 `node cli.cjs status` 确认兼容性。
+- T3 Code 后续版本更新覆盖 `server.asar` 时，可先运行 `node cli.cjs status` 确认兼容性（Windows 版现已支持 `0.1.11` 与 `0.1.12`）。
 
 ## 许可与致谢
 

@@ -4,8 +4,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { readAsar, findUniqueEntry } = require("../lib/asar.cjs");
-const { ALL_PATCHES, resolvePristineBaseline, buildPatchedArchive } = require("../cli.cjs");
+const { readAsar, validateEsmSyntax } = require("../lib/asar.cjs");
+const { ALL_PATCHES, getPatchTargets, resolvePatchTarget, resolvePristineBaseline, buildPatchedArchive } = require("../cli.cjs");
 const timelineCollapse = require("../lib/patches/timeline-collapse.cjs");
 const usageRings = require("../lib/patches/usage-rings.cjs");
 const { SOURCE_THEME_PATH } = require("../lib/theme-manager.cjs");
@@ -86,6 +86,19 @@ assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired1, "gpt-oss-120b").ti
 assert.equal(usageRings.t3SelectPrimaryQuotaForModel(paired2, "gpt-6.2-sol").key, "s:w");
 console.log("   OK");
 
+console.log("3b. Validating multi-version targets & runtime module syntax (0.1.11 + 0.1.12)...");
+for (const patch of ALL_PATCHES) {
+  const versions = getPatchTargets(patch).map((t) => t.version);
+  assert(versions.includes("0.1.11") && versions.includes("0.1.12"), `${patch.id} missing 0.1.11 or 0.1.12 target`);
+}
+for (const [ver, syms] of [["0.1.11", usageRings.SYMBOLS_0111], ["0.1.12", usageRings.SYMBOLS_0112]]) {
+  const mod = usageRings.buildRuntimeModule(syms);
+  assert(mod.includes(usageRings.marker), `Missing marker in runtime module for ${ver}`);
+  assert(!/\.\.\.undefined|\bundefined\s*\(/.test(mod), `Unexpected undefined interpolation in ${ver} runtime module`);
+  validateEsmSyntax(Buffer.from(mod, "utf8"), `usage-rings runtime (${ver})`);
+}
+console.log("   OK");
+
 console.log("4. Full dry-run ASAR build (timeline-collapse + usage-rings) + syntax & integrity check...");
 const source = process.argv[2] || (
   process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Programs", "t3code", "resources", "server.asar")
@@ -101,10 +114,11 @@ try {
   const report = buildPatchedArchive(baseline.asar, ALL_PATCHES, tmpOut);
   const verified = readAsar(tmpOut);
   for (const p of ALL_PATCHES) {
-    const entry = findUniqueEntry(verified, p.targetRegex, p.id);
-    assert(entry.content.toString("utf8").includes(p.marker), `Marker missing for ${p.id}`);
+    const resolved = resolvePatchTarget(verified, p);
+    assert(resolved.installed, `Marker missing for ${p.id}`);
+    assert(resolved.entry.content.toString("utf8").includes(p.marker), `Marker missing for ${p.id}`);
   }
-  console.log("   OK -> built & verified:", report.map((r) => `${r.id}(${r.patched.slice(0, 10)})`).join(", "));
+  console.log(`   OK [v${baseline.detectedVersion || "unknown"}] -> built & verified:`, report.map((r) => `${r.id}(${r.patched.slice(0, 10)})`).join(", "));
 } finally {
   if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
 }

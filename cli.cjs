@@ -12,6 +12,7 @@ const timelineCollapse = require("./lib/patches/timeline-collapse.cjs");
 const usageRings = require("./lib/patches/usage-rings.cjs");
 
 const ALL_PATCHES = [timelineCollapse, usageRings];
+const SUPPORTED_VERSIONS = ["0.1.11", "0.1.12"];
 
 function getAsarPaths() {
   assert(process.platform === "win32" && process.env.LOCALAPPDATA, "目前仅支持 Windows 版 T3 Code");
@@ -23,60 +24,150 @@ function getAsarPaths() {
 
 function isT3Running() {
   const processes = execFileSync("tasklist.exe", ["/FO", "CSV", "/NH"], { encoding: "utf8" });
-  return /^"T3 Code(?: \(Beta\))?\.exe"/im.test(processes);
+  return /^"T3 Code(?: \((?:Beta|Nightly)\))?\.exe"/im.test(processes);
 }
 
 function assertT3Closed() {
   assert(!isT3Running(), "请先关闭所有 T3 Code 窗口（彻底退出进程），然后再执行安装或卸载。");
 }
 
+function getPatchTargets(patch) {
+  if (Array.isArray(patch.targets) && patch.targets.length > 0) return patch.targets;
+  return [
+    {
+      version: patch.version || null,
+      targetRegex: patch.targetRegex,
+      originalHash: patch.originalHash,
+      apply: patch.apply,
+    },
+  ];
+}
+
+function resolvePatchTarget(asar, patch) {
+  const targets = getPatchTargets(patch);
+  if (targets.length === 1) {
+    const target = targets[0];
+    const entry = findUniqueEntry(asar, target.targetRegex, patch.id);
+    const text = entry.content.toString("utf8");
+    const installed = text.includes(patch.marker);
+    const outdated = !installed && Array.isArray(patch.legacyMarkers) && patch.legacyMarkers.some((m) => text.includes(m));
+    const hash = digest(entry.content);
+    const pristine = hash === target.originalHash;
+    return { target, entry, installed, outdated, pristine, hash };
+  }
+
+  const candidates = [];
+  for (const target of targets) {
+    const matches = asar.entries.filter(({ key }) => target.targetRegex.test(key));
+    if (matches.length !== 1) continue;
+    const entry = findUniqueEntry(asar, target.targetRegex, `${patch.id}@${target.version || "unknown"}`);
+    const text = entry.content.toString("utf8");
+    const installed = text.includes(patch.marker);
+    const outdated = !installed && Array.isArray(patch.legacyMarkers) && patch.legacyMarkers.some((m) => text.includes(m));
+    const hash = digest(entry.content);
+    const pristine = hash === target.originalHash;
+    candidates.push({ target, entry, installed, outdated, pristine, hash });
+  }
+
+  const matched =
+    candidates.find((c) => c.pristine) ||
+    candidates.find((c) => c.installed || c.outdated) ||
+    candidates[0];
+  if (matched) return matched;
+
+  const supported = targets.map((t) => t.version).filter(Boolean).join(" / ") || SUPPORTED_VERSIONS.join(" / ");
+  throw new Error(`Could not uniquely identify ${patch.id} (supported versions: ${supported})`);
+}
+
 function inspectArchive(asarPath, patches = ALL_PATCHES) {
   const asar = readAsar(asarPath);
   const modules = patches.map((p) => {
-    const entry = findUniqueEntry(asar, p.targetRegex, p.id);
-    const text = entry.content.toString("utf8");
-    const installed = text.includes(p.marker);
-    const outdated = !installed && Array.isArray(p.legacyMarkers) && p.legacyMarkers.some((m) => text.includes(m));
-    const hash = digest(entry.content);
-    const pristine = hash === p.originalHash;
-    return { id: p.id, name: p.name, key: entry.key, installed, outdated, pristine, hash };
+    const resolved = resolvePatchTarget(asar, p);
+    return {
+      id: p.id,
+      name: p.name,
+      version: resolved.target.version || null,
+      key: resolved.entry.key,
+      installed: resolved.installed,
+      outdated: resolved.outdated,
+      pristine: resolved.pristine,
+      hash: resolved.hash,
+    };
   });
-  return { asar, modules };
+  const versions = [...new Set(modules.map((m) => m.version).filter(Boolean))];
+  const detectedVersion = versions.length === 1 && modules.every((m) => m.version === versions[0]) ? versions[0] : null;
+  return { asar, modules, detectedVersion };
 }
 
 function resolvePristineBaseline(paths) {
-  // Prefer dedicated enhancer backup, then legacy timeline-collapse backup, then current source if pristine.
-  for (const candidate of [paths.backup, paths.legacyBackup, paths.source]) {
+  let currentInfo = null;
+  if (fs.existsSync(paths.source)) {
+    try {
+      currentInfo = inspectArchive(paths.source);
+      if (currentInfo.modules.every((m) => m.pristine)) {
+        return { path: paths.source, asar: currentInfo.asar, detectedVersion: currentInfo.detectedVersion };
+      }
+    } catch {
+      // Fall back to backup candidates if current source is corrupted or unreadable.
+    }
+  }
+
+  for (const candidate of [paths.backup, paths.legacyBackup]) {
     if (!fs.existsSync(candidate)) continue;
     try {
       const info = inspectArchive(candidate);
-      if (info.modules.every((m) => m.pristine)) {
-        return { path: candidate, asar: info.asar };
+      if (!info.modules.every((m) => m.pristine)) continue;
+      if (currentInfo?.detectedVersion && info.detectedVersion && info.detectedVersion !== currentInfo.detectedVersion) {
+        continue;
       }
+      return { path: candidate, asar: info.asar, detectedVersion: info.detectedVersion };
     } catch {
       // ignore corrupted/incompatible candidate
     }
   }
   throw new Error(
-    "找不到未修改的原版 T3 Code 0.1.11 server.asar 基线文件（可能 T3 Code 已更新版本，请先核对兼容性）。"
+    `找不到未修改的原版 T3 Code (${SUPPORTED_VERSIONS.join(" / ")}) server.asar 基线文件（可能 T3 Code 已更新版本，请先核对兼容性）。`
   );
+}
+
+function archiveStaleBackup(backupPath) {
+  let label = "previous";
+  try {
+    const info = inspectArchive(backupPath);
+    if (info.detectedVersion) label = info.detectedVersion;
+  } catch {
+    // Keep generic label when old backup version cannot be inspected.
+  }
+  let archivedPath = `${backupPath}.${label}`;
+  if (fs.existsSync(archivedPath)) {
+    archivedPath = `${backupPath}.${label}-${Date.now()}`;
+  }
+  fs.renameSync(backupPath, archivedPath);
+  return archivedPath;
 }
 
 function buildPatchedArchive(baselineAsar, selectedPatches, outputPath) {
   const replacements = [];
   const report = [];
   for (const patch of selectedPatches) {
-    const entry = findUniqueEntry(baselineAsar, patch.targetRegex, patch.id);
+    const resolved = resolvePatchTarget(baselineAsar, patch);
+    const supported = getPatchTargets(patch).map((t) => t.version).filter(Boolean).join(" / ") || SUPPORTED_VERSIONS.join(" / ");
     assert.equal(
-      digest(entry.content),
-      patch.originalHash,
-      `基线文件 ${entry.key} 校验和不匹配（仅支持已验证的 T3 Code 0.1.11）`
+      resolved.hash,
+      resolved.target.originalHash,
+      `基线文件 ${resolved.entry.key} 校验和不匹配（仅支持已验证的 T3 Code ${supported}）`
     );
-    const patchedStr = patch.apply(entry.content.toString("utf8"));
+    const patchedStr = resolved.target.apply(resolved.entry.content.toString("utf8"));
     const replacement = Buffer.from(patchedStr, "utf8");
-    validateEsmSyntax(replacement, `${patch.id} (${entry.key})`);
-    replacements.push({ key: entry.key, replacement });
-    report.push({ id: patch.id, key: entry.key, original: patch.originalHash, patched: digest(replacement) });
+    validateEsmSyntax(replacement, `${patch.id} (${resolved.entry.key})`);
+    replacements.push({ key: resolved.entry.key, replacement });
+    report.push({
+      id: patch.id,
+      version: resolved.target.version || null,
+      key: resolved.entry.key,
+      original: resolved.target.originalHash,
+      patched: digest(replacement),
+    });
   }
   writePatchedAsar(baselineAsar, replacements, outputPath);
   return report;
@@ -89,6 +180,7 @@ function cmdStatus() {
   const running = isT3Running();
   console.log("=== T3 Code 主题与体验强化状态 ===");
   console.log("T3 Code 运行状态 :", running ? "运行中（安装/卸载补丁需先退出）" : "已退出");
+  console.log("T3 Code 检测版本 :", current.detectedVersion || "未识别/混合版本");
   console.log(
     "主题文件 (chatgpt-app) :",
     theme.installed
@@ -107,7 +199,8 @@ function cmdStatus() {
         : m.pristine
           ? "未安装（兼容原版）"
           : "未识别版本";
-    console.log(`  - [${m.installed ? "✓" : m.outdated ? "↑" : " "}] ${m.id} (${m.name}) : ${state}`);
+    const verTag = m.version ? ` [v${m.version}]` : "";
+    console.log(`  - [${m.installed ? "✓" : m.outdated ? "↑" : " "}] ${m.id}${verTag} (${m.name}) : ${state}`);
   }
 }
 
@@ -130,8 +223,16 @@ function cmdInstall(flags) {
   const baseline = resolvePristineBaseline(paths);
   const staging = `${paths.source}.${randomUUID()}.tmp`;
   try {
-    console.log(`[补丁] 正在基于干净原版基线构建（${selectedPatches.map((p) => p.id).join(" + ")}）...`);
+    const verText = baseline.detectedVersion ? `v${baseline.detectedVersion} ` : "";
+    console.log(`[补丁] 正在基于干净原版基线 ${verText}构建（${selectedPatches.map((p) => p.id).join(" + ")}）...`);
     const report = buildPatchedArchive(baseline.asar, selectedPatches, staging);
+    if (fs.existsSync(paths.backup)) {
+      const existingBackup = readAsar(paths.backup);
+      if (!existingBackup.archive.equals(baseline.asar.archive)) {
+        const archived = archiveStaleBackup(paths.backup);
+        console.log(`[备份] 检测到跨版本旧版备份，已归档至：${archived}`);
+      }
+    }
     if (!fs.existsSync(paths.backup)) {
       fs.copyFileSync(baseline.path, paths.backup, fs.constants.COPYFILE_EXCL);
       assert(readAsar(paths.backup).archive.equals(baseline.asar.archive), "原版备份校验不一致");
@@ -161,9 +262,15 @@ function cmdUninstall(flags) {
   assertT3Closed();
   const paths = getAsarPaths();
   const backupPath = fs.existsSync(paths.backup) ? paths.backup : fs.existsSync(paths.legacyBackup) ? paths.legacyBackup : null;
+  let current = null;
+  try {
+    current = inspectArchive(paths.source);
+  } catch {
+    current = null;
+  }
+
   if (!backupPath) {
-    const current = inspectArchive(paths.source);
-    if (current.modules.every((m) => m.pristine)) {
+    if (current && current.modules.every((m) => m.pristine)) {
       console.log("[补丁] 当前 server.asar 已是纯净原版，无需还原。");
       return;
     }
@@ -172,6 +279,15 @@ function cmdUninstall(flags) {
 
   const original = inspectArchive(backupPath);
   assert(original.modules.every((m) => m.pristine), `备份文件 ${backupPath} 校验不是纯净原版`);
+  if (current?.detectedVersion && original.detectedVersion && current.detectedVersion !== original.detectedVersion) {
+    if (current.modules.every((m) => m.pristine)) {
+      console.log(`[补丁] 当前 server.asar (${current.detectedVersion}) 已是纯净原版，已跳过旧版本备份还原（${backupPath} 为 ${original.detectedVersion}）。`);
+      return;
+    }
+    throw new Error(
+      `备份文件版本 (${original.detectedVersion}) 与当前安装版本 (${current.detectedVersion}) 不匹配，已拒绝跨版本覆盖。`
+    );
+  }
 
   const staging = `${paths.source}.${randomUUID()}.tmp`;
   try {
@@ -194,7 +310,7 @@ function cmdBuild(outputPath, flags) {
   const resolved = path.resolve(outputPath);
   if (fs.existsSync(resolved)) fs.unlinkSync(resolved);
   const report = buildPatchedArchive(baseline.asar, selectedPatches, resolved);
-  console.log(JSON.stringify({ output: resolved, modules: report }, null, 2));
+  console.log(JSON.stringify({ detectedVersion: baseline.detectedVersion, output: resolved, modules: report }, null, 2));
 }
 
 function main() {
@@ -243,4 +359,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { ALL_PATCHES, inspectArchive, resolvePristineBaseline, buildPatchedArchive };
+module.exports = { ALL_PATCHES, getPatchTargets, resolvePatchTarget, inspectArchive, resolvePristineBaseline, buildPatchedArchive };
