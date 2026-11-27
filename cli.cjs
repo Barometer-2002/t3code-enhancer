@@ -28,6 +28,9 @@ const {
   summarizeModuleStates,
   resolvePristineBaseline,
   buildPatchedArchive,
+  readSavedInstallPlan,
+  prepareSavedPlanTransaction,
+  clearSavedInstallPlan,
 } = require("./lib/engine.cjs");
 const { getThemeStatus, formatThemeStatusText, prepareThemeTransaction, reportThemeUninstall } = require("./lib/theme-manager.cjs");
 const {
@@ -315,20 +318,30 @@ function cmdInstall(flags, asarOverride, planOptions = {}) {
   const themeTx = plan.includeTheme
     ? prepareThemeTransaction(undefined, { officialOnly: plan.officialOnly, createSettingsIfMissing: true })
     : null;
+  const planTx = prepareSavedPlanTransaction(undefined, plan, plan.selectedPatches);
 
   let themeRes = null;
   if (plan.themeOnly) {
     try {
       themeRes = themeTx.commit();
+      planTx.commit();
     } catch (err) {
+      try { planTx.rollback(); } catch {}
       try { themeTx.rollback(); } catch {}
       throw err;
     }
   } else {
     const { appliedPatchIds, afterResult } = applyAsarPlan(plan, asarOverride, {
       assertClosed: planOptions.assertClosed,
-      afterCommit: themeTx ? () => themeTx.commit() : null,
-      onRollback: themeTx ? () => themeTx.rollback() : null,
+      afterCommit: () => {
+        const res = themeTx ? themeTx.commit() : null;
+        planTx.commit();
+        return res;
+      },
+      onRollback: () => {
+        try { planTx.rollback(); } catch {}
+        if (themeTx) themeTx.rollback();
+      },
     });
     themeRes = afterResult;
     reportSkippedPatches(plan, appliedPatchIds, asarOverride);
@@ -376,6 +389,13 @@ function resolveRepairPlan(flags, asarOverride, planOptions = {}) {
       // Ignore a corrupt archive so healthy siblings still inform the repair plan.
     }
   }
+  // When an official T3 Code update overwrites ASARs with pristine archives, ASAR-embedded
+  // build metadata is gone; fall back to the userdata-persisted plan so `repair` restores
+  // the user's previous packs/options instead of degrading to theme-only.
+  if (savedPlans.length === 0 && !mergedModules.some((m) => m.installed || m.outdated)) {
+    const persistedPlan = readSavedInstallPlan();
+    if (persistedPlan) savedPlans.push(persistedPlan);
+  }
   const inferred = inferRepairPlanOptions(mergedModules, themeStatus, effectiveFlags, savedPlans);
   if (inferred.officialOnly) effectiveFlags.add("--official");
   if (inferred.patchOnly) effectiveFlags.add("--patch-only");
@@ -398,11 +418,14 @@ function cmdRepair(flags, asarOverride, planOptions = {}) {
   const themeTx = plan.includeTheme
     ? prepareThemeTransaction(undefined, { officialOnly: plan.officialOnly, createSettingsIfMissing: true })
     : null;
+  const planTx = prepareSavedPlanTransaction(undefined, plan, plan.selectedPatches);
   let themeRes = null;
   if (plan.themeOnly) {
     try {
       themeRes = themeTx.commit();
+      planTx.commit();
     } catch (err) {
+      try { planTx.rollback(); } catch {}
       try { themeTx.rollback(); } catch {}
       throw err;
     }
@@ -410,8 +433,15 @@ function cmdRepair(flags, asarOverride, planOptions = {}) {
     const { appliedPatchIds, afterResult } = applyAsarPlan(plan, asarOverride, {
       repair: true,
       assertClosed: planOptions.assertClosed,
-      afterCommit: themeTx ? () => themeTx.commit() : null,
-      onRollback: themeTx ? () => themeTx.rollback() : null,
+      afterCommit: () => {
+        const res = themeTx ? themeTx.commit() : null;
+        planTx.commit();
+        return res;
+      },
+      onRollback: () => {
+        try { planTx.rollback(); } catch {}
+        if (themeTx) themeTx.rollback();
+      },
     });
     themeRes = afterResult;
     reportSkippedPatches(plan, appliedPatchIds, asarOverride);
@@ -461,7 +491,12 @@ function cmdUninstall(flags, asarOverride, options = {}) {
   }
 
   if (!keepTheme) reportThemeUninstall();
-  if (themeOnly) return;
+  if (themeOnly) {
+    const persisted = readSavedInstallPlan();
+    if (persisted?.themeOnly) clearSavedInstallPlan();
+    return;
+  }
+  clearSavedInstallPlan();
 
   console.log("\n卸载完成！现在可以重新启动 T3 Code。");
 }

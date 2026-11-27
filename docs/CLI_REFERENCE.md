@@ -87,5 +87,5 @@ node cli.cjs uninstall --purge-backup                 # 彻底还原原版并清
 | 命令 | 耗时 | 说明 |
 | --- | --- | --- |
 | `npm run test:unit` | `< 1s` | 纯逻辑与三端 CLI 单测，无需安装 T3 Code |
-| `npm test`（可加 `-- <server.asar>`） | `~30s` | 基于真实 `0.1.12` 构建与全部 UI / 去遥测 / 托盘回归 |
+| `npm test`（可加 `-- <server.asar>`） | `~30s` | 基于真实 `0.1.13`（兼容 `0.1.12`）构建与全部 UI / 去遥测 / 托盘回归 |
 | `npm run test:full` | `~5min` | 追加 `v0.1.99` 跨版本变异压测与三端事务回滚矩阵 |

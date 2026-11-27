@@ -13,7 +13,7 @@
   - **Linux（AppImage / `.deb`）与 macOS**：单档合并 `app.asar`（同时含 `apps/server/*` 与 `apps/desktop/*`）。必须始终用 `applicablePatchesForArchive()` 按归档内容过滤补丁。
   - **macOS 禁止原地改包**：`assertSafeAsarTargets()` 硬拦截对 `.app/Contents/Resources/*.asar` 的直接 `--asar` 写入（否则破坏代码签名与 `ElectronAsarIntegrity`）；必须经 `macos.cjs` / `--app` 在独立副本上重建并重签名。
 - **Windows 运行锁与测试隔离**：运行中的 T3 Code（含当前承载 Agent 的宿主进程）会锁定生产目录的 `server.asar` / `app.asar`。开发与测试严禁直接覆盖正在运行的生产 ASAR；本机生效需先彻底退出 T3 Code 后执行 `node cli.cjs repair`。
-- **版本单一真相**：工具版本号以 `package.json` 为唯一真相源，由 `lib/version.cjs` 强校验为 `MAJOR.MINOR.PATCH` 或 `MAJOR.MINOR.PATCH-(alpha|beta|preview|rc).<N>`，与 T3 Code 基线版本 `T3_BASELINE_VERSION`（`0.1.12`）完全解耦。
+- **版本单一真相**：工具版本号以 `package.json` 为唯一真相源，由 `lib/version.cjs` 强校验为 `MAJOR.MINOR.PATCH` 或 `MAJOR.MINOR.PATCH-(alpha|beta|preview|rc).<N>`，与 T3 Code 基线版本 `T3_BASELINE_VERSION`（`0.1.13`，向后兼容 `0.1.12`）完全解耦。
 - **行尾规范**：`install.sh` 必须保持 `LF`，`*.cmd` 必须保持 `CRLF`（`.gitattributes` 约束，单测 `3.7` 强制校验）。
 
 ---
@@ -52,10 +52,10 @@ T3 Code 前端由 Rolldown + React Compiler 构建，混淆名（如 `Cs`、`ve`
 - **React Compiler 缓存数组 `(0,Q.c)(N)`**：向宿主组件内追加需要 memo 的值时，**禁止硬写 `t[xxx]` 固定下标**，必须通过 `ctx.allocateMemoSlots()` 扩展槽位容量并获取安全槽位索引。
 - **同文件多补丁叠加**：多个补丁按 `ALL_PATCHES` 注册顺序串联作用于同一 chunk（如 `usage-rings` + `new-chat-layout` + `workspace-floating-panels` 共改 `ThreadRouteView-*.js`）。补丁间存在条件协作时必须用 `ctx.isEnabled(patchId)` 判断（例如 `new-chat-layout` 在未装 `usage-rings` 时需保留原版右侧权限入口）。
 
-### 2.4 构建元数据与无参修复（`t3e-build-meta.json`）
+### 2.4 构建元数据与无参修复（`t3e-build-meta.json` + `.t3code-enhancer-plan.json`）
 
-- 每次 `buildPatchedArchive()` 都会在 ASAR 根写入 `t3e-build-meta.json`（记录 `enhancerVersion`、`appVersion`、`compatTier`、`modules` 与序列化后的 `plan`）。
-- 裸跑 `repair` 时，`inferRepairPlanOptions()` 优先读取存活归档中的 `plan`（精确保留 `--packs`、`--no-desktop-tray`、`--official` 等细粒度排除项）；即使 Windows 下 `app.asar` 损坏，仍能从存活的 `server.asar` 恢复原方案。
+- 每次 `buildPatchedArchive()` 都会在 ASAR 根写入 `t3e-build-meta.json`（记录 `enhancerVersion`、`appVersion`、`compatTier`、`modules` 与序列化后的 `plan`），同时 `cmdInstall` / `cmdRepair` 会在用户数据目录同步事务化持久化 `.t3code-enhancer-plan.json`（卸载时清理）。
+- 裸跑 `repair` 时，`inferRepairPlanOptions()` 优先读取存活归档中的 `plan`（精确保留 `--packs`、`--no-desktop-tray`、`--official` 等细粒度排除项）；即使 Windows 下 `app.asar` 损坏，仍能从存活的 `server.asar` 恢复原方案；若官方原生覆盖升级清除了全部归档补丁，则自动回退读取 `.t3code-enhancer-plan.json`，绝不误退化为 `theme-only`。
 - `matchesSelectedPatches()` 会额外检查**同文件是否残留未选中的补丁**，避免用户缩减模块组合时因已选模块均已安装而误跳过重建。
 
 ---
@@ -109,7 +109,7 @@ T3 Code 前端由 Rolldown + React Compiler 构建，混淆名（如 `Cs`、`ve`
 | 命令 | 覆盖范围 | 典型耗时 | 使用时机 |
 | --- | --- | --- | --- |
 | `npm run test:unit` | 纯逻辑单测（Suite 1 ~ 3.7，无需安装 T3 Code） | `< 1s` | 改纯算法/CLI 解析/主题校验时快速迭代 |
-| `npm test` | 真实 `0.1.12` 双端全量构建 + 19 补丁/6 外置运行时 + 全部 UI/交互/安全/去遥测/托盘校验（Suite 1 ~ 16） | `~30s` | **每次改动后的默认必跑门禁** |
+| `npm test` | 真实 `0.1.13`（兼容 `0.1.12`）双端全量构建 + 19 补丁/6 外置运行时 + 全部 UI/交互/安全/去遥测/托盘校验（Suite 1 ~ 16） | `~30s` | **每次改动后的默认必跑门禁** |
 | `npm run test:full` | 追加 Suite 17（v0.1.99 跨版本变异压测）与 Suite 18（Linux/macOS 合并单档 + Windows 双端事务回滚矩阵，已采用 `createSlimAsar` 精简真实内容夹具） | `~5min` | 改 `engine`/`resolver`/`asar`/跨端安装事务，或发版打 ZIP 前必跑 |
 
 ### 提交前自检 Checklist
