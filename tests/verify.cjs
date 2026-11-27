@@ -4751,6 +4751,10 @@ function verifyCrossVersionMutation(serverBaseline, desktopBaseline) {
       () => verifyInjectedScope("const a = 1;\n", ["const x = FAKE_UNDECLARED_VAR_999();"], "suite17 undeclared"),
       /Static scope check failed for suite17 undeclared: undeclared reference\(s\): FAKE_UNDECLARED_VAR_999/
     );
+    assert.throws(
+      () => verifyInjectedScope("const a = 1;\n", ["const el = (0,undefined.jsx)('div', {});"], "suite17 undefined-jsx"),
+      /accidental "undefined\." property access/
+    );
     verifyInjectedScope("import{q as r}from\"./x.js\";const a = 1;function b(){return a}\n", ["const y = r(a) + b() + Math.max(1, 2);"], "suite17 declared");
     verifyInjectedScope("const a = 1;\n", ["const z = t3Extra(a);"], "suite17 allowed", ["t3Extra"]);
     const rogueOut = path.join(tmpRoot, "rogue.asar");
@@ -4861,7 +4865,9 @@ try {
   const verified = readAsar(tmpOut);
   for (const p of baselineApplicable) {
     const entry = findUniqueEntry(verified, p.targetRegex, p.id);
-    assert(entry.content.toString("utf8").includes(p.marker), `Marker missing for ${p.id}`);
+    const entryStr = entry.content.toString("utf8");
+    assert(entryStr.includes(p.marker), `Marker missing for ${p.id}`);
+    assert(!/\(0,\s*undefined\.|\bundefined\.(?:jsx|jsxs|Fragment)\b/.test(entryStr), `Accidental undefined JSX interpolation detected in ${p.id}`);
   }
   let verifiedDesktop = verified.entries.some((e) => desktopTray.targetRegex.test(e.key)) ? verified : null;
   if (desktopBaseline && tmpDesktopOut) {

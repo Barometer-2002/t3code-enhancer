@@ -73,7 +73,7 @@ flowchart TD
 | 13 | `new-chat-layout` | `workspace` | — | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_NEW_CHAT_LAYOUT_V9` | — |
 | 14 | `files-changes-explorer` | `chat` | — | `apps/server/dist/client/assets/FilePreviewPanel-*.js` | `T3_FILES_CHANGES_EXPLORER_V9` | `files-explorer-ui.mjs` |
 | 15 | `workspace-floating-panels` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_WORKSPACE_FLOATING_PANELS_V31` | `floating-panels-ui.mjs` |
-| 16 | `workspace-floating-tab-bar` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/PanelLayoutControls-*.js` | `T3_WORKSPACE_FLOATING_TAB_BAR_V14` | `tab-bar-ui.mjs` |
+| 16 | `workspace-floating-tab-bar` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/PanelLayoutControls-*.js` | `T3_WORKSPACE_FLOATING_TAB_BAR_V15` | `tab-bar-ui.mjs` |
 | 17 | `workspace-floating-preview-toolbar` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/PreviewPanel-*.js` | `T3_WORKSPACE_FLOATING_PREVIEW_TOOLBAR_V2` | — |
 | 18 | `workspace-floating-preview-responsive` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/main-*.js` | `T3_WORKSPACE_FLOATING_PREVIEW_RESPONSIVE_V2` | — |
 | 19 | `desktop-tray` | `workspace` | — | `apps/desktop/dist-electron/main.cjs` | `T3_DESKTOP_TRAY_V1` | — |
