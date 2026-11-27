@@ -47,13 +47,18 @@ const BACKUP_SUFFIX = ".before-t3code-enhancer";
 
 function getLinuxPaths(env = process.env, homedir = os.homedir()) {
   const dataHome = env.XDG_DATA_HOME || path.join(homedir, ".local", "share");
+  const customT3Home = typeof env.T3CODE_HOME === "string" ? env.T3CODE_HOME.trim() : "";
+  const defaultSharedHome = path.join(homedir, ".t3");
+  const sharedHome = customT3Home ? path.resolve(customT3Home) : defaultSharedHome;
   return {
     dataHome,
     installDirectory: path.join(dataHome, "t3code-enhancer"),
     installLock: path.join(dataHome, ".t3code-enhancer-install.lock"),
     previousDirectory: path.join(dataHome, ".t3code-enhancer-previous"),
     profileDirectory: path.join(dataHome, "t3code-enhancer-profile"),
-    sharedUserdata: path.join(homedir, ".t3", "userdata"),
+    sharedHome,
+    sharedHomeLabel: customT3Home ? sharedHome : "~/.t3",
+    sharedUserdata: path.join(sharedHome, "userdata"),
   };
 }
 
@@ -170,7 +175,7 @@ function status(paths = getLinuxPaths()) {
   console.log("主题：", formatThemeStatusText(existing.themeStatus));
   console.log("原版 ASAR 备份：", existing.hasBackup ? existing.backupPath : "尚未创建（下次传入 AppImage 升级时将自动补建）");
   console.log(`启动：${path.join(installDirectory, "launch.sh")}`);
-  console.log(existing.sharedData ? "数据：与官方版共用 ~/.t3，两者不能同时运行" : `独立配置：${profileDirectory}`);
+  console.log(existing.sharedData ? `数据：与官方版共用 ${paths.sharedHomeLabel || "~/.t3"}，两者不能同时运行` : `独立配置：${profileDirectory}`);
   if (existing.summary.outdated) {
     console.log("\n待更新模块：");
     for (const m of existing.modules.filter((mod) => !mod.installed)) {
@@ -505,7 +510,7 @@ function uninstall(flags = new Set(), paths = getLinuxPaths()) {
       return;
     }
     console.log(sharedData
-      ? "已卸载 Linux 增强版。会话和项目仍在 ~/.t3，官方版可以继续使用"
+      ? `已卸载 Linux 增强版。会话和项目仍在 ${paths.sharedHomeLabel || "~/.t3"}，官方版可以继续使用`
       : `已卸载 Linux 增强版。独立配置和会话保存在 ${profileDirectory}`);
   }, paths);
 }
