@@ -4604,12 +4604,8 @@ function findDefaultVerifyAsar() {
     candidates.push(path.join(process.env.LOCALAPPDATA, "Programs", "t3code", "resources", "server.asar"));
   }
   if (process.platform === "linux") candidates.push(...getLinuxAsarCandidates());
-  if (process.platform === "darwin") {
-    candidates.push(
-      path.join(os.homedir(), "Applications", "T3 Code Enhancer.app", "Contents", "Resources", "app.asar"),
-      "/Applications/T3 Code (Beta).app/Contents/Resources/app.asar"
-    );
-  }
+  // macOS 增强版副本总是已打补丁且没有原版备份，不能作为基线，只用官方 .app。
+  if (process.platform === "darwin") candidates.push("/Applications/T3 Code (Beta).app/Contents/Resources/app.asar");
   return candidates.find((p) => p && fs.existsSync(p));
 }
 const source = explicitSource || findDefaultVerifyAsar();

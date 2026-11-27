@@ -99,7 +99,7 @@ node cli.cjs uninstall                                # 一键还原官方原版
 
 - **Windows（官方桌面版）** — ✅ 已实测，安装前自动保留原版备份。
 - **Linux x86_64（AppImage / `.deb` / 解包版）** — ✅ 已实测，AppImage 默认独立目录运行、互不干扰。
-- **macOS\*（官方 `.app`）** — 🧪 已通过跨平台单元测试，**诚征 Mac 真机试用反馈**（默认生成独立副本，不动官方原版）。
+- **macOS（官方 `.app`）** — ✅ 已在 Apple Silicon 实测（默认生成独立副本，不动官方原版）；Intel Mac 尚待反馈。
 
 ## 文档导航
 

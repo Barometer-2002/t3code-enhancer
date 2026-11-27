@@ -2,7 +2,7 @@
 "use strict";
 
 // Note: Adapted from original macOS PR (0b8cc00) for current multi-pack / no-telemetry / upgrade / repair support.
-// Not executed on physical macOS hardware; core helper logic is covered by cross-platform unit tests in tests/verify.cjs.
+// Verified on Apple Silicon (macOS 27, T3 Code 0.1.12); helper logic is also covered by cross-platform unit tests in tests/verify.cjs.
 
 const assert = require("node:assert/strict");
 const { execFileSync } = require("node:child_process");
@@ -215,7 +215,7 @@ function status(existing, paths = getMacosPaths()) {
       existing = inspectInstall(paths);
     } catch (err) {
       if (isManagedInstall(installDirectory)) {
-        console.log(`检测到受管理的 macOS 安装 (${installDirectory})，当前包无法直接识别（${err.message}）。`);
+        console.log(`检测到受管理的 macOS 安装 (${installDirectory})，当前包无法直接识别（${err.message.split("\n")[0]}）。`);
         console.log("若之前安装自更早版本（如 v0.1.1 的 0.1.11），请退出应用后运行 install（使用新版官方 T3 Code .app）升级，或运行 repair 修复。");
         return;
       }
