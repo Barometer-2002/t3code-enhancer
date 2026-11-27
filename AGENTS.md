@@ -114,7 +114,9 @@ T3 Code 前端由 Rolldown + React Compiler 构建，混淆名（如 `Cs`、`ve`
 
 ### 提交前自检 Checklist
 
-1. `git diff --check` 无空白/冲突残渣，且未误动无关文件。
-2. 补丁结构变更已同步递增 `MARKER` + 更新 `LEGACY_MARKERS`；外置 `lib/runtime/*.mjs` 保持零 `import`。
-3. 至少通过 `npm run test:unit` 与 `npm test`；如改动构建引擎、事务/回滚、跨平台脚本或发版前，补跑 `npm run test:full`。
-4. 如需更新本机正在运行的 T3 Code 验证实机效果：提醒用户先彻底关闭 T3 Code（含托盘图标），再运行 `node cli.cjs repair`。
+> 完整的 PR 自动拉取/试配、提交前门禁与发版打包流程见 **[docs/MAINTAINER_WORKFLOW.md](docs/MAINTAINER_WORKFLOW.md)**。
+
+1. 运行 `npm run preflight`（或仅快速静态门禁 `npm run preflight -- --skip-tests`），自动校验 `git diff --check`、零外部依赖、行尾规范、`MARKER`/`LEGACY_MARKERS`、外置运行时零 `import` 与文档版本对齐。
+2. 补丁结构变更已同步递增 `MARKER` + 更新 `LEGACY_MARKERS`；外置 `lib/runtime/*.mjs` 保持零 `import` 并登记到 `PATCH_RUNTIME_NAMES`。
+3. 至少通过 `npm run test:unit` 与 `npm test`；如改动构建引擎、事务/回滚、跨平台脚本或发版前，补跑 `npm run preflight -- --full --e2e`。
+4. 发版统一使用 `npm run release:pack`（解压验包 + SHA-256）与 `npm run release:publish`（防覆写 tag + 默认 Draft Release）；如需更新本机正在运行的 T3 Code 验证实机效果：提醒用户先彻底关闭 T3 Code（含托盘图标），再运行 `node cli.cjs repair`。

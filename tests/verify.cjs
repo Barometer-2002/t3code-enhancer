@@ -629,6 +629,79 @@ function verifyCrossPlatformCliUnit() {
   }
   assert.equal(JSON.parse(fs.readFileSync(SOURCE_THEME_PATH, "utf8")).version, 1, "Theme JSON schema version must remain upstream integer 1");
 
+  // 3.10) Maintainer preflight & zero-dependency release packaging scripts
+  const preflight = require("../scripts/preflight.cjs");
+  const packReleaseMod = require("../scripts/pack-release.cjs");
+  const publishReleaseMod = require("../scripts/publish-release.cjs");
+
+  assert.equal(preflight.parseArgs(["--ci", "--strict-clean", "--base=origin/main"]).baseRef, "origin/main");
+  assert.equal(preflight.checkZeroDeps(rootDir).ok, true, "checkZeroDeps must pass on repo");
+  const regCheck = preflight.checkPatchAndRuntimeRegistry(rootDir);
+  assert.equal(regCheck.ok, true, `checkPatchAndRuntimeRegistry failed: ${regCheck.errors.join("; ")}`);
+  assert.equal(regCheck.patchCount, ALL_PATCHES.length);
+  const hygieneCheck = preflight.checkEolAndHygiene(rootDir);
+  assert.equal(hygieneCheck.ok, true, `checkEolAndHygiene failed: ${hygieneCheck.errors.join("; ")}`);
+  const docsCheck = preflight.checkDocsAlignment(rootDir);
+  assert.equal(docsCheck.ok, true, `checkDocsAlignment failed: ${docsCheck.errors.join("; ")}`);
+  assert.deepEqual(
+    preflight.extractMarkersFromPatchSource('const MARKER = "T3_ALPHA_V2"; const sub = { marker: "T3_BETA_V1" };'),
+    ["T3_ALPHA_V2", "T3_BETA_V1"]
+  );
+
+  // Pure JS CRC-32 standard test vector & UTF-8 / Unix 0755 ZIP round-trip
+  assert.equal(packReleaseMod.crc32(Buffer.from("123456789", "utf8")), 0xcbf43926);
+  const sampleZip = packReleaseMod.createZipBuffer([
+    { name: "pkg/", data: null, mode: 0o040755 },
+    { name: "pkg/install.sh", data: Buffer.from("#!/usr/bin/env sh\necho ok\n", "utf8"), mode: 0o100755 },
+    { name: "pkg/使用教程.md", data: Buffer.from("# 中文标题\n".repeat(40), "utf8"), mode: 0o100644 },
+    { name: "pkg/empty.txt", data: Buffer.alloc(0), mode: 0o100644 },
+  ]);
+  const parsedEntries = packReleaseMod.readZipEntries(sampleZip);
+  assert.equal(parsedEntries.length, 4);
+  const zInstall = parsedEntries.find((e) => e.name === "pkg/install.sh");
+  assert.equal(zInstall.madeByHost, 3);
+  assert.equal(zInstall.unixMode, 0o755);
+  assert.equal(zInstall.data.toString("utf8"), "#!/usr/bin/env sh\necho ok\n");
+  const zZh = parsedEntries.find((e) => e.name === "pkg/使用教程.md");
+  assert(Boolean(zZh && (zZh.flags & 0x0800) && zZh.method === 8));
+  assert.equal(zZh.data.toString("utf8"), "# 中文标题\n".repeat(40));
+
+  const releaseManifest = packReleaseMod.collectReleaseFiles(rootDir, { includeUntracked: true });
+  assert(releaseManifest.some((f) => f.rel === "install.sh" && f.mode === 0o100755), "Release manifest must mark install.sh executable");
+  assert(releaseManifest.some((f) => f.rel === "scripts/preflight.cjs"), "Release manifest must include maintainer scripts");
+  assert(!releaseManifest.some((f) => f.rel.startsWith(".github/") || f.rel.startsWith("dist/")), "Release manifest must exclude .github/ and dist/");
+
+  const tmpNotes = path.join(os.tmpdir(), `t3e-notes-test-${process.pid}.md`);
+  try {
+    fs.writeFileSync(tmpNotes, packReleaseMod.buildReleaseNotesTemplate({
+      versionTag: "v0.2.1",
+      isPrerelease: false,
+      zipName: "t3code-enhancer-v0.2.1.zip",
+      fileCount: 10,
+      byteSize: 12345,
+      sha256: "a".repeat(64),
+    }), "utf8");
+    const updated = packReleaseMod.updateNotesChecksum(tmpNotes, {
+      zipName: "t3code-enhancer-v0.2.1.zip",
+      fileCount: 12,
+      byteSize: 23456,
+      sha256: "b".repeat(64),
+    });
+    assert.equal(updated, true);
+    const notesText = fs.readFileSync(tmpNotes, "utf8");
+    assert(notesText.includes("12 个文件") && notesText.includes("b".repeat(64)));
+  } finally {
+    fs.rmSync(tmpNotes, { force: true });
+  }
+
+  const pubDefaults = publishReleaseMod.parseArgs([]);
+  assert.equal(pubDefaults.execute, false, "publish-release must default to dry-run");
+  assert.equal(pubDefaults.publish, false, "publish-release must default to draft release");
+  const pubExec = publishReleaseMod.parseArgs(["--execute", "--publish", "--allow-branch"]);
+  assert.equal(pubExec.execute, true);
+  assert.equal(pubExec.publish, true);
+  assert.equal(pubExec.allowBranch, true);
+
   // 4) Isolated dual-ASAR vs single-ASAR discovery (Windows layout)
   const tmpWin = fs.mkdtempSync(path.join(os.tmpdir(), "t3e-unit-win-"));
   const origLocalAppData = process.env.LOCALAPPDATA;

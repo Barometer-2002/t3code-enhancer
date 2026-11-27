@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight-and-unit:
+    name: Preflight & Unit (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: "20"
+          - os: ubuntu-latest
+            node: "22"
+          - os: macos-latest
+            node: "20"
+          - os: windows-latest
+            node: "20"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Run preflight gate & unit tests
+        run: node scripts/preflight.cjs --ci
+
+  verify-release-packaging:
+    name: Verify Release Packaging
+    runs-on: ubuntu-latest
+    needs: preflight-and-unit
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Dry-run pack & verify unpacked ZIP
+        run: node scripts/pack-release.cjs --out "${{ runner.temp }}/t3e-ci-pack.zip" --skip-clean-check
+
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          node -e '
+            const { ENHANCER_TAG } = require("./lib/version.cjs");
+            const actual = process.env.GITHUB_REF_NAME;
+            if (actual !== ENHANCER_TAG) {
+              console.error(`Tag mismatch: git tag is ${actual}, but package.json expects ${ENHANCER_TAG}`);
+              process.exit(1);
+            }
+            console.log(`Tag verified: ${actual}`);
+          '
