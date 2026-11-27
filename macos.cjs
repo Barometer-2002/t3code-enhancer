@@ -2,7 +2,7 @@
 "use strict";
 
 // Note: Adapted from original macOS PR (0b8cc00) for current multi-pack / no-telemetry / upgrade / repair support.
-// Not executed on physical macOS hardware; core helper logic is covered by cross-platform unit tests in tests/verify.cjs.
+// Verified on Apple Silicon (macOS 27, T3 Code 0.1.12); helper logic is also covered by cross-platform unit tests in tests/verify.cjs.
 
 const assert = require("node:assert/strict");
 const { execFileSync } = require("node:child_process");
@@ -154,7 +154,7 @@ function verifyOfficialSignature(app) {
 }
 
 function prepareProfile(sharedData, options = {}, paths = getMacosPaths()) {
-  return prepareProfileAt(getUserdataDir(sharedData, paths), sharedData, options);
+  return prepareProfileAt(getUserdataDir(sharedData, paths), options);
 }
 
 function buildInfoPlistEnv(existingEnv = {}, sharedData = false, paths = getMacosPaths(), options = {}) {
@@ -215,7 +215,7 @@ function status(existing, paths = getMacosPaths()) {
       existing = inspectInstall(paths);
     } catch (err) {
       if (isManagedInstall(installDirectory)) {
-        console.log(`检测到受管理的 macOS 安装 (${installDirectory})，当前包无法直接识别（${err.message}）。`);
+        console.log(`检测到受管理的 macOS 安装 (${installDirectory})，当前包无法直接识别（${err.message.split("\n")[0]}）。`);
         console.log("若之前安装自更早版本（如 v0.1.1 的 0.1.11），请退出应用后运行 install（使用新版官方 T3 Code .app）升级，或运行 repair 修复。");
         return;
       }
@@ -299,6 +299,8 @@ function install(input, options = {}, paths = getMacosPaths()) {
     assert(!requestedSharedData || sharedData, "当前为独立配置模式，无需 --shared-data（如需切换请先卸载）");
     const res = prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
     console.log(`[主题] 已安装 chatgpt-app 主题（${plan.officialOnly ? "仅官方稳定层 Layer 1" : "完整分层主题 Layer 1-3"}） -> ${res.targetPath}`);
+    // 没有增强版副本时，卸载无法推断共用目录，必须显式带上 --shared-data。
+    if (sharedData && !dirExists) console.log("[提示] 卸载此主题：node macos.cjs uninstall --theme-only --shared-data");
   }, paths);
 
   return withInstallLock(() => {
@@ -349,8 +351,7 @@ function install(input, options = {}, paths = getMacosPaths()) {
     const themeTx = plan.includeTheme
       ? require("./lib/theme-manager.cjs").prepareThemeTransaction(getUserdataDir(sharedData, paths), {
           officialOnly: plan.officialOnly,
-          activate: !sharedData,
-          createSettingsIfMissing: !sharedData,
+          createSettingsIfMissing: true,
         })
       : null;
     try {
@@ -412,7 +413,7 @@ function install(input, options = {}, paths = getMacosPaths()) {
       replaceStagedInstall(app, paths.installDirectory, replacing ? paths.previousApp : null, themeTx ? {
         afterCommit: () => {
           const res = themeTx.commit();
-          if (!sharedData && !res.activated) {
+          if (!res.activated) {
             console.warn("[提示] 主题已写入，但未能自动激活：请检查设置文件后手动切换主题");
           }
         },

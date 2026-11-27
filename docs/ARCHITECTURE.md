@@ -201,7 +201,7 @@ T3 Code 前端由 Rolldown + React Compiler 构建，升级后必然发生：**c
 
 ### 4.4 三端平台适配差异矩阵
 
-| 维度 | Windows（`cli.cjs`） | Linux AppImage（`linux.cjs`） | Linux `.deb`/解包（`cli.cjs`） | macOS（`macos.cjs`，未真机实测） |
+| 维度 | Windows（`cli.cjs`） | Linux AppImage（`linux.cjs`） | Linux `.deb`/解包（`cli.cjs`） | macOS（`macos.cjs`，Apple Silicon 实测） |
 | --- | --- | --- | --- | --- |
 | 归档形态 | `server.asar` + `app.asar` 双档分离 | 单档合并 `app.asar`（解压 `squashfs-root`） | 单档合并 `app.asar` | 单档合并 `app.asar`（独立副本 `.app`） |
 | 补丁数 | 17（server）+ 2（desktop） | 19 | 19 | 19（共享）或 20（独立含 `macos-user-data`） |

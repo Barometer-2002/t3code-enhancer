@@ -47,13 +47,18 @@ const BACKUP_SUFFIX = ".before-t3code-enhancer";
 
 function getLinuxPaths(env = process.env, homedir = os.homedir()) {
   const dataHome = env.XDG_DATA_HOME || path.join(homedir, ".local", "share");
+  const customT3Home = typeof env.T3CODE_HOME === "string" ? env.T3CODE_HOME.trim() : "";
+  const defaultSharedHome = path.join(homedir, ".t3");
+  const sharedHome = customT3Home ? path.resolve(customT3Home) : defaultSharedHome;
   return {
     dataHome,
     installDirectory: path.join(dataHome, "t3code-enhancer"),
     installLock: path.join(dataHome, ".t3code-enhancer-install.lock"),
     previousDirectory: path.join(dataHome, ".t3code-enhancer-previous"),
     profileDirectory: path.join(dataHome, "t3code-enhancer-profile"),
-    sharedUserdata: path.join(homedir, ".t3", "userdata"),
+    sharedHome,
+    sharedHomeLabel: customT3Home ? sharedHome : "~/.t3",
+    sharedUserdata: path.join(sharedHome, "userdata"),
   };
 }
 
@@ -110,7 +115,7 @@ function getUserdataDir(sharedData, paths = getLinuxPaths()) {
 }
 
 function prepareProfile(sharedData, options = {}, paths = getLinuxPaths()) {
-  return prepareProfileAt(getUserdataDir(sharedData, paths), sharedData, options);
+  return prepareProfileAt(getUserdataDir(sharedData, paths), options);
 }
 
 function inspectInstall(paths = getLinuxPaths()) {
@@ -170,7 +175,7 @@ function status(paths = getLinuxPaths()) {
   console.log("主题：", formatThemeStatusText(existing.themeStatus));
   console.log("原版 ASAR 备份：", existing.hasBackup ? existing.backupPath : "尚未创建（下次传入 AppImage 升级时将自动补建）");
   console.log(`启动：${path.join(installDirectory, "launch.sh")}`);
-  console.log(existing.sharedData ? "数据：与官方版共用 ~/.t3，两者不能同时运行" : `独立配置：${profileDirectory}`);
+  console.log(existing.sharedData ? `数据：与官方版共用 ${paths.sharedHomeLabel || "~/.t3"}，两者不能同时运行` : `独立配置：${profileDirectory}`);
   if (existing.summary.outdated) {
     console.log("\n待更新模块：");
     for (const m of existing.modules.filter((mod) => !mod.installed)) {
@@ -237,6 +242,8 @@ function install(input, options = {}, paths = getLinuxPaths()) {
     assert(!requestedSharedData || sharedData, "当前为独立配置模式，无需 --shared-data（如需切换请先卸载）");
     const res = prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
     console.log(`[主题] 已安装 chatgpt-app 主题（${plan.officialOnly ? "仅官方稳定层 Layer 1" : "完整分层主题 Layer 1-3"}） -> ${res.targetPath}`);
+    // 没有增强版副本时，卸载无法推断共用目录，必须显式带上 --shared-data。
+    if (sharedData && !dirExists) console.log("[提示] 卸载此主题：node linux.cjs uninstall --theme-only --shared-data");
   }, paths);
 
   return withInstallLock(() => {
@@ -305,7 +312,7 @@ function install(input, options = {}, paths = getLinuxPaths()) {
       const targetPatches = applicablePatchesForArchive(baseline.asar, selectedPatches);
       const userdataDir = getUserdataDir(sharedData, paths);
       const themeTx = plan.includeTheme
-        ? prepareThemeTransaction(userdataDir, { officialOnly: plan.officialOnly, activate: !sharedData, createSettingsIfMissing: !sharedData })
+        ? prepareThemeTransaction(userdataDir, { officialOnly: plan.officialOnly, createSettingsIfMissing: true })
         : null;
       const launchPath = path.join(paths.installDirectory, "launch.sh");
       const managedPath = path.join(paths.installDirectory, MANAGED_FILE);
@@ -349,7 +356,7 @@ function install(input, options = {}, paths = getLinuxPaths()) {
         asarReplaced = true;
         if (themeTx) {
           const res = themeTx.commit();
-          if (!sharedData && !res.activated) {
+          if (!res.activated) {
             console.warn("[提示] 主题已写入，但未能自动激活：请检查设置文件后手动切换主题");
           }
         }
@@ -389,7 +396,7 @@ function install(input, options = {}, paths = getLinuxPaths()) {
     fs.mkdirSync(paths.dataHome, { recursive: true });
     const staging = fs.mkdtempSync(path.join(paths.dataHome, ".t3code-enhancer-"));
     const themeTx = plan.includeTheme
-      ? prepareThemeTransaction(getUserdataDir(sharedData, paths), { officialOnly: plan.officialOnly, activate: !sharedData, createSettingsIfMissing: !sharedData })
+      ? prepareThemeTransaction(getUserdataDir(sharedData, paths), { officialOnly: plan.officialOnly, createSettingsIfMissing: true })
       : null;
     try {
       const image = path.join(staging, "T3-Code-x86_64.AppImage");
@@ -503,7 +510,7 @@ function uninstall(flags = new Set(), paths = getLinuxPaths()) {
       return;
     }
     console.log(sharedData
-      ? "已卸载 Linux 增强版。会话和项目仍在 ~/.t3，官方版可以继续使用"
+      ? `已卸载 Linux 增强版。会话和项目仍在 ${paths.sharedHomeLabel || "~/.t3"}，官方版可以继续使用`
       : `已卸载 Linux 增强版。独立配置和会话保存在 ${profileDirectory}`);
   }, paths);
 }

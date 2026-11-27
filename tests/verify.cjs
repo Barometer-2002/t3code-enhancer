@@ -25,7 +25,7 @@ const inlineFileDiff = require("../lib/patches/inline-file-diff.cjs");
 const filesChangesExplorer = require("../lib/patches/files-changes-explorer.cjs");
 const workspaceFloatingPanels = require("../lib/patches/workspace-floating-panels.cjs");
 const { workspaceFloatFrame, workspaceSnapFrame, defaultChatFloatFrame, defaultPreviewFloatFrame, serializePreviewFloatFrame, restorePreviewFloatFrame, chatPillFrame, placeSurfaceFloat } = workspaceFloatingPanels;
-const { SOURCE_THEME_PATH, extractOfficialTheme, installThemeAt, uninstallTheme, getThemeStatus } = require("../lib/theme-manager.cjs");
+const { SOURCE_THEME_PATH, extractOfficialTheme, installThemeAt, prepareThemeTransaction, uninstallTheme, getThemeStatus } = require("../lib/theme-manager.cjs");
 
 // Runtime modules under lib/runtime are plain ESM without imports. Load them the way the
 // ASAR does (as a standalone script) so tests exercise the real shipped source, and hand
@@ -115,6 +115,14 @@ const officialTheme = extractOfficialTheme(theme);
 for (const forbidden of ["[data-work-entry-id]", "[data-tool-group-scroll]", "[data-right-panel-", "[data-changed-files-", "[data-testid=", ".t3e-"]) {
   assert(!officialTheme.css.includes(forbidden), `Layer 1 official theme must not contain non-official selector: ${forbidden}`);
 }
+assert(
+  theme.css.includes(':root:not(.wco) [data-t3e-workspace]:has(> [data-chat-column] > [data-chat-header].drag-region, > [data-preview-panel-mode="inline"] [data-right-panel-tabbar].drag-region) > [data-chat-column]:not([data-t3e-chat-floating="true"], [data-t3e-chat-expanded]) > [data-chat-header].drag-region,'),
+  "macOS drag-region override must exclude floating and expanded chat headers"
+);
+assert(
+  theme.css.includes(':root:not(.wco) [data-t3e-workspace] [data-preview-panel-mode="inline"] [data-right-panel-tabbar].drag-region [data-active-tab] {\n    -webkit-app-region: no-drag;\n  }'),
+  "macOS tabbar drag-region must keep workspace tabs no-drag for click and tear-off"
+);
 assert.deepEqual(
   findUndeclaredIdentifiers("function first(){let alias=1} function second(){return alias}", new Set()),
   ["alias"],
@@ -721,6 +729,21 @@ function verifyCrossPlatformCliUnit() {
     assert.equal(JSON.parse(fs.readFileSync(customThemePath, "utf8")).name, "My Custom Theme");
     assert.equal(getThemeStatus(customDir).hasBackup, false);
 
+    // Shared settings written by the running official app between prepare and rollback must survive the rollback
+    const sharedTxDir = path.join(upgradeTmp, "shared-tx");
+    const sharedTxSettings = path.join(sharedTxDir, "settings.json");
+    fs.mkdirSync(sharedTxDir, { recursive: true });
+    fs.writeFileSync(sharedTxSettings, JSON.stringify({ zoom: 1 }));
+    const sharedTx = prepareThemeTransaction(sharedTxDir, { createSettingsIfMissing: true });
+    fs.writeFileSync(sharedTxSettings, JSON.stringify({ zoom: 2 }));
+    sharedTx.rollback();
+    assert.deepEqual(JSON.parse(fs.readFileSync(sharedTxSettings, "utf8")), { zoom: 2 }, "Rollback before commit must not touch settings");
+    const sharedTx2 = prepareThemeTransaction(sharedTxDir, { createSettingsIfMissing: true });
+    fs.writeFileSync(sharedTxSettings, JSON.stringify({ zoom: 3 }));
+    assert.equal(sharedTx2.commit().activated, true);
+    sharedTx2.rollback();
+    assert.deepEqual(JSON.parse(fs.readFileSync(sharedTxSettings, "utf8")), { zoom: 3 }, "Rollback must restore settings as of commit, not as of prepare");
+
     // User-edited CSS inside chatgpt-app.json + prior defaultTheme must both survive direct uninstall, reinstall & uninstall
     const editedDir = path.join(upgradeTmp, "edited-theme");
     fs.mkdirSync(path.join(editedDir, "themes"), { recursive: true });
@@ -781,6 +804,111 @@ function verifyCrossPlatformCliUnit() {
     assert.equal(lifoUninst.remainingBackups.length >= 1, true, "Older third-party backup must remain preserved on disk");
     assert.equal(JSON.parse(fs.readFileSync(path.join(stackDir, "settings.json"), "utf8")).defaultTheme, "solarized");
     assert.equal(JSON.parse(fs.readFileSync(path.join(stackDir, "settings.json"), "utf8")).defaultThemeSetAt, "2026-02-02T00:00:00.000Z");
+
+    // Pre-existing active chatgpt-app must not refresh defaultThemeSetAt on install or lose it on uninstall
+    const preActiveDir = path.join(upgradeTmp, "pre-active");
+    const preActiveSettings = path.join(preActiveDir, "settings.json");
+    fs.mkdirSync(preActiveDir, { recursive: true });
+    fs.writeFileSync(preActiveSettings, JSON.stringify({ defaultTheme: "chatgpt-app", defaultThemeSetAt: "2026-01-01T00:00:00.000Z" }, null, 2) + "\n");
+    const preActiveBefore = fs.readFileSync(preActiveSettings, "utf8");
+    installThemeAt(preActiveDir, { officialOnly: false });
+    assert.equal(fs.readFileSync(preActiveSettings, "utf8"), preActiveBefore, "Install must not refresh defaultThemeSetAt when chatgpt-app is already active");
+    assert.equal(uninstallTheme(preActiveDir).action, "removed");
+    assert.deepEqual(JSON.parse(fs.readFileSync(preActiveSettings, "utf8")), { defaultTheme: "chatgpt-app", defaultThemeSetAt: "2026-01-01T00:00:00.000Z" }, "Uninstall must preserve pre-existing chatgpt-app defaultThemeSetAt");
+
+    // Re-installing over enhancer-activated chatgpt-app must not refresh defaultThemeSetAt and must keep prior defaultThemeSetAt for uninstall
+    const reActiveDir = path.join(upgradeTmp, "re-active");
+    const reActiveSettings = path.join(reActiveDir, "settings.json");
+    fs.mkdirSync(reActiveDir, { recursive: true });
+    fs.writeFileSync(reActiveSettings, JSON.stringify({ defaultTheme: "tokyo-night", defaultThemeSetAt: "2026-01-01T00:00:00.000Z" }));
+    installThemeAt(reActiveDir, { officialOnly: false });
+    const afterFirstActive = fs.readFileSync(reActiveSettings, "utf8");
+    installThemeAt(reActiveDir, { officialOnly: false });
+    assert.equal(fs.readFileSync(reActiveSettings, "utf8"), afterFirstActive, "Re-install must not rewrite settings when chatgpt-app is already active");
+    assert.equal(uninstallTheme(reActiveDir).action, "removed");
+    assert.deepEqual(JSON.parse(fs.readFileSync(reActiveSettings, "utf8")), { defaultTheme: "tokyo-night", defaultThemeSetAt: "2026-01-01T00:00:00.000Z" });
+
+    // Manually installed theme matching bundled full or official content (without enhancer state) must never be deleted on uninstall
+    const bundledThemeRaw = fs.readFileSync(SOURCE_THEME_PATH, "utf8");
+    const bundledOfficialRaw = JSON.stringify(extractOfficialTheme(JSON.parse(bundledThemeRaw)), null, 2) + "\n";
+    for (const [label, sampleRaw] of [["full", bundledThemeRaw], ["official", bundledOfficialRaw]]) {
+      const manualDir = path.join(upgradeTmp, `manual-${label}`);
+      const manualThemePath = path.join(manualDir, "themes", "chatgpt-app.json");
+      fs.mkdirSync(path.dirname(manualThemePath), { recursive: true });
+      fs.writeFileSync(manualThemePath, sampleRaw);
+      assert.equal(uninstallTheme(manualDir).action, "kept-custom-theme", `Direct uninstall must not delete manually installed ${label} theme`);
+      assert.equal(fs.readFileSync(manualThemePath, "utf8"), sampleRaw);
+      const manualInstall = installThemeAt(manualDir, { officialOnly: false, createSettingsIfMissing: true });
+      assert(manualInstall.backupPath && fs.existsSync(manualInstall.backupPath), `Install over manual ${label} theme must back it up`);
+      assert.equal(uninstallTheme(manualDir).action, "restored-backup", `Uninstall after install must restore manual ${label} theme`);
+      assert.equal(fs.readFileSync(manualThemePath, "utf8"), sampleRaw);
+    }
+
+    // Symlinked settings.json must stay a symlink across install, rollback, and uninstall (valid & dangling targets)
+    const symSettingsRoot = path.join(upgradeTmp, "sym-settings");
+    const symDataDir = path.join(symSettingsRoot, "userdata");
+    const symDotfilesDir = path.join(symSettingsRoot, "dotfiles");
+    fs.mkdirSync(symDataDir, { recursive: true });
+    fs.mkdirSync(symDotfilesDir, { recursive: true });
+    const realSettingsPath = path.join(symDotfilesDir, "settings.json");
+    const linkSettingsPath = path.join(symDataDir, "settings.json");
+    fs.writeFileSync(realSettingsPath, JSON.stringify({ defaultTheme: "nord", defaultThemeSetAt: "2026-03-03T00:00:00.000Z" }));
+    let settingsSymlinkCreated = false;
+    try {
+      fs.symlinkSync(realSettingsPath, linkSettingsPath, "file");
+      settingsSymlinkCreated = true;
+    } catch (err) {
+      if (!["EPERM", "EACCES"].includes(err?.code)) throw err;
+    }
+    if (settingsSymlinkCreated) {
+      const symTx = prepareThemeTransaction(symDataDir, { createSettingsIfMissing: true });
+      symTx.commit();
+      assert(fs.lstatSync(linkSettingsPath).isSymbolicLink(), "Commit must keep settings.json as a symlink");
+      assert.equal(JSON.parse(fs.readFileSync(realSettingsPath, "utf8")).defaultTheme, "chatgpt-app");
+      symTx.rollback();
+      assert(fs.lstatSync(linkSettingsPath).isSymbolicLink(), "Rollback must keep settings.json as a symlink");
+      assert.equal(JSON.parse(fs.readFileSync(realSettingsPath, "utf8")).defaultTheme, "nord");
+
+      installThemeAt(symDataDir, { createSettingsIfMissing: true });
+      assert(fs.lstatSync(linkSettingsPath).isSymbolicLink(), "Install must keep settings.json as a symlink");
+      assert.equal(JSON.parse(fs.readFileSync(realSettingsPath, "utf8")).defaultTheme, "chatgpt-app");
+      uninstallTheme(symDataDir);
+      assert(fs.lstatSync(linkSettingsPath).isSymbolicLink(), "Uninstall must keep settings.json as a symlink");
+      assert.equal(JSON.parse(fs.readFileSync(realSettingsPath, "utf8")).defaultTheme, "nord");
+      assert.equal(JSON.parse(fs.readFileSync(realSettingsPath, "utf8")).defaultThemeSetAt, "2026-03-03T00:00:00.000Z");
+
+      // Dangling symlink target created at commit must be cleaned up on rollback without deleting the symlink
+      const danglingDir = path.join(symSettingsRoot, "dangling-userdata");
+      const danglingTarget = path.join(symDotfilesDir, "dangling-settings.json");
+      const danglingLink = path.join(danglingDir, "settings.json");
+      fs.mkdirSync(danglingDir, { recursive: true });
+      fs.symlinkSync(danglingTarget, danglingLink, "file");
+      const danglingTx = prepareThemeTransaction(danglingDir, { createSettingsIfMissing: true });
+      assert.equal(danglingTx.commit().activated, true);
+      assert(fs.lstatSync(danglingLink).isSymbolicLink(), "Dangling symlink commit must preserve symlink");
+      assert(fs.existsSync(danglingTarget), "Dangling symlink commit must materialize target file");
+      danglingTx.rollback();
+      assert(fs.lstatSync(danglingLink).isSymbolicLink(), "Dangling symlink rollback must preserve symlink");
+      assert(!fs.existsSync(danglingTarget), "Dangling symlink rollback must remove newly created target");
+    }
+
+    // Linux shared-data paths must honor custom T3CODE_HOME consistently with launch.sh
+    const customLinuxHome = path.join(upgradeTmp, "custom-t3-home");
+    const customLinuxPaths = linuxCli.getLinuxPaths({ XDG_DATA_HOME: path.join(upgradeTmp, "xdg"), T3CODE_HOME: customLinuxHome }, upgradeTmp);
+    assert.equal(customLinuxPaths.sharedUserdata, path.join(path.resolve(customLinuxHome), "userdata"));
+    assert.equal(linuxCli.getUserdataDir(true, customLinuxPaths), path.join(path.resolve(customLinuxHome), "userdata"));
+    const customSharedRes = linuxCli.prepareProfile(true, { officialOnly: false }, customLinuxPaths);
+    assert.equal(customSharedRes.targetPath, path.join(path.resolve(customLinuxHome), "userdata", "themes", "chatgpt-app.json"));
+    const customOrigLog = console.log;
+    console.log = () => {};
+    try {
+      linuxCli.uninstall(new Set(["--theme-only", "--shared-data"]), customLinuxPaths);
+    } finally {
+      console.log = customOrigLog;
+    }
+    assert(!fs.existsSync(customSharedRes.targetPath), "Linux theme-only shared uninstall must remove theme from custom T3CODE_HOME");
+    const blankHomePaths = linuxCli.getLinuxPaths({ XDG_DATA_HOME: path.join(upgradeTmp, "xdg"), T3CODE_HOME: "   " }, upgradeTmp);
+    assert.equal(blankHomePaths.sharedUserdata, path.join(upgradeTmp, ".t3", "userdata"));
 
     // Legacy 0.1.11 managed Linux install status must guide upgrade cleanly instead of crashing inspectInstall
     const legacyLinuxPaths = linuxCli.getLinuxPaths({ XDG_DATA_HOME: path.join(upgradeTmp, "xdg") }, upgradeTmp);
@@ -3322,7 +3450,7 @@ function verifyLinuxSupport(patchedAsarPath) {
     linuxCli.writeLauncherFiles(linuxPaths.installDirectory, true);
     const sharedTheme = linuxCli.prepareProfile(true, { officialOnly: true }, linuxPaths);
     assert.equal(sharedTheme.officialOnly, true);
-    assert.equal(sharedTheme.activated, false);
+    assert.equal(sharedTheme.activated, true);
     assert.equal(linuxCli.usesSharedData(linuxPaths.installDirectory), true);
     assert(!linuxCli.buildLauncher(true).includes("T3CODE_HOME="));
     assert(linuxCli.buildLauncher(true).includes("export T3CODE_TELEMETRY_ENABLED=false T3CODE_OTEL_SDK_DISABLED=true"));
@@ -3518,7 +3646,7 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
     assert.equal(macTheme.activated, true);
     const macSharedTheme = macosCli.prepareProfile(true, { officialOnly: true }, tmpMacPaths);
     assert.equal(macSharedTheme.officialOnly, true);
-    assert.equal(macSharedTheme.activated, false);
+    assert.equal(macSharedTheme.activated, true);
   } finally {
     fs.rmSync(macTmp, { recursive: true, force: true });
   }
@@ -4604,12 +4732,8 @@ function findDefaultVerifyAsar() {
     candidates.push(path.join(process.env.LOCALAPPDATA, "Programs", "t3code", "resources", "server.asar"));
   }
   if (process.platform === "linux") candidates.push(...getLinuxAsarCandidates());
-  if (process.platform === "darwin") {
-    candidates.push(
-      path.join(os.homedir(), "Applications", "T3 Code Enhancer.app", "Contents", "Resources", "app.asar"),
-      "/Applications/T3 Code (Beta).app/Contents/Resources/app.asar"
-    );
-  }
+  // macOS 增强版副本总是已打补丁且没有原版备份，不能作为基线，只用官方 .app。
+  if (process.platform === "darwin") candidates.push("/Applications/T3 Code (Beta).app/Contents/Resources/app.asar");
   return candidates.find((p) => p && fs.existsSync(p));
 }
 const source = explicitSource || findDefaultVerifyAsar();
