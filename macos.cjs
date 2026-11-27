@@ -154,7 +154,7 @@ function verifyOfficialSignature(app) {
 }
 
 function prepareProfile(sharedData, options = {}, paths = getMacosPaths()) {
-  return prepareProfileAt(getUserdataDir(sharedData, paths), sharedData, options);
+  return prepareProfileAt(getUserdataDir(sharedData, paths), options);
 }
 
 function buildInfoPlistEnv(existingEnv = {}, sharedData = false, paths = getMacosPaths(), options = {}) {
@@ -299,6 +299,8 @@ function install(input, options = {}, paths = getMacosPaths()) {
     assert(!requestedSharedData || sharedData, "当前为独立配置模式，无需 --shared-data（如需切换请先卸载）");
     const res = prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
     console.log(`[主题] 已安装 chatgpt-app 主题（${plan.officialOnly ? "仅官方稳定层 Layer 1" : "完整分层主题 Layer 1-3"}） -> ${res.targetPath}`);
+    // 没有增强版副本时，卸载无法推断共用目录，必须显式带上 --shared-data。
+    if (sharedData && !dirExists) console.log("[提示] 卸载此主题：node macos.cjs uninstall --theme-only --shared-data");
   }, paths);
 
   return withInstallLock(() => {
@@ -349,8 +351,7 @@ function install(input, options = {}, paths = getMacosPaths()) {
     const themeTx = plan.includeTheme
       ? require("./lib/theme-manager.cjs").prepareThemeTransaction(getUserdataDir(sharedData, paths), {
           officialOnly: plan.officialOnly,
-          activate: !sharedData,
-          createSettingsIfMissing: !sharedData,
+          createSettingsIfMissing: true,
         })
       : null;
     try {
@@ -412,7 +413,7 @@ function install(input, options = {}, paths = getMacosPaths()) {
       replaceStagedInstall(app, paths.installDirectory, replacing ? paths.previousApp : null, themeTx ? {
         afterCommit: () => {
           const res = themeTx.commit();
-          if (!sharedData && !res.activated) {
+          if (!res.activated) {
             console.warn("[提示] 主题已写入，但未能自动激活：请检查设置文件后手动切换主题");
           }
         },

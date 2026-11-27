@@ -59,7 +59,7 @@
 | `--asar <path>` | Windows / Linux 解包版 | 显式指定单个 `server.asar` 或 `app.asar`（禁用于 macOS `.app` 原地修改） |
 | `--appimage <path>` | Linux | 指定官方 `T3-Code-x86_64.AppImage` 路径 |
 | `--app <path>` | macOS | 指定官方 `T3 Code (Beta).app` 路径（默认 `/Applications/T3 Code (Beta).app`） |
-| `--shared-data` | Linux / macOS | 与官方版共用 `~/.t3` 数据目录（两者勿同时运行） |
+| `--shared-data` | Linux / macOS | 与官方版共用 `~/.t3` 数据目录，并把共用设置切到 ChatGPT App 主题（卸载时恢复原主题；两者勿同时运行） |
 | `--keep-theme` | `uninstall` | 卸载补丁时保留 `chatgpt-app` 主题 |
 | `--purge-backup` | `uninstall` | 还原原版后一并删除 `.before-t3code-enhancer` 备份 |
 | `--purge-profile` | Linux / macOS `uninstall` | 一并清理独立配置目录 |

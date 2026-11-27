@@ -25,7 +25,7 @@ const inlineFileDiff = require("../lib/patches/inline-file-diff.cjs");
 const filesChangesExplorer = require("../lib/patches/files-changes-explorer.cjs");
 const workspaceFloatingPanels = require("../lib/patches/workspace-floating-panels.cjs");
 const { workspaceFloatFrame, workspaceSnapFrame, defaultChatFloatFrame, defaultPreviewFloatFrame, serializePreviewFloatFrame, restorePreviewFloatFrame, chatPillFrame, placeSurfaceFloat } = workspaceFloatingPanels;
-const { SOURCE_THEME_PATH, extractOfficialTheme, installThemeAt, uninstallTheme, getThemeStatus } = require("../lib/theme-manager.cjs");
+const { SOURCE_THEME_PATH, extractOfficialTheme, installThemeAt, prepareThemeTransaction, uninstallTheme, getThemeStatus } = require("../lib/theme-manager.cjs");
 
 // Runtime modules under lib/runtime are plain ESM without imports. Load them the way the
 // ASAR does (as a standalone script) so tests exercise the real shipped source, and hand
@@ -720,6 +720,21 @@ function verifyCrossPlatformCliUnit() {
     assert.equal(uninstallTheme(customDir).action, "restored-backup", "Uninstalling must restore backed up third-party theme");
     assert.equal(JSON.parse(fs.readFileSync(customThemePath, "utf8")).name, "My Custom Theme");
     assert.equal(getThemeStatus(customDir).hasBackup, false);
+
+    // Shared settings written by the running official app between prepare and rollback must survive the rollback
+    const sharedTxDir = path.join(upgradeTmp, "shared-tx");
+    const sharedTxSettings = path.join(sharedTxDir, "settings.json");
+    fs.mkdirSync(sharedTxDir, { recursive: true });
+    fs.writeFileSync(sharedTxSettings, JSON.stringify({ zoom: 1 }));
+    const sharedTx = prepareThemeTransaction(sharedTxDir, { createSettingsIfMissing: true });
+    fs.writeFileSync(sharedTxSettings, JSON.stringify({ zoom: 2 }));
+    sharedTx.rollback();
+    assert.deepEqual(JSON.parse(fs.readFileSync(sharedTxSettings, "utf8")), { zoom: 2 }, "Rollback before commit must not touch settings");
+    const sharedTx2 = prepareThemeTransaction(sharedTxDir, { createSettingsIfMissing: true });
+    fs.writeFileSync(sharedTxSettings, JSON.stringify({ zoom: 3 }));
+    assert.equal(sharedTx2.commit().activated, true);
+    sharedTx2.rollback();
+    assert.deepEqual(JSON.parse(fs.readFileSync(sharedTxSettings, "utf8")), { zoom: 3 }, "Rollback must restore settings as of commit, not as of prepare");
 
     // User-edited CSS inside chatgpt-app.json + prior defaultTheme must both survive direct uninstall, reinstall & uninstall
     const editedDir = path.join(upgradeTmp, "edited-theme");
@@ -3322,7 +3337,7 @@ function verifyLinuxSupport(patchedAsarPath) {
     linuxCli.writeLauncherFiles(linuxPaths.installDirectory, true);
     const sharedTheme = linuxCli.prepareProfile(true, { officialOnly: true }, linuxPaths);
     assert.equal(sharedTheme.officialOnly, true);
-    assert.equal(sharedTheme.activated, false);
+    assert.equal(sharedTheme.activated, true);
     assert.equal(linuxCli.usesSharedData(linuxPaths.installDirectory), true);
     assert(!linuxCli.buildLauncher(true).includes("T3CODE_HOME="));
     assert(linuxCli.buildLauncher(true).includes("export T3CODE_TELEMETRY_ENABLED=false T3CODE_OTEL_SDK_DISABLED=true"));
@@ -3518,7 +3533,7 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
     assert.equal(macTheme.activated, true);
     const macSharedTheme = macosCli.prepareProfile(true, { officialOnly: true }, tmpMacPaths);
     assert.equal(macSharedTheme.officialOnly, true);
-    assert.equal(macSharedTheme.activated, false);
+    assert.equal(macSharedTheme.activated, true);
   } finally {
     fs.rmSync(macTmp, { recursive: true, force: true });
   }
