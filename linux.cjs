@@ -37,8 +37,12 @@ const {
 const { ENHANCER_TAG, T3_BASELINE_VERSION } = require("./lib/version.cjs");
 
 const T3_VERSION = T3_BASELINE_VERSION;
-// SHA-256 published on the upstream v0.1.12 release asset.
-const APPIMAGE_HASH = "66b91551571df6d29b55cb590295edf411cff96c95a8feb3f41c3ca595d722e2";
+// SHA-256 published on the upstream v0.1.13 release asset (v0.1.12 also retained for smooth dual-baseline upgrades).
+const APPIMAGE_HASH = "dac1bbe9e93c1a5fb0942332befa998597f6a086232a87766ef5d8235a44f56d";
+const KNOWN_APPIMAGE_HASHES = new Set([
+  APPIMAGE_HASH,
+  "66b91551571df6d29b55cb590295edf411cff96c95a8feb3f41c3ca595d722e2",
+]);
 const MANAGED_FILE = ".t3code-enhancer-appimage";
 const SHARED_DATA_FILE = ".t3code-enhancer-shared-data";
 const APP_DIRECTORY = "squashfs-root";
@@ -401,8 +405,8 @@ function install(input, options = {}, paths = getLinuxPaths()) {
     try {
       const image = path.join(staging, "T3-Code-x86_64.AppImage");
       fs.copyFileSync(source, image, fs.constants.COPYFILE_EXCL);
-      assert.equal(digest(fs.readFileSync(image)), APPIMAGE_HASH,
-        `需要官方 T3 Code ${T3_VERSION} x86_64 AppImage（SHA-256 不匹配）`);
+      assert(KNOWN_APPIMAGE_HASHES.has(digest(fs.readFileSync(image))),
+        `需要官方 T3 Code ${T3_VERSION}（或兼容基线）x86_64 AppImage（SHA-256 不匹配）`);
       fs.chmodSync(image, 0o700);
       console.log("解包官方 AppImage 并校验前端补丁…");
       execFileSync(image, ["--appimage-extract"], { cwd: staging, stdio: ["ignore", "ignore", "inherit"] });

@@ -48,7 +48,7 @@ flowchart TD
 | `lib/packs.cjs` | 5 大模块（`PACKS`）、5 档预设（`PRESETS`）、联动禁用组（`PATCH_GROUPS`）、安装方案解析（`resolveInstallPlan`）与交互菜单 |
 | `lib/install-state.cjs` | 目录级维护锁（`withInstallDirectoryLock`）、原子目录替换与回滚（`replaceStagedInstall`、`recoverPreviousInstall`） |
 | `lib/theme-manager.cjs` | 主题 3 层裁剪（`extractOfficialTheme`）、SHA-256 托管所有权识别（`KNOWN_HISTORICAL_THEME_HASHES` + `.t3code-enhancer-theme-state`）、双阶段主题事务（`prepareThemeTransaction`） |
-| `lib/version.cjs` | SemVer 2.0.0 单一真相源（读取 `package.json`），严格隔离工具版本与 `T3_BASELINE_VERSION`（`0.1.12`） |
+| `lib/version.cjs` | SemVer 2.0.0 单一真相源（读取 `package.json`），严格隔离工具版本与 `T3_BASELINE_VERSION`（`0.1.13`，向后兼容 `0.1.12`） |
 
 ---
 
@@ -64,17 +64,17 @@ flowchart TD
 | 4 | `no-telemetry-ui` | `privacy` | `PRIVACY` | `apps/server/dist/client/assets/SettingsPanels-*.js` | `T3_NO_TELEMETRY_UI_V2` | — |
 | 5 | `no-telemetry-desktop` | `privacy` | `PRIVACY` | `apps/desktop/dist-electron/main.cjs` | `T3_NO_TELEMETRY_DESKTOP_V2` | — |
 | 6 | `timeline-collapse` | `chat` | `TIMELINE` | `apps/server/dist/client/assets/ReadOnlyThreadTimeline-*.js` | `T3_TIMELINE_CASCADE_V7` | `timeline-ui.mjs` |
-| 7 | `timeline-collapse-summary` | `chat` | `TIMELINE` | `apps/server/dist/client/assets/session-logic-*.js` | `T3_TIMELINE_SUMMARY_V3` | — |
+| 7 | `timeline-collapse-summary` | `chat` | `TIMELINE` | `apps/server/dist/client/assets/session-logic-*.js` | `T3_TIMELINE_SUMMARY_V4` | — |
 | 8 | `inline-file-diff` | `chat` | `DIFF` | `apps/server/dist/client/assets/ReadOnlyThreadTimeline-*.js` | `T3_INLINE_FILE_DIFF_V13` | `inline-diff-ui.mjs` |
 | 9 | `inline-file-diff-side-reveal` | `chat` | `DIFF` | `apps/server/dist/client/assets/DiffPanel-*.js` | `T3_INLINE_FILE_DIFF_SIDE_REVEAL_V6` | — |
 | 10 | `inline-file-diff-quiet-review-toast` | `chat` | `DIFF` | `apps/server/dist/client/assets/runtime-*.js` | `T3_QUIET_REVIEW_SLOW_TOAST_V1` | — |
-| 11 | `usage-rings` | `composer` | — | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_USAGE_RINGS_V34` | `usage-rings-ui.mjs` |
+| 11 | `usage-rings` | `composer` | — | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_USAGE_RINGS_V35` | `usage-rings-ui.mjs` |
 | 12 | `sidebar-new-chat` | `workspace` | — | `apps/server/dist/client/assets/main-*.js` | `T3_SIDEBAR_NEW_CHAT_V4` | — |
-| 13 | `new-chat-layout` | `workspace` | — | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_NEW_CHAT_LAYOUT_V8` | — |
+| 13 | `new-chat-layout` | `workspace` | — | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_NEW_CHAT_LAYOUT_V9` | — |
 | 14 | `files-changes-explorer` | `chat` | — | `apps/server/dist/client/assets/FilePreviewPanel-*.js` | `T3_FILES_CHANGES_EXPLORER_V9` | `files-explorer-ui.mjs` |
-| 15 | `workspace-floating-panels` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_WORKSPACE_FLOATING_PANELS_V30` | `floating-panels-ui.mjs` |
-| 16 | `workspace-floating-tab-bar` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/PanelLayoutControls-*.js` | `T3_WORKSPACE_FLOATING_TAB_BAR_V13` | `tab-bar-ui.mjs` |
-| 17 | `workspace-floating-preview-toolbar` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/PreviewPanel-*.js` | `T3_WORKSPACE_FLOATING_PREVIEW_TOOLBAR_V1` | — |
+| 15 | `workspace-floating-panels` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_WORKSPACE_FLOATING_PANELS_V31` | `floating-panels-ui.mjs` |
+| 16 | `workspace-floating-tab-bar` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/PanelLayoutControls-*.js` | `T3_WORKSPACE_FLOATING_TAB_BAR_V15` | `tab-bar-ui.mjs` |
+| 17 | `workspace-floating-preview-toolbar` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/PreviewPanel-*.js` | `T3_WORKSPACE_FLOATING_PREVIEW_TOOLBAR_V2` | — |
 | 18 | `workspace-floating-preview-responsive` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/main-*.js` | `T3_WORKSPACE_FLOATING_PREVIEW_RESPONSIVE_V2` | — |
 | 19 | `desktop-tray` | `workspace` | — | `apps/desktop/dist-electron/main.cjs` | `T3_DESKTOP_TRAY_V1` | — |
 | 20 | `macos-user-data` | macOS 独立模式 | — | `apps/desktop/dist-electron/main.cjs` | `"t3code-enhancer-profile/electron"` | — |
@@ -156,7 +156,8 @@ flowchart LR
 - **裸 `repair` 方案恢复优先级**（`inferRepairPlanOptions()`）：
   1. 优先读取存活归档中的 `t3e-build-meta.json` 的 `plan`（精确保留 `--packs`、`--no-desktop-tray`、`--official`、`exactPatchIds`；Windows 下即便 `app.asar` 已截断损坏，也能从存活的 `server.asar` 读出完整 `plan`）。
   2. 若无 `buildMeta.plan`（早期版本升级），从所有可识别模块的 `installed | outdated` 状态反推出 `packs` 与 `excludePatchIds`。
-  3. 判定是否可跳过重建时，`matchesSelectedPatches()` 不仅确认已选模块全为 `installed`，还确认**同文件无残留未选中的补丁**，避免缩减模块组合时误跳过。
+  3. 若归档均为纯净原版且无 `buildMeta.plan`（典型官方 T3 Code 原生覆盖升级场景），回退读取用户数据目录中随安装事务同步持久化的 `.t3code-enhancer-plan.json`（`readSavedInstallPlan()`），避免裸跑 `repair` 误退化为 `theme-only`；`uninstall` 卸载时自动清理该文件。
+  4. 判定是否可跳过重建时，`matchesSelectedPatches()` 不仅确认已选模块全为 `installed`，还确认**同文件无残留未选中的补丁**，避免缩减模块组合时误跳过。
 
 ### 3.4 流程 D：主题三层分离与所有权保护
 

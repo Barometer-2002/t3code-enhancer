@@ -57,7 +57,8 @@ const userDataPatch = {
     pathRegex: /^apps\/desktop\/dist-electron\/main\.cjs$/,
     includes: ['current: "t3code-v2",'],
   },
-  originalHash: "3767e3a14ef66756b8e404e11a2a472bb22c1993f710b932653f24bd29f50cdd",
+  originalHash: "80eb399935ad079a3f3084ca6da80dd495fbe9b69f473831819361223a50c559",
+  knownHashes: ["3767e3a14ef66756b8e404e11a2a472bb22c1993f710b932653f24bd29f50cdd"],
   apply(text) {
     const anchor = 'current: "t3code-v2",';
     assert.equal(text.split(anchor).length, 2, "无法唯一定位 userData 目录名");
@@ -326,8 +327,14 @@ function install(input, options = {}, paths = getMacosPaths()) {
     const selectedPatches = selectMacosPatches(plan, sharedData);
 
     const expectedEnv = buildInfoPlistEnv(existing?.currentEnv, sharedData, paths, { disableTelemetry: plan.telemetryDisabled });
+    const defaultSourceVersion = !input && fs.existsSync(path.join(DEFAULT_SOURCE, INFO_PLIST))
+      ? readOptionalPlist(DEFAULT_SOURCE, "CFBundleShortVersionString", "raw", null)
+      : null;
+    const officialAppUpdated = Boolean(
+      defaultSourceVersion && existing?.appVersion && defaultSourceVersion !== existing.appVersion
+    );
     if (
-      existing && !input && !options.repair &&
+      existing && !input && !options.repair && !officialAppUpdated &&
       matchesSelectedPatches(existing.modules, selectedPatches) &&
       !envNeedsUpdate(existing.currentEnv, expectedEnv)
     ) {

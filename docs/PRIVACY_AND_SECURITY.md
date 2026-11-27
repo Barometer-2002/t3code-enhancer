@@ -28,7 +28,7 @@
 `privacy` 模块并非只改一个环境变量，而是从服务端到桌面壳层做了 **5 层全闭环防护**（源码见 [lib/patches/no-telemetry.cjs](../lib/patches/no-telemetry.cjs)）：
 
 1. **停止生成匿名追踪标识** — 服务端 `getTelemetryIdentity` 直接返回空值，不再生成与保存设备/安装 ID。
-2. **停止跨工具读取本机账号文件** — 服务端 `getServerOwners` 返回空列表，不再扫描读取 `~/.claude.json` 与 `~/.codex/auth.json`。
+2. **停止上报本机/关联账号标识** — 服务端 `getServerOwners` 返回空列表，不再上报已绑定的 T3 Connect 账号哈希；在 T3 Code `0.1.12` 等旧版本中亦同时阻止扫描读取 `~/.claude.json` 与 `~/.codex/auth.json`（`0.1.13` 官方已移除对这两份本地凭证文件的读取，工具仍保留兼容拦截）。
 3. **清空服务端与 Relay 上报** — 默认关闭 `T3CODE_TELEMETRY_ENABLED`，将 PostHog 上报服务置为空操作，并关闭 Relay OTLP 链路追踪。
 4. **关闭前端追踪导出并明示状态** — 移除前端 Axiom OTLP 导出逻辑，在「设置 → 关于」直观标明已由 `t3code-enhancer` 禁用。
 5. **桌面主进程网络层兜底拦截** — 启动即锁定 `T3CODE_TELEMETRY_ENABLED=false` 与 `T3CODE_OTEL_SDK_DISABLED=true`，并在默认会话网络层取消发往以下域名的请求：

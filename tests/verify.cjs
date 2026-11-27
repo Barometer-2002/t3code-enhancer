@@ -12,7 +12,7 @@ const { collectTopLevelBindings, findUndeclaredIdentifiers, tokenize, parseImpor
 const { ALL_PATCHES, selectPatches, applicablePatchesForArchive, inspectArchive, summarizeModuleStates, resolvePristineBaseline, buildPatchedArchive, getLinuxAsarCandidates, getAsarPaths, getArchiveTargetPaths, isLinuxAppRunning, parseCliArgs, buildDelegatedArgs, isThemeOnlySelection, shouldDelegateToLinux, shouldDelegateToMacos, isMacosBundleAsarPath, resolveCanonicalPath, assertSafeAsarTargets, runAsarTransaction, matchesSelectedPatches, getArchiveCompatibilityTier, cmdInstall, cmdRepair, cmdUninstall } = require("../cli.cjs");
 const { PACKS, PRESETS, resolveInstallPlan, parsePlatformArgs } = require("../lib/packs.cjs");
 const { withInstallDirectoryLock } = require("../lib/install-state.cjs");
-const { inspectCompatibleSource, inferRepairPlanOptions } = require("../lib/engine.cjs");
+const { inspectCompatibleSource, inferRepairPlanOptions, getSavedPlanPath, readSavedInstallPlan } = require("../lib/engine.cjs");
 const noTelemetry = require("../lib/patches/no-telemetry.cjs");
 const desktopTray = require("../lib/patches/desktop-tray.cjs");
 const newChatLayout = require("../lib/patches/new-chat-layout.cjs");
@@ -1577,15 +1577,21 @@ function verifyNativePreviewPosition(asar) {
 function verifyResponsiveBrowserLayout(asar) {
   const patch = workspaceFloatingPanels.responsivePreviewPatch;
   const main = findUniqueEntry(asar, patch.targetRegex, patch.id).content.toString("utf8");
-  const store = main.match(/Yw=gn\(\)\(e=>\(\{activityByTabId:[\s\S]+?(?=var Qw=)/);
+  const storeMatch = main.match(/([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(\)\(e=>\(\{activityByTabId:[\s\S]+?function\s+([A-Za-z_$][\w$]*)\(e,t=!1\)\{let n=Symbol\(`browser-surface:\$\{e\}`\)[\s\S]+?\}\}\}(?=var\s+[A-Za-z_$][\w$]*=)/);
   const layoutMode = main.match(/const T3ResponsiveViewport=[^;]+;/);
-  const layoutSelector = main.match(/C=e=>\{let t=e\.byTabId\[i\];return\{[^}]+\}\}/);
-  const layoutOverride = main.match(/if\(w\.responsive\)o=T3ResponsiveViewport;/);
+  const layoutSelectorMatch = main.match(/([A-Za-z_$][\w$]*)=e=>\{let t=e\.byTabId\[([A-Za-z_$][\w$]*)\];return\{content:[^}]+\}\}/);
+  const layoutOverrideMatch = main.match(/if\(([A-Za-z_$][\w$]*)\.responsive\)([A-Za-z_$][\w$]*)=T3ResponsiveViewport;/);
   const overlayAnchor = main.indexOf("responsive:t3Responsive=!1,");
   const overlayStyleFn = overlayAnchor >= 0 ? createPatchContext(null, null, main).findEnclosingFunction(overlayAnchor) : null;
-  assert(store && layoutMode && layoutSelector && layoutOverride && overlayStyleFn, "Missing responsive browser viewport or corner clipping wiring");
-  assert(main.includes("cornerRadius:w.cornerRadius,responsive:w.responsive,zIndex:w.zIndex"), "Webview host must pass responsive flag to overlay style helper");
-  const computeOverlayStyle = runInNewContext(`(${overlayStyleFn.source})`, { TE: -1e5 });
+  assert(storeMatch && layoutMode && layoutSelectorMatch && layoutOverrideMatch && overlayStyleFn, "Missing responsive browser viewport or corner clipping wiring");
+  const [, storeVar, createStoreFn, claimFn] = storeMatch;
+  const [, selFn, tabVar] = layoutSelectorMatch;
+  const [, selVar, vpVar] = layoutOverrideMatch;
+  assert(main.includes(`cornerRadius:${selVar}.cornerRadius,responsive:${selVar}.responsive,zIndex:${selVar}.zIndex`), "Webview host must pass responsive flag to overlay style helper");
+  const hiddenConst = overlayStyleFn.source.match(/\{left:([A-Za-z_$][\w$]*),top:\1,/)?.[1];
+  const rectEqFn = storeMatch[0].match(/&&([A-Za-z_$][\w$]*)\([A-Za-z_$][\w$]*\.rect,[A-Za-z_$][\w$]*\)/)?.[1];
+  assert(hiddenConst && rectEqFn, "Missing hiddenConst or rectEqFn in responsive browser layout test");
+  const computeOverlayStyle = runInNewContext(`(${overlayStyleFn.source})`, { [hiddenConst]: -1e5 });
   const floatingStyle = computeOverlayStyle({ active: true, cornerRadius: 13, responsive: true, rect: { x: 10, y: 20, width: 400, height: 420 }, hiddenSize: { width: 400, height: 420 }, renderingActive: true, zIndex: 34 });
   assert.equal(floatingStyle.borderRadius, undefined, "Responsive floating browser should only round bottom corners, not top corners below the toolbar");
   assert.equal(floatingStyle.borderBottomLeftRadius, 13);
@@ -1594,28 +1600,33 @@ function verifyResponsiveBrowserLayout(asar) {
   const pipStyle = computeOverlayStyle({ active: true, cornerRadius: 12, responsive: false, rect: { x: 10, y: 20, width: 320, height: 200 }, hiddenSize: { width: 320, height: 200 }, renderingActive: true, zIndex: 48 });
   assert.equal(pipStyle.borderRadius, 12);
   const defaults = findUniqueEntry(asar, /\/browserDefaults-[\w-]+\.js$/, "browser layout").content.toString("utf8");
-  const layout = defaults.match(/function it\(e,t,n=1\)\{[\s\S]+?(?=function ot\()/);
+  const layout = defaults.match(/function\s+([A-Za-z_$][\w$]*)\(e,t,n=1\)\{let r=Math\.max\(1,Math\.round\(e\.width\)\)[\s\S]+?fillsPanel:!1\}\}/);
   assert(layout, "Missing native browser viewport calculation");
+  const layoutFnName = layout[1];
+  const zoomFnName = layout[0].match(/let\s+[A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)\(n\),/)?.[1];
+  assert(zoomFnName, "Missing zoom helper in browserDefaults layout calculation");
+  const rectGetterFn = layoutSelectorMatch[0].match(/rect:([A-Za-z_$][\w$]*)\(/)?.[1];
   const { claim, state, viewportFor, size } = runInNewContext(
-    "let " + store[0] + "\n" + layoutMode[0] + "\n" + layout[0] + `
+    "let " + storeMatch[0] + "\n" + layoutMode[0] + "\n" + layout[0] + `
     ({
-      claim: Zw,
-      state: Yw.getState,
-      viewportFor(i, o) {
-        let C;
-        ${layoutSelector[0]};
-        const w = C(Yw.getState());
-        ${layoutOverride[0]}
-        return o;
+      claim: ${claimFn},
+      state: ${storeVar}.getState,
+      viewportFor(${tabVar}, ${vpVar}) {
+        let ${selFn};
+        ${layoutSelectorMatch[0]};
+        const ${selVar} = ${selFn}(${storeVar}.getState());
+        ${layoutOverrideMatch[0]}
+        return ${vpVar};
       },
-      size: it
+      size: ${layoutFnName}
     })`, {
-      gn: () => (init) => {
+      [createStoreFn]: () => (init) => {
         let state = init((update) => { state = { ...state, ...update(state) }; });
         return { getState: () => state };
       },
-      qw: (tabs, tab) => tabs[tab]?.rect ?? null,
-      X: (zoom) => zoom,
+      [rectEqFn]: (a, b) => JSON.stringify(a) === JSON.stringify(b),
+      [zoomFnName]: (zoom) => zoom,
+      ...(rectGetterFn ? { [rectGetterFn]: (byTabId, id) => byTabId?.[id]?.rect ?? null } : {}),
     }
   );
   const tab = "browser";
@@ -1642,17 +1653,22 @@ function verifyResponsiveBrowserLayout(asar) {
 
 function verifyInlineEditDetail(asar) {
   const code = findUniqueEntry(asar, inlineFileDiff.targetRegex, inlineFileDiff.id).content.toString("utf8");
-  const detailHook = code.match(/function bm\(e,t,n,r\)\{[\s\S]+?(?=function xm\()/);
-  assert(detailHook, "Missing timeline detail hook");
+  const inspMatch = code.match(/([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\.projectedItem,\s*\3\.environmentId/);
+  assert(inspMatch, "Missing timeline detail hook call");
+  const detailHookName = inspMatch[2];
+  const detailHookIdx = code.indexOf(`function ${detailHookName}(`);
+  assert(detailHookIdx >= 0, `Missing declaration of timeline detail hook ${detailHookName}`);
+  const detailHookFn = createPatchContext(null, null, code).findEnclosingFunction(detailHookIdx + 10);
+  assert(detailHookFn, "Missing timeline detail hook body");
   assert.match(code, /createInlineDiffRuntime\(\{\s*React:\s*[\w$]+,\s*jsx:\s*[\w$]+\.jsx,\s*jsxs:\s*[\w$]+\.jsxs,\s*resolveRelPath:\s*[\w$]+,\s*useCheckpointSummaries:/, "Missing inline diff runtime bridge");
-  assert.match(code, /&&L&&\(B\|\|W\|\|n\.projectedItem&&U===void 0\)\?[^;]*?\(Tm,\{/);
-  assert.match(code, /T3FileChangeRowLabelMemo,\{projectedItem:n\.projectedItem,workspaceRoot:r,cwd:a\.markdownCwd,environmentId:a\.activeThreadEnvironmentId,source:a\.turnItemSource,expanded:x\}/);
-  assert.match(code, /cu\(i\|\|s\.pending,e\.onInitialOutputReady\);if\(o\.type===`file_change`\)return\(0,Q\.jsx\)\(T3InlineFileDiffCardMemo/);
+  assert.match(code, /T3FileChangeRowLabelMemo,\{projectedItem:[\w$]+\.projectedItem,workspaceRoot:[\w$]+,cwd:[\w$]+\.markdownCwd,environmentId:[\w$]+\.activeThreadEnvironmentId,source:[\w$]+\.turnItemSource,expanded:[\w$]+\}/);
+  assert.match(code, /onInitialOutputReady\);if\([\w$]+\.type===`file_change`\)return\(0,[\w$]+\.jsx\)\(T3InlineFileDiffCardMemo/);
 
   const summary = { type: "file_change", fileName: "README.md", updatedAt: "r1" };
   const projected = { sourceThreadId: "source-thread", sourceItemId: "edit-1", item: summary };
   const customDetailSource = () => {};
-  const memo = Array(29).fill(Symbol.for("react.memo_cache_sentinel"));
+  const memoSize = Number(detailHookFn.source.match(/\(0,[A-Za-z_$][\w$]*\.c\)\((\d+)\)/)?.[1] || 32);
+  const memo = Array(memoSize).fill(Symbol.for("react.memo_cache_sentinel"));
   let reply = { isPending: true };
   let request;
   let checkpointRequest;
@@ -1673,18 +1689,25 @@ function verifyInlineEditDetail(asar) {
   };
   const useTurnItemDetail = (key, customSource) => { request = key; source = customSource; return reply; };
   const getItemRevision = (item) => item.updatedAt;
-  // The native detail hook (bm) lives in the host bundle and is extracted from the patched chunk.
-  const { bm } = runInNewContext(detailHook[0] + "\n({ bm })", {
-    Z: { c: () => memo },
-    we: () => (text) => text,
-    bo: () => false,
-    go: getItemRevision,
-    pi: useTurnItemDetail,
-    mo: () => null,
-    So: () => [],
-    $: React,
-    Q: { jsx, jsxs: jsx },
-  });
+  const compilerVar = detailHookFn.source.match(/\(0,([A-Za-z_$][\w$]*)\.c\)\(\d+\)/)?.[1];
+  const i18nVar = detailHookFn.source.match(/=([A-Za-z_$][\w$]*)\(\),/)?.[1];
+  const boVar = detailHookFn.source.match(/![A-Za-z_$][\w$]*&&\(([A-Za-z_$][\w$]*)\(/)?.[1];
+  const goVar = detailHookFn.source.match(/revision:([A-Za-z_$][\w$]*)\(/)?.[1];
+  const piVar = detailHookFn.source.match(/=([A-Za-z_$][\w$]*)\([A-Za-z_$][\w$]*,[A-Za-z_$][\w$]*\?\.detail\)/)?.[1];
+  const reactRefs = createPatchContext(null, null, code).resolveReactBindings();
+  const detailSandbox = {
+    [compilerVar]: { c: () => memo },
+    [i18nVar]: () => (text) => text,
+    [boVar]: () => false,
+    [goVar]: getItemRevision,
+    [piVar]: useTurnItemDetail,
+    [reactRefs.react]: React,
+    [reactRefs.jsx]: { jsx, jsxs: jsx },
+  };
+  for (const id of findUndeclaredIdentifiers(detailHookFn.source, new Set([detailHookName]), Object.keys(detailSandbox))) {
+    detailSandbox[id] = () => [];
+  }
+  const { [detailHookName]: bm } = runInNewContext(detailHookFn.source + `\n({ ${detailHookName} })`, detailSandbox);
   // The inline diff UI is the shipped runtime module, wired up exactly like the generated bridge.
   const runtime = loadRuntimeModule("inline-diff-ui", { crypto: { randomUUID: () => `rev-${++uuidSeq}` } });
   const parseUnifiedDiff = runtime.sandbox.t3ParseUnifiedDiff;
@@ -1859,9 +1882,12 @@ function verifyInlineEditDetail(asar) {
   const diffPanel = findUniqueEntry(asar, inlineFileDiff.sideRevealPatch.targetRegex, inlineFileDiff.id + "-side").content.toString("utf8");
   assert.match(diffPanel, /createSideRevealHelpers\(\{\s*extractToolPatch:\s*[\w$]+,\s*parsePatch:\s*[\w$]+,\s*getFileName:\s*[\w$]+,?\s*\}\)/, "Missing side-reveal runtime bridge");
   const revealMatch = diffPanel.match(
-    /\/\* T3_INLINE_FILE_DIFF_SIDE_REVEAL_V\d+ \*\/let t3RawZ=V,t3Fb=[\s\S]*?(let gr=B.kind===`turn`\?B.turnId:t3Fb\?\.turnId\?\?null,[^;]+),br;[\s\S]*?(if\(vr\|\|t3RawZ\?\.revealRequestId\)vr=t3ResolveRevealPath\(vr,Z,Ji,F,!t3GitMode&&Boolean\(t3RawZ\?\.revealRequestId\)\);)[\s\S]*?(Qi=e=>\{let t=A\(e\);return!ze\|\|t===vr\|\|!Ye\(t\)\})[\s\S]*?(xa\.current!==e&&ba\(vr\)&&\(xa\.current=e\))/
+    /\/\* T3_INLINE_FILE_DIFF_SIDE_REVEAL_V\d+ \*\/let t3RawZ=[A-Za-z_$][\w$]*,t3Fb=[\s\S]*?(let [A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)\.kind===`turn`\?\2\.turnId:t3Fb\?\.turnId\?\?null,[^;]+),[A-Za-z_$][\w$]*;[\s\S]*?(if\(([A-Za-z_$][\w$]*)\|\|t3RawZ\?\.revealRequestId\)\4=t3ResolveRevealPath\(\4,([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),!t3GitMode&&Boolean\(t3RawZ\?\.revealRequestId\)\);)[\s\S]*?(([A-Za-z_$][\w$]*)=e=>\{let t=([A-Za-z_$][\w$]*)\(e\);return!([A-Za-z_$][\w$]*)\|\|t===\4\|\|!([A-Za-z_$][\w$]*)\(t\)\})[\s\S]*?(([A-Za-z_$][\w$]*)\.current!==e&&([A-Za-z_$][\w$]*)\(\4\)&&\(\14\.current=e\))/
   );
   assert(revealMatch, "Missing updated DiffPanel sideRevealPatch injection");
+  const [, selDecl, bVar, revealStmt, vrVar, filesVar, rowsVar, rootVar, filterAssign, filterVar, getFileNameVar, hideFlagVar, isTestVar, scrollStmt, lastRevealRefVar, revealFnVar] = revealMatch;
+  const yrVar = selDecl.match(/,([A-Za-z_$][\w$]*)=t3RawZ\?\.revealRequestId\?\?/)?.[1];
+  assert(yrVar, "Missing revealRequestId variable in DiffPanel selection");
   const fallbackFns = loadRuntimeModule("inline-diff-ui").exports.createSideRevealHelpers({
     extractToolPatch: (cn) => ({ patch: cn.diffStr, truncated: Boolean(cn.truncated) }),
     parsePatch: (patch) => {
@@ -1906,16 +1932,16 @@ function verifyInlineEditDetail(asar) {
   const uncollapsed = [];
   const scrolled = [];
   const revealRunner = runInNewContext(
-    `(function(t3RawZ, B, ze, Ji, K, xa, ba, Ye, A, t3GitMode) {
-      const F = "C:/repo";
-      const Z = Ji.map(({ fileDiff }) => fileDiff);
+    `(function(t3RawZ, ${bVar}, ${hideFlagVar}, ${rowsVar}, __scopeK, ${lastRevealRefVar}, ${revealFnVar}, ${isTestVar}, ${getFileNameVar}, t3GitMode) {
+      const ${rootVar} = "C:/repo";
+      const ${filesVar} = ${rowsVar}.map(({ fileDiff }) => fileDiff);
       const t3Fb = null;
-      ${revealMatch[1]};
-      ${revealMatch[2]}
-      let ${revealMatch[3]};
-      const e = JSON.stringify([K, vr, yr]);
-      ${revealMatch[4]};
-      return { vr, yr, Qi };
+      ${selDecl};
+      ${revealStmt}
+      let ${filterAssign};
+      const e = JSON.stringify([__scopeK, ${vrVar}, ${yrVar}]);
+      ${scrollStmt};
+      return { vr: ${vrVar}, yr: ${yrVar}, Qi: ${filterVar} };
     })`,
     { ...fallbackFns }
   );
@@ -1964,12 +1990,13 @@ function verifyInlineEditDetail(asar) {
   assert.deepEqual(uncollapsed, ["k2", "k1"]);
 
   // Verify background review.* RPCs (review.getDiffPreview etc.) do not trigger the 15s slow-request warning toast
-  const rtCode = findUniqueEntry(asar, inlineFileDiff.quietReviewToastPatch.targetRegex, inlineFileDiff.quietReviewToastPatch.id).content.toString("utf8");
-  const filterMatch = rtCode.match(/function vS\(e\)\{\/\* T3_QUIET_REVIEW_SLOW_TOAST_V1 \*\/[^}]+\}/);
+  const rtCode = findPatchTarget(asar, inlineFileDiff.quietReviewToastPatch, ALL_PATCHES).content.toString("utf8");
+  const filterMatch = rtCode.match(/function\s+([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)\{\/\* T3_QUIET_REVIEW_SLOW_TOAST_V1 \*\/[^}]+&&!([A-Za-z_$][\w$]*)\.has\(\2\)\}/);
   assert(filterMatch, "Missing quietReviewToastPatch filter in runtime bundle");
+  const [, quietFnName, , quietSetName] = filterMatch;
   const shouldWarnSlow = runInNewContext(
-    `${filterMatch[0]}\nvS`,
-    { pS: new Set(["server.getUsageSummary"]) }
+    `${filterMatch[0]}\n${quietFnName}`,
+    { [quietSetName]: new Set(["server.getUsageSummary"]) }
   );
   assert.equal(shouldWarnSlow("review.getDiffPreview"), false);
   assert.equal(shouldWarnSlow("review.getBranchCommits"), false);
@@ -2020,10 +2047,10 @@ function findNodes(node, pred, out = []) {
 
 function verifyUsageRingsUX(asar) {
   const chat = findUniqueEntry(asar, usageRings.targetRegex, usageRings.id).content.toString("utf8");
-  assert.match(chat, /T3ComposerCtxProvider,\{canAttach:Io,/);
-  assert.match(chat, /T3ComposerQuotaRingMemo,\{providerInstanceId:oi,activeModel:di\}/);
-  assert.match(chat, /T3RingsCtxProvider,\{threadRef:la,providerInstanceId:tc,/);
-  assert.match(chat, /providerTurns:q\?\.providerTurns,activeProviderThreadId:q\?\.thread\?\.activeProviderThreadId/);
+  assert.match(chat, /T3ComposerCtxProvider,\{canAttach:[\w$]+,/);
+  assert.match(chat, /T3ComposerQuotaRingMemo,\{providerInstanceId:[\w$]+,activeModel:[\w$]+\}/);
+  assert.match(chat, /T3RingsCtxProvider,\{threadRef:[\w$]+,providerInstanceId:[\w$]+,/);
+  assert.match(chat, /providerTurns:([\w$]+)\?\.providerTurns,activeProviderThreadId:\1\?\.thread\?\.activeProviderThreadId/);
   const runtimeSource = fs.readFileSync(path.join(__dirname, "..", "lib", "runtime", "usage-rings-ui.mjs"), "utf8");
   assert.match(runtimeSource, /\.t3e-slider-fill \{[\s\S]*?z-index: 1;/);
   assert.match(runtimeSource, /\.t3e-effort-tick \{[\s\S]*?z-index: 2;/);
@@ -3495,11 +3522,14 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
   const idStart = rl.indexOf("const getTelemetryIdentity = gen$1(function* () {");
   const ownersStart = rl.indexOf("const getServerOwners = gen$1(function* () {");
   const ownersEnd = rl.indexOf("});", ownersStart) + 3;
-  const asStart = rl.indexOf("const make$44 = gen$1(function* () {\n\t/* T3_NO_TELEMETRY_V1 */");
-  const asEnd = rl.indexOf("\nconst layer$56 = ", asStart);
-  assert(idStart >= 0 && ownersStart > idStart && asStart >= 0 && asEnd > asStart, "Missing patched telemetry blocks");
-  assert(!rl.slice(asStart, asEnd).includes("httpClient.execute"), "AnalyticsService make$44 must not retain sendBatch httpClient execution");
-  assert(!rl.slice(asStart, asEnd).includes("posthogHost"), "AnalyticsService make$44 must not reference posthogHost");
+  const asMatch = rl.match(/const (make\$\d+) = gen\$1\(function\* \(\) \{\n\t\/\* T3_NO_TELEMETRY_V1 \*\//);
+  const asStart = asMatch ? asMatch.index : -1;
+  const makeVar = asMatch ? asMatch[1] : null;
+  const asLayerMatch = makeVar ? rl.slice(asStart).match(new RegExp(`\\nconst layer\\$\\d+ = effect\\(AnalyticsService, ${makeVar.replace("$", "\\$")}\\);`)) : null;
+  const asEnd = asLayerMatch ? asStart + asLayerMatch.index : -1;
+  assert(idStart >= 0 && ownersStart > idStart && asStart >= 0 && asEnd > asStart && makeVar, "Missing patched telemetry blocks");
+  assert(!rl.slice(asStart, asEnd).includes("httpClient.execute"), `AnalyticsService ${makeVar} must not retain sendBatch httpClient execution`);
+  assert(!rl.slice(asStart, asEnd).includes("posthogHost"), `AnalyticsService ${makeVar} must not reference posthogHost`);
   let secretReads = 0;
   const runGen = (g) => {
     const it = g();
@@ -3518,13 +3548,13 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
   runInNewContext(
     rl.slice(idStart, rl.indexOf("});", idStart) + 3) + "\n" +
     rl.slice(ownersStart, ownersEnd) + "\n" +
-    rl.slice(asStart, asEnd) + "\nObject.assign(globalThis, { getTelemetryIdentity, getServerOwners, make$44 });",
+    rl.slice(asStart, asEnd) + `\nObject.assign(globalThis, { getTelemetryIdentity, getServerOwners, makeAnalytics: ${makeVar} });`,
     telemetrySandbox
   );
   assert.equal(JSON.stringify(telemetrySandbox.getTelemetryIdentity()), JSON.stringify({ distinctId: null, installId: null }));
   assert.equal(JSON.stringify(telemetrySandbox.getServerOwners()), "[]");
   assert.equal(secretReads, 0);
-  const svc = telemetrySandbox.make$44();
+  const svc = telemetrySandbox.makeAnalytics();
   assert.equal(svc.record("any.event", {})._tag, "Void");
   assert.equal(svc.flush._tag, "Void");
   assert.equal(svc.recordOwners([], "server")._tag, "Void");
@@ -3534,8 +3564,8 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
   assert(mer.includes("/* T3_NO_TELEMETRY_RELAY_V1 */\nconst isRelayTracingEnabled = () => false;"));
 
   // Client Axiom exporter disabled
-  const utils = findUniqueEntry(verifiedAsar, noTelemetry.clientPatch.targetRegex, noTelemetry.clientPatch.id).content.toString("utf8");
-  assert(utils.includes("function jE(){/* T3_NO_TELEMETRY_CLIENT_V1 */return wt(SE,uc())}"));
+  const utils = findPatchTarget(verifiedAsar, noTelemetry.clientPatch, ALL_PATCHES).content.toString("utf8");
+  assert.match(utils, /function\s+[\w$]+\(\)\{\/\* T3_NO_TELEMETRY_CLIENT_V1 \*\/return\s+[\w$]+\([\w$]+,[\w$]+\(\)\)\}/);
   assert(!utils.includes("headers:{Authorization:`Bearer ${e.tracesToken}`"), "Axiom OTLP exporter body must be stripped");
 
   // Settings UI privacy description updated
@@ -3585,7 +3615,7 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
   // Verify new-chat-layout preserves trailing permissions when usage-rings is NOT applied
   const baselineChat = findUniqueEntry(baselineAsar, newChatLayout.targetRegex, "chat-base").content.toString("utf8");
   const layoutWithoutComposer = newChatLayout.apply(baselineChat);
-  assert(layoutWithoutComposer.includes("trailing:(0,$.jsx)(BF,"), "new-chat-layout must preserve trailing permissions when usage-rings is omitted");
+  assert.match(layoutWithoutComposer, /trailing:\(0,[\w$]+\.jsx\)\([\w$]+,\{environmentId:/, "new-chat-layout must preserve trailing permissions when usage-rings is omitted");
 
   // Verify new-chat-layout binds the Combobox trigger (not an outer TooltipTrigger wrapper) to data-draft-project-trigger
   const trayStart = layoutWithoutComposer.indexOf("function T3NewChatTray(");
@@ -3653,28 +3683,40 @@ function verifyNoTelemetryAndAdapters(verifiedAsar, baselineAsar) {
 }
 
 function verifySameFileFolding(asar) {
-  // 1) Patched session-logic We/ce deduplicates repeated reads (including Windows backslash/Path keys) & edits
-  const slCode = findUniqueEntry(asar, timelineCollapse.summaryPatch.targetRegex, timelineCollapse.summaryPatch.id).content.toString("utf8");
-  const ceMatch = slCode.match(/var ce=\[[^\]]+\];function w\(e,t,n,r\)\{[\s\S]+?function T\(e\)\{[\s\S]+?\}/);
-  const beMatch = slCode.match(/function We\(e,t\)\{\/\* T3_TIMELINE_SUMMARY_V\d+ \*\/[\s\S]+?\n?\}(?=function Ge\()/);
-  assert(ceMatch && beMatch, "Missing patched session-logic path extractor or We counter");
+  // 1) Patched session-logic path extractor & deduplicating counter (cross-version variable resolution)
+  const slCode = findPatchTarget(asar, timelineCollapse.summaryPatch, ALL_PATCHES).content.toString("utf8");
+  const keysM = slCode.match(/var\s+([A-Za-z_$][\w$]*)=\[`path`,`Path`,[^\]]+\];/);
+  assert(keysM, "Missing patched session-logic path keys array");
+  const extractM = slCode.match(/function\s+([A-Za-z_$][\w$]*)\(e,t,n,r\)\{if\(r>4\|\|[^)]+\)return;[\s\S]+?\}\s*function\s+([A-Za-z_$][\w$]*)\(e\)\{let\s+t=\[\];return\s+\1\(e,t,new Set,0\),t\}/);
+  assert(extractM, "Missing patched session-logic path extractor");
+  const [, walkFn, extractFn] = extractM;
+  const helperRefs = [...extractM[0].matchAll(/\b([A-Za-z_$][\w$]*)\(/g)].map((m) => m[1]);
+  const counterM = slCode.match(/function\s+([A-Za-z_$][\w$]*)\(e,t\)\{\/\* T3_TIMELINE_SUMMARY_V\d+ \*\/[\s\S]+?return paths\.size \+ unknown;\s*\}/);
+  assert(counterM, "Missing patched session-logic deduplicating counter");
+  const counterFn = counterM[1];
+  const toolInputFn = counterM[0].match(new RegExp(`${extractFn}\\(([A-Za-z_$][\\w$]*)\\(entry\\)\\)`))?.[1];
+  const readDetailFn = counterM[0].match(/const path = ([A-Za-z_$][\w$]*)\(entry\);/)?.[1];
+  assert(toolInputFn && readDetailFn, "Missing helper references inside patched summary counter");
+  const objCheckFn = extractM[0].match(/let\s+[A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)\(e\);/)?.[1];
+  const strCheckFn = extractM[0].match(/let\s+[A-Za-z_$][\w$]*=([A-Za-z_$][\w$]*)\([A-Za-z_$][\w$]*\[[A-Za-z_$][\w$]*\]\)/)?.[1];
+  assert(objCheckFn && strCheckFn, "Missing type-check helpers in session-logic path walker");
   const slCtx = runInNewContext(
-    ceMatch[0] + "\n" + beMatch[0] + "\n({ T, We })",
+    keysM[0] + "\n" + extractM[0] + "\n" + counterM[0] + `\n({ extract: ${extractFn}, count: ${counterFn} })`,
     {
-      x: (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : null),
-      S: (v) => (typeof v === "string" && v.trim() ? v.trim() : null),
-      V: (x) => x.toolData?.input ?? x.structuredPayload?.input,
-      Be: (x) => x.detail ?? null,
+      [objCheckFn]: (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : null),
+      [strCheckFn]: (v) => (typeof v === "string" && v.trim() ? v.trim() : null),
+      [toolInputFn]: (x) => x.toolData?.input ?? x.structuredPayload?.input,
+      [readDetailFn]: (x) => x.detail ?? null,
     }
   );
-  assert.deepEqual([...slCtx.T({ input: { Path: "C:\\proj\\foo.js" } })], ["C:\\proj\\foo.js"]);
-  const readCount = slCtx.We("read", [
+  assert.deepEqual([...slCtx.extract({ input: { Path: "C:\\proj\\foo.js" } })], ["C:\\proj\\foo.js"]);
+  const readCount = slCtx.count("read", [
     { toolData: { input: { Path: "C:\\proj\\foo.js", StartLine: 1, EndLine: 50 } } },
     { toolData: { input: { file_path: "c:/proj/foo.js", StartLine: 51, EndLine: 100 } } },
     { detail: "C:\\proj\\bar.js" },
   ]);
   assert.equal(readCount, 2, "Repeated reads of the same file must count as 1 unique file");
-  const editCount = slCtx.We("edit", [
+  const editCount = slCtx.count("edit", [
     { changedFiles: ["src\\a.ts"] },
     { changedFiles: ["./src/a.ts"] },
   ]);
@@ -3690,8 +3732,9 @@ function verifySameFileFolding(asar) {
   assert(!utCode.includes("function disclosureIds("), "Timeline runtime helpers must live in the external asset, not the host chunk");
   assert(timelineAsset.text.includes("function disclosureIds("), "Timeline asset must define the disclosure helpers");
   assert(
-    utCode.includes("t3RenderSameFileChildren(i,o)") && utCode.includes("var Ph=(0,$.memo)(") && utCode.includes("(0,$.useMemo)(()=>t3RenderSameFileChildren(i,o),[i,o])"),
-    "Patched Ph must memoize t3RenderSameFileChildren"
+    /\(0,[A-Za-z_$][\w$]*\.memo\)\(/.test(utCode) &&
+      /\(0,[A-Za-z_$][\w$]*\.useMemo\)\(\(\)=>t3RenderSameFileChildren\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\),\[\1,\2\]\)/.test(utCode),
+    "Patched work-group list must memoize t3RenderSameFileChildren"
   );
   const expandedSet = new Set();
   const toggledCalls = [];
@@ -4344,7 +4387,7 @@ function replaceAllLiteral(text, from, to) {
   return text.split(from).join(to);
 }
 
-const bumpVersion = (text) => text.replace(/("(?:version|buildVersion)"\s*:\s*")0\.1\.12(")/g, (m, head, tail) => head + MUTANT_VERSION + tail);
+const bumpVersion = (text) => text.replace(/("(?:version|buildVersion)"\s*:\s*")\d+\.\d+\.\d+(")/g, (m, head, tail) => head + MUTANT_VERSION + tail);
 // Keep a leading shebang first so the mutated chunk stays valid.
 const addBanner = (text) => {
   const banner = `/* t3code v${MUTANT_VERSION} build banner */\n`;
@@ -4405,14 +4448,28 @@ function createServerMutant(baseAsar, outputPath) {
   const workflow = target(noTelemetry.relayPatch);
   const settings = target(noTelemetry.uiPatch);
   const threadRoute = target(usageRings);
-  add(runtimeLayer, (t) => renameIdentifier(renameIdentifier(t, "make$44", "make$999"), "Boolean$1", "BoolCfg$99"));
+  add(runtimeLayer, (t) => {
+    const analyticsMake = t.match(/effect\(\s*AnalyticsService\s*,\s*(make\$\d+)\s*\)/)?.[1];
+    assert(analyticsMake, "Missing AnalyticsService make$NN binding for mutation");
+    return renameIdentifier(renameIdentifier(t, analyticsMake, "make$999"), "Boolean$1", "BoolCfg$99");
+  });
   add(workflow, (t) => `${t}\n// t3code v${MUTANT_VERSION} content-hash drift\n`);
   add(threadRoute, (t) => {
-    let out = renameIdentifier(t, "hW", "hW_v99");
-    out = renameIdentifier(out, "_W", "_W_v99");
-    out = replaceAllLiteral(out, "t[1220]", "t[1299]");
-    out = replaceAllLiteral(out, "(0,Q.c)(1221)", "(0,Q.c)(1300)");
-    for (const slot of [716, 717, 718]) out = replaceAllLiteral(out, `t[${slot}]`, `t[${slot + 100}]`);
+    const fnNames = [...t.matchAll(/\bfunction\s+([A-Za-z_$][\w$]*)\(/g)].map((m) => m[1]).filter((n) => n.length <= 3);
+    const renameCandidates = [...new Set(fnNames)].slice(0, 2);
+    let out = t;
+    for (const fn of renameCandidates) out = renameIdentifier(out, fn, `${fn}_v99`);
+    // Shift the largest React Compiler memo cache allocation in ThreadRouteView so slot-index assumptions cannot slip through
+    const cacheMatches = [...out.matchAll(/let\s+([A-Za-z_$][\w$]*)=\(0,([A-Za-z_$][\w$]*)\.c\)\((\d+)\)/g)];
+    cacheMatches.sort((a, b) => Number(b[3]) - Number(a[3]));
+    const largestCache = cacheMatches[0];
+    assert(largestCache, "Missing React Compiler memo cache in ThreadRouteView for mutation");
+    const [, cacheVar, compilerVar, sizeStr] = largestCache;
+    const origSize = Number(sizeStr);
+    const bumpedSize = origSize + 79;
+    out = replaceAllLiteral(out, `(0,${compilerVar}.c)(${origSize})`, `(0,${compilerVar}.c)(${bumpedSize})`);
+    const lastSlot = `${cacheVar}[${origSize - 1}]`;
+    if (out.includes(lastSlot)) out = replaceAllLiteral(out, lastSlot, `${cacheVar}[${bumpedSize - 1}]`);
     return out;
   });
   const sibling = (key, name) => `${path.posix.dirname(key)}/${name}`;
@@ -4442,12 +4499,32 @@ function createServerMutant(baseAsar, outputPath) {
         const ei = u.lastIndexOf("export{");
         return u.slice(0, ei) + u.slice(ei).replace(expMatchRe, `as ${renamedExport}`);
       });
-      add(threadRoute, (t) =>
-        renameIdentifier(t, traitsRes.local, renamedLocal).replace(
-          new RegExp(`\\b${traitsRes.imported}\\s+as\\s+${renamedLocal}(?=[,}])`),
-          `${renamedExport} as ${renamedLocal}`
-        )
-      );
+      add(threadRoute, (t) => {
+        const savedImports = [];
+        const masked = t.replace(/import\s*\{[^}]*\}\s*from\s*"\.\/[^"]+"/g, (m) => {
+          const token = `__T3_MUT_IMP_${savedImports.length}__`;
+          savedImports.push(m);
+          return token;
+        });
+        let renamed = renameIdentifier(masked, traitsRes.local, renamedLocal);
+        for (let idx = 0; idx < savedImports.length; idx++) {
+          let impLine = savedImports[idx];
+          if (impLine.includes(utilsImp[2])) {
+            impLine = impLine.replace(
+              new RegExp(`\\b${traitsRes.imported}\\s+as\\s+${traitsRes.local}(?=[,}])`),
+              `${renamedExport} as ${renamedLocal}`
+            );
+          } else {
+            // If another import binds local === traitsRes.local, keep its imported export name intact
+            impLine = impLine.replace(
+              new RegExp(`\\bas\\s+${traitsRes.local}(?=[,}])`),
+              `as ${renamedLocal}`
+            );
+          }
+          renamed = renamed.replace(`__T3_MUT_IMP_${idx}__`, () => impLine);
+        }
+        return renamed;
+      });
     }
   }
   const renames = [
@@ -4464,7 +4541,11 @@ function createDesktopMutant(baseAsar, outputPath) {
     ["package.json", [bumpVersion]],
     [DESKTOP_MAIN_KEY, [
       addBanner,
-      (t) => renameIdentifier(t, "make$93", scanIdentifier(t, "make$91").count === 0 ? "make$91" : "make$93_v99"),
+      (t) => {
+        const makeVar = t.match(/\b(?:const|var|let)\s+(make\$\d+)\s*=/)?.[1];
+        assert(makeVar, "Missing desktop make$NN binding for mutation");
+        return renameIdentifier(t, makeVar, `${makeVar}_v99`);
+      },
     ]],
   ]);
   return { asar: writeMutatedAsar(baseAsar, outputPath, { edits }), path: outputPath, patches };
@@ -4622,12 +4703,14 @@ function verifyCrossVersionMutation(serverBaseline, desktopBaseline) {
     assert.equal(brokenUsageMod.installed, false, "Tampered runtime asset must invalidate usage-rings installed status");
     assert.equal(brokenUsageMod.outdated, true, "Tampered runtime asset must flag usage-rings as needing upgrade/repair");
 
-    // Unresolvable fixed dependency alias in ThreadRouteView must fail explicitly instead of silently emitting broken bridge bindings
+    // Unresolvable dependency in ThreadRouteView must fail explicitly instead of silently emitting broken bridge bindings
     const trEntry = findUniqueEntry(serverBaseline.asar, usageRings.targetRegex, "usage-rings-neg");
-    const brokenImportSrc = trEntry.content.toString("utf8").replace("qr as ", "MISSING_ALIAS as ");
+    const trText = trEntry.content.toString("utf8");
+    const brokenImportSrc = trText.replace(/import\{([^}]+)\}from"\.\/(popover-[\w.-]+\.js)"/, 'import{}from"./$2"');
+    assert.notEqual(brokenImportSrc, trText, "Expected popover import in ThreadRouteView for negative test");
     assert.throws(
       () => usageRings.apply(brokenImportSrc, createPatchContext(serverBaseline.asar, trEntry, brokenImportSrc)),
-      /Could not resolve Tooltip \(qr\) from utils/,
+      /Could not resolve Popover \(t\) from popover/,
       "Broken fixed export alias must throw explicit diagnostic error"
     );
     const telemetryChunk = findUniqueEntry(patchedServer.asar, /\/runtimeLayer-MUT99999\.mjs$/, "mutated runtimeLayer").content.toString("utf8");
@@ -4667,6 +4750,10 @@ function verifyCrossVersionMutation(serverBaseline, desktopBaseline) {
     assert.throws(
       () => verifyInjectedScope("const a = 1;\n", ["const x = FAKE_UNDECLARED_VAR_999();"], "suite17 undeclared"),
       /Static scope check failed for suite17 undeclared: undeclared reference\(s\): FAKE_UNDECLARED_VAR_999/
+    );
+    assert.throws(
+      () => verifyInjectedScope("const a = 1;\n", ["const el = (0,undefined.jsx)('div', {});"], "suite17 undefined-jsx"),
+      /accidental "undefined\." property access/
     );
     verifyInjectedScope("import{q as r}from\"./x.js\";const a = 1;function b(){return a}\n", ["const y = r(a) + b() + Math.max(1, 2);"], "suite17 declared");
     verifyInjectedScope("const a = 1;\n", ["const z = t3Extra(a);"], "suite17 allowed", ["t3Extra"]);
@@ -4778,7 +4865,9 @@ try {
   const verified = readAsar(tmpOut);
   for (const p of baselineApplicable) {
     const entry = findUniqueEntry(verified, p.targetRegex, p.id);
-    assert(entry.content.toString("utf8").includes(p.marker), `Marker missing for ${p.id}`);
+    const entryStr = entry.content.toString("utf8");
+    assert(entryStr.includes(p.marker), `Marker missing for ${p.id}`);
+    assert(!/\(0,\s*undefined\.|\bundefined\.(?:jsx|jsxs|Fragment)\b/.test(entryStr), `Accidental undefined JSX interpolation detected in ${p.id}`);
   }
   let verifiedDesktop = verified.entries.some((e) => desktopTray.targetRegex.test(e.key)) ? verified : null;
   if (desktopBaseline && tmpDesktopOut) {
@@ -5079,6 +5168,50 @@ function verifyCrossPlatformArchivesAndTransactions(serverBaseline, desktopBasel
         cmdRepair(new Set(), null, { assertClosed: () => {} });
         assert.equal(inspectArchive(winApp, desktopPatches).modules.find((m) => m.id === "desktop-tray").installed, false, "Bare repair with corrupt winApp must still read surviving winServer buildMeta.plan and exclude desktop-tray");
         cmdUninstall(new Set(["--purge-backup"]), null, { assertClosed: () => {} });
+        assert.equal(readSavedInstallPlan(path.join(fakeT3Home, "userdata")), null, "uninstall must clear persisted install plan");
+
+        // Overwrite-upgrade regression:
+        // 1) Install custom plan (--packs theme,privacy,composer) -> persists .t3code-enhancer-plan.json
+        // 2) Simulate official T3 Code overwrite-upgrade (pristine server.asar & app.asar replace patched ones)
+        // 3) Bare `repair` must restore the full saved plan (not degrade to theme-only)
+        // 4) Simulate legacy patched archive (LEGACY_MARKERS) -> direct `install` upgrades cleanly from backup
+        const userdataPath = path.join(fakeT3Home, "userdata");
+        cmdInstall(new Set(), null, { packs: ["theme", "privacy", "composer"], assertClosed: () => {} });
+        const savedPlan = readSavedInstallPlan(userdataPath);
+        assert(savedPlan && Array.isArray(savedPlan.packIds), "install must persist .t3code-enhancer-plan.json");
+        assert.deepEqual([...savedPlan.packIds].sort(), ["composer", "privacy", "theme"]);
+        assert(fs.existsSync(getSavedPlanPath(userdataPath)));
+
+        // Simulate official overwrite-upgrade: both ASARs revert to pristine upstream binaries
+        fs.copyFileSync(serverBaseline.path, winServer);
+        fs.copyFileSync(desktopBaseline.path, winApp);
+        cmdRepair(new Set(), null, { assertClosed: () => {} });
+        const afterOverwriteServer = inspectArchive(winServer).modules;
+        const afterOverwriteApp = inspectArchive(winApp, desktopPatches).modules;
+        assert.equal(afterOverwriteServer.find((m) => m.id === "no-telemetry").installed, true, "Bare repair after native overwrite-upgrade must restore privacy");
+        assert.equal(afterOverwriteServer.find((m) => m.id === "usage-rings").installed, true, "Bare repair after native overwrite-upgrade must restore composer");
+        assert.equal(afterOverwriteServer.find((m) => m.id === "new-chat-layout").installed, false, "Bare repair must NOT add unselected workspace pack");
+        assert.equal(afterOverwriteApp.find((m) => m.id === "no-telemetry-desktop").installed, true, "Bare repair must restore desktop privacy patch");
+        assert.equal(afterOverwriteApp.find((m) => m.id === "desktop-tray").installed, false, "Bare repair must keep unselected desktop-tray off");
+
+        // Simulate legacy enhancer version already installed (marker downgraded to LEGACY_MARKERS) -> direct install overwrites cleanly
+        const legacyServerPath = path.join(tmpRoot, "legacy-server.asar");
+        const curServerAsar = readAsar(winServer);
+        const urEntry = findPatchTarget(curServerAsar, usageRings);
+        const urText = urEntry.content.toString("utf8");
+        const legacyMarker = usageRings.legacyMarkers[usageRings.legacyMarkers.length - 1];
+        assert(legacyMarker && urText.includes(usageRings.marker), "Expected active usage-rings marker for legacy upgrade test");
+        writePatchedAsar(
+          curServerAsar,
+          [{ key: urEntry.key, replacement: Buffer.from(urText.replaceAll(usageRings.marker, legacyMarker), "utf8") }],
+          legacyServerPath
+        );
+        fs.copyFileSync(legacyServerPath, winServer);
+        assert.equal(inspectArchive(winServer).modules.find((m) => m.id === "usage-rings").outdated, true, "Legacy marker must be classified as outdated");
+        cmdInstall(new Set(), null, { packs: ["theme", "privacy", "composer"], assertClosed: () => {} });
+        assert.equal(inspectArchive(winServer).modules.find((m) => m.id === "usage-rings").installed, true, "Direct install over legacy patch must upgrade to latest marker cleanly");
+        cmdUninstall(new Set(["--purge-backup"]), null, { assertClosed: () => {} });
+        assert(!fs.existsSync(getSavedPlanPath(userdataPath)), "uninstall must delete .t3code-enhancer-plan.json");
 
         // Theme ENOTDIR/EISDIR pre-commit failure AND post-rename mid-commit failure must BOTH leave winServer & winApp at orig SHA-256
         const userdataDir = path.join(fakeT3Home, "userdata");
