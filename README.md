@@ -7,9 +7,9 @@
 **让 T3 Code 更接近 ChatGPT 桌面版**<br/>
 更顺眼的整体界面 · 更干净的隐私去遥测 · 后台系统托盘 · 更顺手的对话与多浮窗工作区
 
-<p align="center"><a href="https://github.com/Barometer-2002/t3code-enhancer/releases/tag/v0.2.0-preview.2"><img src="https://img.shields.io/badge/version-v0.2.0--preview.2-7c3aed?style=flat-square" alt="Version" /></a> <a href="https://github.com/pingdotgg/t3code/releases/tag/v0.1.13"><img src="https://img.shields.io/badge/T3_Code-0.1.13-0ea5e9?style=flat-square" alt="T3 Code" /></a> <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%E2%89%A5%2020-339933?style=flat-square" alt="Node.js" /></a> <a href="#核心体验"><img src="https://img.shields.io/badge/dependencies-0-22c55e?style=flat-square" alt="Zero Deps" /></a> <a href="#平台支持"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS*-64748b?style=flat-square" alt="Platforms" /></a> <a href="#说明与许可"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License" /></a></p>
+<p align="center"><a href="https://github.com/Barometer-2002/t3code-enhancer/releases/latest"><img src="https://img.shields.io/badge/version-v0.2.0-7c3aed?style=flat-square" alt="Version" /></a> <a href="https://github.com/pingdotgg/t3code/releases/tag/v0.1.13"><img src="https://img.shields.io/badge/T3_Code-0.1.13-0ea5e9?style=flat-square" alt="T3 Code" /></a> <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%E2%89%A5%2020-339933?style=flat-square" alt="Node.js" /></a> <a href="#核心体验"><img src="https://img.shields.io/badge/dependencies-0-22c55e?style=flat-square" alt="Zero Deps" /></a> <a href="#平台支持"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS*-64748b?style=flat-square" alt="Platforms" /></a> <a href="#说明与许可"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License" /></a></p>
 
-**[⬇ 下载 v0.2.0-preview.2 预览版](https://github.com/Barometer-2002/t3code-enhancer/releases/tag/v0.2.0-preview.2)** · [实机演示](#实机演示) · [核心体验](#核心体验) · [快速开始](#快速开始) · [按需搭配](#按需搭配) · [文档导航](#文档导航)
+**[⬇ 下载 v0.2.0 最新正式版](https://github.com/Barometer-2002/t3code-enhancer/releases/latest)** · [实机演示](#实机演示) · [核心体验](#核心体验) · [快速开始](#快速开始) · [按需搭配](#按需搭配) · [文档导航](#文档导航)
 
 <sub>纯本地运行 · 零外部依赖 · 自动保留原版备份，随时一键还原</sub>
 
@@ -19,7 +19,7 @@
 
 开发者可在 Windows 上运行 `npm run test:e2e`，从本机原版归档构建独立测试实例，复查主题切换、启动台及浮窗交互。运行条件和截图方式见[浏览器测试说明](docs/ARCHITECTURE.md#独立浏览器测试windows)。
 
-以下动图均在真实 T3 Code `0.1.12` 客户端中录制（点击图片可放大查看）：
+以下动图录制于 T3 Code `0.1.12` 客户端（界面体验同样适配当前 `0.1.13`，点击图片可放大查看）：
 
 <table>
   <tr>
@@ -64,7 +64,7 @@
 
 ## 快速开始
 
-准备 **Node.js 20+**，下载 **[v0.2.0-preview.2 预览版压缩包](https://github.com/Barometer-2002/t3code-enhancer/releases/tag/v0.2.0-preview.2)** 并解压（无需 `npm install`；右侧 Releases 栏默认展示的是旧版 `v0.1.1`，本页全部新功能请从预览版下载，历史版本见 [全部 Releases](https://github.com/Barometer-2002/t3code-enhancer/releases)）：
+准备 **Node.js 20+**，前往 **[最新正式版下载页（Releases Latest）](https://github.com/Barometer-2002/t3code-enhancer/releases/latest)** 下载压缩包并解压（当前为 **`v0.2.0`**，无需 `npm install`；历史版本见 [全部 Releases](https://github.com/Barometer-2002/t3code-enhancer/releases)）：
 
 **Windows**
 1. 退出 T3 Code（若在托盘运行，右键右下角图标点击退出）。
@@ -122,10 +122,12 @@ node cli.cjs uninstall                                # 一键还原官方原版
 - 部分面板图标来自 [Lucide](https://github.com/lucide-icons/lucide) 与 Feather（[许可](licenses/Lucide.txt)）。
 - 认可并支持 [LINUX DO 社区](https://linux.do/)。
 
-## 版本号规范
+## 版本号规范与客户端适配规则
 
-本项目遵循语义化版本（SemVer 2.0.0），由 [lib/version.cjs](lib/version.cjs) 与 [package.json](package.json) 统一管理（执行 `node cli.cjs --version` 查看）：
+本项目遵循语义化版本（SemVer 2.0.0），由 [lib/version.cjs](lib/version.cjs) 与 [package.json](package.json) 统一管理（执行 `node cli.cjs --version` 查看；当前正式版为 **`v0.2.0`**）：
 
-- **正式版**：`vMAJOR.MINOR.PATCH`（如 `v0.1.0`、`v0.1.1`、`v0.2.0`）
-- **预览版**：`vMAJOR.MINOR.PATCH-<alpha|beta|preview|rc>.<N>`（当前为 `v0.2.0-preview.2`）
-- 工具版本号与所适配的官方 T3 Code 基线版本（`0.1.13`，向后兼容 `0.1.12`）相互独立
+- **小版本（`0.x.y`，如 `v0.2.1`）**：包含自身缺陷修复、样式/跨主题调整、文档修订，以及**对 T3 Code 客户端的常规小版本适配**（仅刷新基线哈希与少量定位锚点，不改模块架构与补丁集）。
+- **中版本（`0.x.0`，如 `v0.2.0`、`v0.3.0`）**：新增或重构功能模块（`PACKS` / `PRESETS` 变化）、重构外置运行时，或适配导致多补丁重写、不再兼容上一代架构的 T3 Code 大改版。
+- **主版本（`x.0.0`）**：工具自身底层机制或 CLI/配置格式发生不兼容换代。
+- **预览版（`vMAJOR.MINOR.PATCH-<alpha|beta|preview|rc>.<N>`）**：仅在大改版转正前的公开试测阶段使用，验证收口后转正为正式版并更新 GitHub `Latest`；已公开的标签与发行包不原地覆写，入口下载链接固定指向 `/releases/latest`。
+- 工具版本号与所适配的官方 T3 Code 基线版本（`0.1.13`，向后兼容 `0.1.12`）相互独立。

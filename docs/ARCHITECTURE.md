@@ -236,11 +236,12 @@ T3 Code 前端由 Rolldown + React Compiler 构建，升级后必然发生：**c
 2. **适配 T3 Code 新版本（如 `0.1.13+`）**：
    - 先对新版 ASAR 试跑 `node cli.cjs build /tmp/check.asar` 或 `npm test -- <new.asar>`，查看哪些模块进入 `auto-adapted` 或触发 fail-closed 报错；
    - 修复失败锚点（优先改用语义/AST 定位而非写死新混淆名），确认稳定后更新 `lib/version.cjs` 的 `T3_BASELINE_VERSION`、各补丁的 `ORIGINAL_HASH` 与 `linux.cjs` 的 `APPIMAGE_HASH`；
+   - **版本递增规则**：常规客户端小版本跟进（仅更新基线哈希与少量锚点，不改模块结构）递增 `PATCH`（如 `0.2.1`）；若客户端大改版导致多补丁重写或弃用旧架构，再递增 `MINOR`（如 `0.3.0`）；
    - 跑通 `npm run test:full`。
 3. **新增原子补丁或外置运行时**：
    - 在 `lib/patches/` 实现补丁（必须提供 `targetSpec`、`marker`、`legacyMarkers`、`originalHash`，注入代码经 `ctx.recordInjectedCode()` 登记）；
    - 同步登记到 `lib/engine.cjs`（`ALL_PATCHES`，若带外置运行时再登记 `PATCH_RUNTIME_NAMES`）与 `lib/packs.cjs`（`PACKS` 及需要联动禁用时的 `PATCH_GROUPS`）；
    - 在 `tests/verify.cjs` 补齐行为验证并更新 `ALL_PATCHES.length` 断言。
 4. **打包预发布/正式版 ZIP**：
-   - 确认 `package.json` 版本号符合 `lib/version.cjs` 规范，同步更新 `README.md`、`使用教程.md` 与 `dist/release-v<ver>.md`；
-   - 跑通 `npm run test:unit` + `npm test` + `npm run test:full`，打包 ZIP（注意保持 `install.sh` 的 POSIX `0755` 权限与 LF、`*.cmd` 的 CRLF）并记录 ZIP 的文件数、字节数与 SHA-256。
+   - 确认 `package.json` 版本号符合 `lib/version.cjs` 规范（已公开的 tag / ZIP 严禁原地覆写，改动一律递增版本号；正式版入口保持 `/releases/latest`），同步更新 `README.md`、`使用教程.md` 与 `dist/release-v<ver>.md`；
+   - 跑通 `npm run test:unit` + `npm test` + `npm run test:e2e` + `npm run test:full`，打包 ZIP（注意保持 `install.sh` 的 POSIX `0755` 权限与 LF、`*.cmd` 的 CRLF）并记录 ZIP 的文件数、字节数与 SHA-256。

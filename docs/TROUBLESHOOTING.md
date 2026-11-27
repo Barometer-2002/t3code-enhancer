@@ -56,6 +56,6 @@ macOS 的 `.app` 有严格的代码签名与完整性校验，原地改包会导
 
 遇到异常或愿意协助测试 **macOS 真机表现**，欢迎到 [GitHub Issues](https://github.com/Barometer-2002/t3code-enhancer/issues) 留言，附上以下 3 项即可最快定位：
 
-1. **系统与版本** — 如 Windows 11 / Ubuntu 24.04 / macOS 15 + T3 Code `0.1.12` + `node cli.cjs --version` 输出
+1. **系统与版本** — 如 Windows 11 / Ubuntu 24.04 / macOS 15 + T3 Code `0.1.13` + `node cli.cjs --version` 输出
 2. **当前状态** — 粘贴 `node cli.cjs status` 的完整输出
 3. **具体现象** — 做了哪一步、报错文案或截图

@@ -13,7 +13,7 @@
   - **Linux（AppImage / `.deb`）与 macOS**：单档合并 `app.asar`（同时含 `apps/server/*` 与 `apps/desktop/*`）。必须始终用 `applicablePatchesForArchive()` 按归档内容过滤补丁。
   - **macOS 禁止原地改包**：`assertSafeAsarTargets()` 硬拦截对 `.app/Contents/Resources/*.asar` 的直接 `--asar` 写入（否则破坏代码签名与 `ElectronAsarIntegrity`）；必须经 `macos.cjs` / `--app` 在独立副本上重建并重签名。
 - **Windows 运行锁与测试隔离**：运行中的 T3 Code（含当前承载 Agent 的宿主进程）会锁定生产目录的 `server.asar` / `app.asar`。开发与测试严禁直接覆盖正在运行的生产 ASAR；本机生效需先彻底退出 T3 Code 后执行 `node cli.cjs repair`。
-- **版本单一真相**：工具版本号以 `package.json` 为唯一真相源，由 `lib/version.cjs` 强校验为 `MAJOR.MINOR.PATCH` 或 `MAJOR.MINOR.PATCH-(alpha|beta|preview|rc).<N>`，与 T3 Code 基线版本 `T3_BASELINE_VERSION`（`0.1.13`，向后兼容 `0.1.12`）完全解耦。
+- **版本单一真相与发版约束**：工具版本号以 `package.json` 为唯一真相源，由 `lib/version.cjs` 强校验为 `MAJOR.MINOR.PATCH` 或 `MAJOR.MINOR.PATCH-(alpha|beta|preview|rc).<N>`，与 T3 Code 基线版本 `T3_BASELINE_VERSION`（`0.1.13`，向后兼容 `0.1.12`）解耦。**T3 Code 常规小版本适配（仅刷新基线哈希与少量定位锚点，不改模块架构）与日常缺陷修复统一递增 `PATCH`（如 `0.2.1`），功能重构或架构级大改版再递增 `MINOR`；已公开发布的 tag 与 ZIP 禁止原地覆写**。
 - **行尾规范**：`install.sh` 必须保持 `LF`，`*.cmd` 必须保持 `CRLF`（`.gitattributes` 约束，单测 `3.7` 强制校验）。
 
 ---

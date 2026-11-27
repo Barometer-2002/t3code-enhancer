@@ -623,6 +623,10 @@ function verifyCrossPlatformCliUnit() {
   const tutorialText = fs.readFileSync(path.join(rootDir, "使用教程.md"), "utf8");
   assert(readmeText.includes("## 版本号规范") && readmeText.includes(ENHANCER_TAG), "README.md must stay synced with ENHANCER_TAG");
   assert(tutorialText.includes("版本号规范") && tutorialText.includes(ENHANCER_TAG), "使用教程.md must stay synced with ENHANCER_TAG");
+  if (!readPackageVersion().isPrerelease) {
+    assert(readmeText.includes("/releases/latest") && tutorialText.includes("/releases/latest"), "Stable release docs must link entry downloads to /releases/latest");
+    assert(!/releases\/tag\/v\d+\.\d+\.\d+-(?:alpha|beta|preview|rc)\.\d+/.test(readmeText) && !/releases\/tag\/v\d+\.\d+\.\d+-(?:alpha|beta|preview|rc)\.\d+/.test(tutorialText), "Stable release entry docs must not link primary downloads to prerelease tags");
+  }
   assert.equal(JSON.parse(fs.readFileSync(SOURCE_THEME_PATH, "utf8")).version, 1, "Theme JSON schema version must remain upstream integer 1");
 
   // 4) Isolated dual-ASAR vs single-ASAR discovery (Windows layout)
