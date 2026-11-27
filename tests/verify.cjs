@@ -4160,10 +4160,44 @@ function verifyFilesChangesExplorer(asar) {
     feHost.text.includes("data-item-flattened-subitems"),
     "FilePreviewPanel must inject flattened-directory alignment CSS into @pierre/trees unsafeCSS"
   );
-  // Verify all runtime fallback style injectors prepend instead of clobbering active theme Layer 3 CSS
-  for (const modName of ["inline-diff-ui", "files-explorer-ui", "timeline-ui", "floating-panels-ui", "usage-rings-ui"]) {
+  // Verify all UI runtime & patch fallback style injectors prepend instead of clobbering active theme Layer 3 CSS,
+  // every injected <svg> carries explicit intrinsic width/height so missing theme CSS can never blow up icons,
+  // and floating-panels preserves Windows WCO top-right control clearance on official non-ChatGPT themes.
+  for (const modName of ["inline-diff-ui", "files-explorer-ui", "timeline-ui", "floating-panels-ui", "tab-bar-ui", "usage-rings-ui"]) {
     const src = fs.readFileSync(path.join(__dirname, "..", "lib", "runtime", modName + ".mjs"), "utf8");
     assert(src.includes("document.head.prepend"), `${modName}.mjs must prepend fallback styles so theme Layer 3 takes precedence`);
+    for (const m of src.matchAll(/(?:jsxs?)\("svg"\s*,\s*\{/g)) {
+      const beforeChildren = src.slice(m.index, m.index + 500).split(/\bchildren\s*:/)[0];
+      assert(/\bwidth\b/.test(beforeChildren) && /\bheight\b/.test(beforeChildren), `${modName}.mjs contains an <svg> without explicit intrinsic width/height`);
+    }
+  }
+  const fpRtSrc = fs.readFileSync(path.join(__dirname, "..", "lib", "runtime", "floating-panels-ui.mjs"), "utf8");
+  assert(
+    fpRtSrc.includes(".wco [data-t3e-workspace]") &&
+      fpRtSrc.includes("var(--workspace-native-controls-inset, 144px)") &&
+      fpRtSrc.includes('[data-t3e-chat-floating="true"]'),
+    "floating-panels-ui.mjs must reserve Windows WCO native window-control inset across docked/swapped/maximized/floating layouts"
+  );
+  const tbRtSrc = fs.readFileSync(path.join(__dirname, "..", "lib", "runtime", "tab-bar-ui.mjs"), "utf8");
+  assert(
+    tbRtSrc.includes('.t3e-new-tab-pill[data-active-tab="true"]'),
+    "tab-bar-ui.mjs must style active new-tab pill without depending on ChatGPT Layer 2/3 CSS"
+  );
+  const feRtSrc = fs.readFileSync(path.join(__dirname, "..", "lib", "runtime", "files-explorer-ui.mjs"), "utf8");
+  assert(
+    feRtSrc.includes(".t3e-fe-section{"),
+    "files-explorer-ui.mjs must include .t3e-fe-section fallback layout rule"
+  );
+  for (const patchFile of ["new-chat-layout.cjs", "sidebar-new-chat.cjs"]) {
+    const src = fs.readFileSync(path.join(__dirname, "..", "lib", "patches", patchFile), "utf8");
+    assert(src.includes("document.head.prepend"), `${patchFile} must prepend fallback styles so switching themes or --official never breaks layout`);
+  }
+  const ncPatchSrc = fs.readFileSync(path.join(__dirname, "..", "lib", "patches", "new-chat-layout.cjs"), "utf8");
+  const ncSvgBlock = ncPatchSrc.match(/const T3_NC_SVGS = \{([\s\S]*?)\n\};/)?.[1] || "";
+  const ncSvgEntries = [...ncSvgBlock.matchAll(/^\s*(\w+):\s*\{([^\n]+)/gm)];
+  assert(ncSvgEntries.length >= 9, "Expected all new-chat SVG icon definitions");
+  for (const [, iconName, defLine] of ncSvgEntries) {
+    assert(/\bwidth:\s*\d+/.test(defLine) && /\bheight:\s*\d+/.test(defLine), `T3_NC_SVGS.${iconName} must declare explicit width and height`);
   }
   const themeJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "themes", "chatgpt-app.json"), "utf8"));
   assert(

@@ -69,11 +69,11 @@ flowchart TD
 | 9 | `inline-file-diff-side-reveal` | `chat` | `DIFF` | `apps/server/dist/client/assets/DiffPanel-*.js` | `T3_INLINE_FILE_DIFF_SIDE_REVEAL_V6` | — |
 | 10 | `inline-file-diff-quiet-review-toast` | `chat` | `DIFF` | `apps/server/dist/client/assets/runtime-*.js` | `T3_QUIET_REVIEW_SLOW_TOAST_V1` | — |
 | 11 | `usage-rings` | `composer` | — | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_USAGE_RINGS_V35` | `usage-rings-ui.mjs` |
-| 12 | `sidebar-new-chat` | `workspace` | — | `apps/server/dist/client/assets/main-*.js` | `T3_SIDEBAR_NEW_CHAT_V4` | — |
-| 13 | `new-chat-layout` | `workspace` | — | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_NEW_CHAT_LAYOUT_V9` | — |
+| 12 | `sidebar-new-chat` | `workspace` | — | `apps/server/dist/client/assets/main-*.js` | `T3_SIDEBAR_NEW_CHAT_V5` | — |
+| 13 | `new-chat-layout` | `workspace` | — | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_NEW_CHAT_LAYOUT_V10` | — |
 | 14 | `files-changes-explorer` | `chat` | — | `apps/server/dist/client/assets/FilePreviewPanel-*.js` | `T3_FILES_CHANGES_EXPLORER_V9` | `files-explorer-ui.mjs` |
 | 15 | `workspace-floating-panels` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/ThreadRouteView-*.js` | `T3_WORKSPACE_FLOATING_PANELS_V31` | `floating-panels-ui.mjs` |
-| 16 | `workspace-floating-tab-bar` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/PanelLayoutControls-*.js` | `T3_WORKSPACE_FLOATING_TAB_BAR_V15` | `tab-bar-ui.mjs` |
+| 16 | `workspace-floating-tab-bar` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/PanelLayoutControls-*.js` | `T3_WORKSPACE_FLOATING_TAB_BAR_V16` | `tab-bar-ui.mjs` |
 | 17 | `workspace-floating-preview-toolbar` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/PreviewPanel-*.js` | `T3_WORKSPACE_FLOATING_PREVIEW_TOOLBAR_V2` | — |
 | 18 | `workspace-floating-preview-responsive` | `workspace` | `FLOATING` | `apps/server/dist/client/assets/main-*.js` | `T3_WORKSPACE_FLOATING_PREVIEW_RESPONSIVE_V2` | — |
 | 19 | `desktop-tray` | `workspace` | — | `apps/desktop/dist-electron/main.cjs` | `T3_DESKTOP_TRAY_V1` | — |
@@ -210,12 +210,20 @@ T3 Code 前端由 Rolldown + React Compiler 构建，升级后必然发生：**c
 | 隔离与启动 | 原地替换 + `.before-t3code-enhancer` 备份 | `~/.local/share/t3code-enhancer/` + `launch.sh`（端口 3774） | 原地替换 + 备份 | `~/Applications/T3 Code Enhancer.app` + `Info.plist` + ad-hoc `codesign` |
 | 特殊约束 | 关闭托盘后才可写入 | 首装校验官方 AppImage SHA-256 | 支持 `--asar` | 禁止 `--asar` 原地改 `.app`，必须经 `--app` 重建并更新 `ElectronAsarIntegrity` |
 
-### 4.5 测试体系架构（`tests/verify.cjs`）
+### 4.5 构建测试与浏览器交互测试
 
-- **三层执行模式**：
+- `tests/verify.cjs` 提供三种执行模式。
   - `npm run test:unit`（`--unit`，`<1s`）：Suite 1 ~ 3.7（主题三层分离、纯算法、跨平台 CLI 路由与行尾规范，零外部依赖）。
-  - `npm test`（默认，`~30s`）：Suite 1 ~ 16（在真实 `0.1.12` 全量 `server.asar` + `app.asar` 上构建全部 19 补丁与 6 外置运行时，并在无 DOM Node VM 沙箱中逐项验证 12 组 UI/交互/安全/去遥测/托盘行为）。
-  - `npm run test:full`（`--full`，发版/引擎改动必跑）：追加 Suite 17（合成 `v0.1.99` 变异归档：chunk 重命名 + 标识符改名 + memo 槽位右移 + `useModelTraits` 跨 chunk 导出改名 + fail-closed 负例 + ESM 链接正负例）与 Suite 18（三端组合归档与安装/损坏修复/缩减计划/回滚事务矩阵），两者均采用 `createSlimAsar()` 抽取真实 0.1.12 目标 chunk 及其全部 1-hop 依赖（~28 MB 替代 271 MB）。
+  - `npm test` 运行 Suite 1 至 16，在本机原版 `server.asar` 和 `app.asar` 上构建 19 项补丁与 6 个外置运行时，验证 UI、交互、去遥测和托盘行为。本次使用 T3 Code 0.1.13。
+  - `npm run test:full` 增加 Suite 17 和 18。Suite 17 用合成的 `v0.1.99` 归档检验 chunk 重命名、标识符改名、memo 槽位偏移、跨 chunk 导出、失配中止和 ESM 链接。Suite 18 检验三端归档、安装、损坏修复、缩减方案和事务回滚。两者均通过 `createSlimAsar()` 从基线提取目标 chunk 及其直接依赖。
+
+#### 独立浏览器测试（Windows）
+
+从仓库运行 `npm run test:e2e`。测试使用本机 T3 Code 安装目录的原版基线构建临时 server.asar，启动独立服务、空白项目和 Chrome 配置目录。当前桌面客户端可以继续运行。测试要求已安装 Chrome 和 T3 Code，非默认位置的浏览器可通过 `T3E_CHROME` 指定；`T3E_ELECTRON` 可指定与基线配套的 T3 Code 可执行文件。
+
+测试切换五款内置主题、默认外观和 ChatGPT App，核对实际生效的主题 ID 与明暗模式。在单栏测量图标和侧栏按钮，在分栏测量活动标签和启动台卡片。随后点击互换、最大化、收起和还原控件，并在 720 px 窄窗复查标题栏。Chrome 中模拟了 Electron 的 `wco`、标题栏拖动区域及 144 px 原生按钮占位。真实窗口的按钮、系统托盘和模型请求需要单独验证。
+
+若需保留 PNG，在运行前设置 PowerShell 环境变量 `$env:T3E_SCREENSHOTS = Join-Path $env:TEMP 't3e-cross-theme-review'`。测试会更新该目录中对应场景的截图。正常结束和断言失败均会清理临时服务、浏览器及其工作目录。
 
 ---
 

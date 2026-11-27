@@ -14,6 +14,7 @@
     "repair": "node cli.cjs repair",
     "uninstall-enhancer": "node cli.cjs uninstall",
     "test": "node tests/verify.cjs",
+    "test:e2e": "node tests/e2e-real.cjs",
     "test:full": "node tests/verify.cjs --full",
     "test:unit": "node tests/verify.cjs --unit"
   },
