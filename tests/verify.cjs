@@ -627,7 +627,13 @@ function verifyCrossPlatformCliUnit() {
     assert(readmeText.includes("/releases/latest") && tutorialText.includes("/releases/latest"), "Stable release docs must link entry downloads to /releases/latest");
     assert(!/releases\/tag\/v\d+\.\d+\.\d+-(?:alpha|beta|preview|rc)\.\d+/.test(readmeText) && !/releases\/tag\/v\d+\.\d+\.\d+-(?:alpha|beta|preview|rc)\.\d+/.test(tutorialText), "Stable release entry docs must not link primary downloads to prerelease tags");
   }
-  assert.equal(JSON.parse(fs.readFileSync(SOURCE_THEME_PATH, "utf8")).version, 1, "Theme JSON schema version must remain upstream integer 1");
+  const themeObj = JSON.parse(fs.readFileSync(SOURCE_THEME_PATH, "utf8"));
+  assert.equal(themeObj.version, 1, "Theme JSON schema version must remain upstream integer 1");
+  const crumbsRule = themeObj.css.match(/\[data-file-breadcrumbs\]\s*\{[^}]*\}/)?.[0] || "";
+  assert(
+    crumbsRule.includes("margin-inline: 0 auto !important;"),
+    "File preview breadcrumb pill must stay left-aligned (margin-inline: 0 auto !important)"
+  );
 
   // 3.10) Maintainer preflight & zero-dependency release packaging scripts
   const preflight = require("../scripts/preflight.cjs");
@@ -2184,6 +2190,22 @@ function verifyUsageRingsUX(asar) {
   assert(i18nDecl.includes("$_source"), "useI18n must resolve to the M(...) message decoder containing $_source");
   const fmtMsgDecl = resolveUtilsDecl(bridgeBindings.useFormatMessage, "useFormatMessage");
   assert(fmtMsgDecl.includes("ICU") && !fmtMsgDecl.includes("$_source"), "useFormatMessage must resolve to the plain ICU formatter");
+  // Regression #9: useStore must match the exact host hook reading canAttachEnvSelector (e.g. Effect-Atom useAtomValue),
+  // never Zustand's 2-argument useStore(storeApi, selector) which crashes with "e.getState is not a function" on '+' click.
+  const hostCanAttachCall = chat.match(
+    new RegExp(`([A-Za-z_$][\\w$]*)=${bridgeBindings.canAttachEnvSelector}\\([^)]*\\)[^;]{0,80};\\s*(?:let|const|var)\\s+[A-Za-z_$][\\w$]*=([A-Za-z_$][\\w$]*)\\(\\1\\)`)
+  );
+  assert(hostCanAttachCall, "Could not locate host canAttachEnvSelector reader hook in ThreadRouteView");
+  assert.equal(
+    bridgeBindings.useStore,
+    hostCanAttachCall[2],
+    `useStore (${bridgeBindings.useStore}) must match the host hook (${hostCanAttachCall[2]}) reading canAttachEnvSelector`
+  );
+  const useStoreDecl = resolveUtilsDecl(bridgeBindings.useStore, "useStore");
+  assert(
+    !useStoreDecl.includes("getInitialState") && !useStoreDecl.includes(".getState("),
+    `useStore must not bind to Zustand's 2-arg useStore(storeApi, selector): ${useStoreDecl}`
+  );
   // Verify threadAtoms resolves to the entities thread-atom registry (threadAtom + quietThreadAtom)
   // and atomRegistry resolves to the Effect-Atom Registry (.subscribe + Provider value)
   const resolveChunkExport = (localName, label) => {
@@ -4295,11 +4317,11 @@ function verifyFilesChangesExplorer(asar) {
   assert(
     themeJson.css.includes('[data-file-breadcrumbs] [data-slot="scroll-area-viewport"]') &&
       themeJson.css.includes("direction: rtl !important;") &&
-      themeJson.css.includes("margin-inline: auto !important;") &&
+      themeJson.css.includes("margin-inline: 0 auto !important;") &&
       themeJson.css.includes('[data-current-file-crumb="true"] span') &&
       themeJson.css.includes("max-width: none !important;") &&
       themeJson.css.includes("min-width: max-content !important;"),
-    "themes/chatgpt-app.json must center bounded file breadcrumbs, keep full current filename, and never clip the editor split button"
+    "themes/chatgpt-app.json must left-align bounded file breadcrumbs, keep full current filename, and never clip the editor split button"
   );
   assert(
     themeJson.css.includes('[data-slot="sidebar-rail"]') &&

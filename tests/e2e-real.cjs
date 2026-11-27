@@ -81,6 +81,7 @@ async function run() {
     const project = path.join(root, "project");
     fs.mkdirSync(themes, { recursive: true });
     fs.mkdirSync(project);
+    fs.writeFileSync(path.join(project, "sample-e2e.txt"), "hello t3code-enhancer\n");
     fs.copyFileSync(path.join(repo, "themes", "chatgpt-app.json"), path.join(themes, "chatgpt-app.json"));
     fs.writeFileSync(path.join(themes, "..", "environment-id"), randomUUID() + "\n");
     const port = await availablePort();
@@ -178,10 +179,13 @@ async function checkWorkspace(evaluate, page) {
   })()`);
   const chat = "[data-chat-header] .t3e-chat-toolbar";
   const panel = "[data-right-panel-tabbar] .t3e-chat-toolbar";
-  async function capture(name) {
-    if (!process.env.T3E_SCREENSHOTS) return;
+  async function dismissProviderWarning() {
     const dismiss = '[aria-label="Dismiss Codex provider warning"]';
     if ((await rect(dismiss))?.width) await click(dismiss);
+  }
+  async function capture(name, { dismissBanner = true } = {}) {
+    if (!process.env.T3E_SCREENSHOTS) return;
+    if (dismissBanner) await dismissProviderWarning();
     await page("Input.dispatchMouseEvent", { type: "mouseMoved", x: 10, y: 300 });
     fs.mkdirSync(process.env.T3E_SCREENSHOTS, { recursive: true });
     const { data } = await page("Page.captureScreenshot", { format: "png" });
@@ -199,6 +203,12 @@ async function checkWorkspace(evaluate, page) {
         assert(search?.width && actions?.width && search.right <= actions.left + 1 && actions.top < search.bottom && search.top < actions.bottom, label + " sidebar row");
         const button = await rect(".t3e-new-chat-btn");
         assert(button?.height >= 20 && button.height <= 48, label + " sidebar button");
+        const tray = await rect(".t3e-nc-tray");
+        const host = await rect('[data-slot="composer-host"]');
+        assert(
+          tray && host && Math.abs(tray.bottom - host.top) <= 1.5,
+          label + " new-chat tray must sit flush on composer top without bleeding behind glass: " + JSON.stringify({ trayBottom: tray?.bottom, hostTop: host?.top })
+        );
       } else {
         const pill = await rect('.t3e-new-tab-pill[data-active-tab="true"]');
         const cards = await evaluate("Array.from(document.querySelectorAll('.t3e-launcher-card')).slice(0,2).map(b=>b.getBoundingClientRect().toJSON())");
@@ -214,12 +224,94 @@ async function checkWorkspace(evaluate, page) {
     console.log(layout + ": 14 theme/appearance combinations passed");
   }
   await matrix("single");
+  // Regression #9: clicking '+' attachment menu and permissions button on /draft must open cleanly with zero runtime errors
+  await dismissProviderWarning();
+  await theme("chatgpt-app", "light");
+  await click(".t3e-plus-btn");
+  await until("plus menu panel", () => evaluate("!!document.querySelector('.t3e-plus-panel')"));
+  await until("plus menu settled", () => evaluate(`(() => {
+    const p = document.querySelector('[data-slot="popover-popup"]:has(.t3e-plus-panel)');
+    return !!p && parseFloat(getComputedStyle(p).opacity) >= 0.99;
+  })()`));
+  await capture("composer-plus-menu-chatgpt-app-light", { dismissBanner: false });
+  await page("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await page("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await until("plus menu closed", () => evaluate("!document.querySelector('.t3e-plus-panel')"));
+  await click(".t3e-perm-btn");
+  await until("permissions popover", () => evaluate("!!document.querySelector('.t3e-perm-card')"));
+  await page("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await page("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await until("permissions popover closed", () => evaluate("!document.querySelector('.t3e-perm-card')"));
+  // Also verify '+' menu in Ocean dark translucent theme (no glass bleed / contrast issues)
+  await dismissProviderWarning();
+  await theme("ocean", "dark");
+  await click(".t3e-plus-btn");
+  await until("ocean dark plus menu panel", () => evaluate("!!document.querySelector('.t3e-plus-panel')"));
+  await until("ocean dark plus menu settled", () => evaluate(`(() => {
+    const p = document.querySelector('[data-slot="popover-popup"]:has(.t3e-plus-panel)');
+    return !!p && parseFloat(getComputedStyle(p).opacity) >= 0.99;
+  })()`));
+  await capture("composer-plus-menu-ocean-dark", { dismissBanner: false });
+  await page("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await page("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await until("ocean dark plus menu closed", () => evaluate("!document.querySelector('.t3e-plus-panel')"));
+  console.log("Composer '+' menu and permissions popover passed");
   await theme("ocean", "dark");
   await click('[aria-label="Toggle right panel"]');
   await until("right panel", () => evaluate("!!document.querySelector('[data-right-panel-tabbar]')"));
   if (!await rect(".t3e-launcher-grid")) await click(".t3e-new-tab-add");
   await until("launcher", () => evaluate("!!document.querySelector('.t3e-launcher-card')"));
   await matrix("split");
+  // Regression: FilePreviewPanel breadcrumb pill must be left-aligned (not centered with empty left gap)
+  await theme("chatgpt-app", "light");
+  const filesCardInfo = await evaluate(`(() => {
+    const cards = Array.from(document.querySelectorAll(".t3e-launcher-card")).map((el) => ({
+      kbd: el.querySelector(".t3e-launcher-card-kbd")?.textContent?.trim() || "",
+      label: el.querySelector(".t3e-launcher-card-label")?.textContent?.trim() || "",
+      disabled: !!el.disabled,
+    }));
+    const card = Array.from(document.querySelectorAll(".t3e-launcher-card"))
+      .find((el) => el.querySelector(".t3e-launcher-card-kbd")?.textContent?.trim() === "F");
+    if (card && !card.disabled) card.click();
+    return { found: !!card, disabled: !!card?.disabled, cards };
+  })()`);
+  assert(filesCardInfo.found && !filesCardInfo.disabled, "Missing/disabled Files launcher card: " + JSON.stringify(filesCardInfo));
+  await until("file browser panel", () => evaluate("!!document.querySelector('[data-file-browser-panel]') || !!document.querySelector('[data-file-breadcrumbs]')"));
+  const findSampleBox = () => evaluate(`(() => {
+    const walk = (root) => {
+      const hit = root.querySelector('[role="treeitem"][data-item-path*="sample-e2e.txt"]');
+      if (hit) return hit;
+      for (const el of root.querySelectorAll("*")) {
+        if (el.shadowRoot) {
+          const inner = walk(el.shadowRoot);
+          if (inner) return inner;
+        }
+      }
+      return null;
+    };
+    const host = document.querySelector("[data-file-browser-panel]") || document;
+    const item = walk(host);
+    if (!item) return null;
+    const r = item.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null;
+  })()`);
+  if (!await evaluate("!!document.querySelector('[data-file-breadcrumbs]')")) {
+    let pt = null;
+    await until("file tree item", async () => { pt = await findSampleBox(); return !!pt; });
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await page("Input.dispatchMouseEvent", { type, ...pt, button: "left", clickCount: 1 });
+    }
+  }
+  await until("file preview breadcrumbs", () => evaluate("!!document.querySelector('[data-file-breadcrumbs]')"));
+  const crumbAlign = await evaluate(`(() => {
+    const sub = document.querySelector("[data-surface-subheader]:has([data-file-breadcrumbs])")?.getBoundingClientRect();
+    const crumb = document.querySelector("[data-file-breadcrumbs]")?.getBoundingClientRect();
+    if (!sub || !crumb) return null;
+    return { subLeft: sub.left, crumbLeft: crumb.left, gapLeft: crumb.left - sub.left, crumbRight: crumb.right, subRight: sub.right };
+  })()`);
+  assert(crumbAlign && crumbAlign.gapLeft >= 0 && crumbAlign.gapLeft <= 24, "File breadcrumbs must stay left-aligned: " + JSON.stringify(crumbAlign));
+  await capture("file-breadcrumbs-chatgpt-app-light");
+  console.log("File preview breadcrumb left-alignment passed (left gap: " + Math.round(crumbAlign.gapLeft) + "px)");
   await theme("ocean", "dark");
   await click("[data-t3e-panel-actions] [data-t3e-swap-btn]");
   await until("swapped", () => evaluate("!!document.querySelector('[data-t3e-workspace][data-t3e-swap=true]')"));
