@@ -181,7 +181,6 @@ function validateReleaseReadiness(repoRoot = DEFAULT_REPO_ROOT, options = {}) {
     tag,
     "--notes-file",
     notesPath,
-    notesSha256,
   ];
   if (ENHANCER_VERSION_INFO.isPrerelease) ghReleaseArgs.push("--prerelease");
   if (!options.publish) ghReleaseArgs.push("--draft");
@@ -198,6 +197,7 @@ function validateReleaseReadiness(repoRoot = DEFAULT_REPO_ROOT, options = {}) {
     commit,
     zipPath,
     notesPath,
+    notesSha256,
     zipInfo,
     plannedCommands: [
       `git push origin ${commit}:refs/heads/${branch || "main"}`,

@@ -13,7 +13,7 @@ const { ALL_PATCHES, selectPatches, applicablePatchesForArchive, inspectArchive,
 const { PACKS, PRESETS, resolveInstallPlan, parsePlatformArgs } = require("../lib/packs.cjs");
 const { withInstallDirectoryLock } = require("../lib/install-state.cjs");
 const { inspectCompatibleSource, inferRepairPlanOptions, getSavedPlanPath, readSavedInstallPlan } = require("../lib/engine.cjs");
-const { packRelease } = require("../scripts/pack-release.cjs");
+const { packRelease, readZipEntries } = require("../scripts/pack-release.cjs");
 const { validateReleaseReadiness } = require("../scripts/publish-release.cjs");
 const noTelemetry = require("../lib/patches/no-telemetry.cjs");
 const desktopTray = require("../lib/patches/desktop-tray.cjs");
@@ -5099,17 +5099,25 @@ function verifyReleaseZipCommit() {
     for (const file of [".gitattributes", "install.sh", "install.cmd", "repair.cmd", "status.cmd", "uninstall.cmd", "使用教程.md"]) {
       fs.copyFileSync(path.join(__dirname, "..", file), path.join(tempRepo, file));
     }
+    edit("LICENSE", "License text\n");
     edit("cli.cjs", 'console.log("old");\n');
     git("add", "--all");
     git("update-index", "--chmod=+x", "install.sh");
     git("commit", "-qm", "Original package");
+    // Simulate checkout bytes that differ while Git reports a clean tree.
+    edit("LICENSE", "License text\r\n");
+    git("update-index", "--assume-unchanged", "LICENSE");
 
     const packaged = packRelease(tempRepo, { skipVerify: true });
+    const license = readZipEntries(fs.readFileSync(packaged.zipPath)).find((entry) => entry.name.endsWith("/LICENSE"));
+    assert.equal(license.data.toString("utf8"), "License text\n", "ZIP must use committed LICENSE bytes");
     const notes = path.join("dist", `release-${packaged.tag}.md`);
     edit(notes, `Release SHA-256: ${packaged.sha256}\n`);
     const initial = validateReleaseReadiness(tempRepo, options);
     assert(initial.ok, initial.errors.join("\n"));
     assert.equal(initial.commit, git("rev-parse", "HEAD"));
+    assert.equal(initial.notesSha256, digest(fs.readFileSync(initial.notesPath)));
+    assert(!initial.ghReleaseArgs.includes(initial.notesSha256), "The notes checksum must not be passed to gh release create");
     assert(initial.plannedCommands.some((command) => command.startsWith(`git tag -a ${packaged.tag} ${initial.commit} `)));
 
     edit("cli.cjs", 'console.log("new");\n');

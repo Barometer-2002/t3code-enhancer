@@ -299,18 +299,22 @@ function collectReleaseFiles(repoRoot, { includeUntracked = false } = {}) {
   }));
 }
 
-function getDeterministicTimestamp(repoRoot) {
-  const res = runGit(repoRoot, ["log", "-1", "--format=%ct"]);
+function getDeterministicTimestamp(repoRoot, commit) {
+  const res = runGit(repoRoot, ["log", "-1", "--format=%ct", commit ?? "HEAD"]);
   if (res.status === 0 && /^\d+$/.test(res.stdout.trim())) {
     return new Date(Number(res.stdout.trim()) * 1000);
   }
   return new Date(Date.UTC(2026, 0, 1, 0, 0, 0));
 }
 
-function buildZipEntries(repoRoot, versionTag, { includeUntracked = false } = {}) {
+function buildZipEntries(repoRoot, versionTag, { includeUntracked = false, commit = null } = {}) {
   const rootPrefix = `t3code-enhancer-${versionTag}`;
-  const files = collectReleaseFiles(repoRoot, { includeUntracked });
-  const mtime = getDeterministicTimestamp(repoRoot);
+  const files = commit
+    ? [...readReleaseCommitFiles(repoRoot, commit, rootPrefix).values()]
+    : collectReleaseFiles(repoRoot, { includeUntracked }).map(({ rel, mode }) => ({
+        rel, mode, data: fs.readFileSync(path.join(repoRoot, rel)),
+      }));
+  const mtime = getDeterministicTimestamp(repoRoot, commit);
   const dirSet = new Set([`${rootPrefix}/`]);
 
   for (const { rel } of files) {
@@ -326,10 +330,10 @@ function buildZipEntries(repoRoot, versionTag, { includeUntracked = false } = {}
   for (const dirName of dirSet) {
     allItems.push({ name: dirName, data: null, mode: 0o040755, mtime });
   }
-  for (const { rel, mode } of files) {
+  for (const { rel, mode, data } of files) {
     allItems.push({
       name: `${rootPrefix}/${rel}`,
-      data: fs.readFileSync(path.join(repoRoot, rel)),
+      data,
       mode,
       mtime,
     });
@@ -338,8 +342,11 @@ function buildZipEntries(repoRoot, versionTag, { includeUntracked = false } = {}
   return { rootPrefix, fileCount: files.length, entries: allItems };
 }
 
-function verifyReleaseFiles(entries, rootPrefix, { repoRoot, commit }) {
-  const archive = spawnSync("git", ["archive", "--format=zip", `--prefix=${rootPrefix}/`, commit], {
+function readReleaseCommitFiles(repoRoot, commit, rootPrefix) {
+  const archive = spawnSync("git", [
+    "-c", "core.autocrlf=false", "-c", "core.eol=lf",
+    "archive", "--format=zip", `--prefix=${rootPrefix}/`, commit,
+  ], {
     cwd: repoRoot,
     windowsHide: true,
     maxBuffer: 64 * 1024 * 1024,
@@ -347,19 +354,28 @@ function verifyReleaseFiles(entries, rootPrefix, { repoRoot, commit }) {
   if (archive.error) throw archive.error;
   assert.equal(archive.status, 0, `无法读取提交 ${commit} 的文件：${archive.stderr.toString().trim()}`);
 
-  const expected = new Map();
+  const files = new Map();
   for (const entry of readZipEntries(archive.stdout)) {
     const rel = entry.name.slice(rootPrefix.length + 1);
     if (entry.isDir || isExcludedPath(rel)) continue;
     const data = CMD_FILES.has(rel)
       ? Buffer.from(entry.data.toString("utf8").replace(/\r?\n/g, "\r\n"))
       : entry.data;
-    expected.set(entry.name, data);
+    const executable = rel === "install.sh" || (entry.unixMode & 0o111);
+    files.set(entry.name, { rel, data, mode: executable ? 0o100755 : 0o100644 });
   }
+  return files;
+}
+
+function verifyReleaseFiles(entries, rootPrefix, { repoRoot, commit }) {
+  const expected = readReleaseCommitFiles(repoRoot, commit, rootPrefix);
   for (const entry of entries) {
     if (entry.isDir) continue;
-    const data = expected.get(entry.name);
-    assert(data?.equals(entry.data), `ZIP 内的 ${entry.name} 与提交 ${commit} 不一致，请重新打包。`);
+    const file = expected.get(entry.name);
+    assert(
+      file?.data.equals(entry.data) && entry.unixMode === (file.mode & 0o7777),
+      `ZIP 内的 ${entry.name} 与提交 ${commit} 不一致，请重新打包。`
+    );
     expected.delete(entry.name);
   }
   assert(expected.size === 0, `ZIP 缺少提交 ${commit} 的文件：${[...expected.keys()].join("、")}`);
@@ -517,6 +533,7 @@ function packRelease(repoRoot = DEFAULT_REPO_ROOT, options = {}) {
     }
   }
 
+  let commit = null;
   if (!options.skipCleanCheck) {
     const st = runGit(repoRoot, ["status", "--porcelain"]);
     if (st.status === 0 && st.stdout.trim()) {
@@ -524,10 +541,16 @@ function packRelease(repoRoot = DEFAULT_REPO_ROOT, options = {}) {
         `工作区存在未提交改动，拒绝生成正式发行包（试打包请传 --skip-clean-check）：\n${st.stdout.trim()}`
       );
     }
+    if (st.status === 0) {
+      const head = runGit(repoRoot, ["rev-parse", "--verify", "HEAD^{commit}"]);
+      assert.equal(head.status, 0, `无法读取打包提交：${head.stderr.trim()}`);
+      commit = head.stdout.trim();
+    }
   }
 
   const { rootPrefix, fileCount, entries } = buildZipEntries(repoRoot, versionTag, {
     includeUntracked: Boolean(options.skipCleanCheck),
+    commit,
   });
   const zipBuf = createZipBuffer(entries);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
