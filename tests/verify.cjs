@@ -272,6 +272,43 @@ assert(
   usageRings.t3EstimateOutputTokens("a你🙂b") > usageRings.t3EstimateOutputTokens("a你🙂"),
   "Output token estimate must remain monotonic as streamed text grows"
 );
+assert.equal(usageRings.t3ClassifySpeedTier({ id: "default", label: "Standard" }), "standard");
+assert.equal(usageRings.t3ClassifySpeedTier({ id: "fast", label: "Fast" }), "fast");
+assert.equal(usageRings.t3ClassifySpeedTier({ id: "priority", label: "Priority" }), "fast");
+assert.equal(usageRings.t3ClassifySpeedTier({ id: "ultrafast", label: "Ultrafast" }), "ultrafast");
+assert.equal(usageRings.t3ClassifySpeedTier({ id: "ultra-fast", label: "Ultra Fast" }), "ultrafast");
+assert.equal(usageRings.t3ClassifySpeedTier({ id: "custom", label: "极速" }), "ultrafast");
+assert.equal(usageRings.t3ClassifySpeedTier({ id: "custom", label: "快速" }), "fast");
+assert.deepEqual(
+  usageRings.t3ResolveSpeedOptions({
+    speedSelect: { id: "serviceTier", type: "select" },
+    fastToggle: null,
+    curSpeedVal: "ultrafast",
+    choices: [
+      { id: "default", label: "Standard", isDefault: true },
+      { id: "fast", label: "Fast" },
+      { id: "ultrafast", label: "Ultrafast", description: "Even faster, more expensive" },
+    ],
+  }).map((o) => ({ id: o.id, tier: o.tier, isSelected: o.isSelected })),
+  [
+    { id: "default", tier: "standard", isSelected: false },
+    { id: "fast", tier: "fast", isSelected: false },
+    { id: "ultrafast", tier: "ultrafast", isSelected: true },
+  ]
+);
+assert.deepEqual(
+  usageRings.t3ResolveSpeedOptions({
+    speedSelect: null,
+    fastToggle: { id: "fastMode", type: "boolean", currentValue: true },
+    curSpeedVal: "",
+    choices: [],
+    isZh: false,
+  }).map((o) => ({ id: o.id, label: o.label, tier: o.tier, isSelected: o.isSelected })),
+  [
+    { id: "standard", label: "Standard", tier: "standard", isSelected: false },
+    { id: "fast", label: "Fast", tier: "fast", isSelected: true },
+  ]
+);
 console.log("   OK");
 
 console.log("3.5. Unit testing inline-file-diff unified diff parser...");
@@ -3493,6 +3530,158 @@ function verifyUsageRingsUX(asar) {
   assert.equal(disabledReset.props["aria-disabled"], "true", "Prompt-injected-only effort must keep reset button disabled");
   disabledReset.props.onClick();
   assert.deepEqual(activeDriver.dispatches, [], "Prompt-injected-only effort must not dispatch index 0");
+
+  // 5) Codex 3-tier speed distinction (Standard / Fast / Ultrafast) vs 2-tier (Standard / Fast) vs disabled
+  delete sandbox.document.documentElement;
+  const speedBtnOf = (node) => findNodes(node, (n) => n.type === "button" && n.props && n.props["data-speed-tier"] && String(n.props.className || "").includes("t3e-icon-btn"))[0];
+  const speedRadiosOf = (node) => findNodes(node, (n) => n.type === "button" && n.props && n.props.role === "radio");
+  const inlineBoltOf = (node) => findNodes(node, (n) => n.props && String(n.props.className || "").includes("t3e-fast-inline"))[0] ?? null;
+  const triggerBtnOf = (node) => findNodes(node, (n) => n.type === "PopoverTrigger")[0]?.props?.render;
+  const renderIconEl = (el) => (el && typeof el.type === "function" ? el.type(el.props) : el);
+  const boltPathsOf = (node) => findNodes(renderIconEl(node), (n) => n.type === "path");
+
+  activeDriver = createStatefulTraitsDriver({
+    provider: "codex",
+    optionDescriptors: [
+      {
+        id: "reasoningEffort",
+        type: "select",
+        role: "reasoning",
+        options: [
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium", isDefault: true },
+          { id: "high", label: "High" },
+          { id: "xhigh", label: "Extra High" },
+        ],
+      },
+      {
+        id: "serviceTier",
+        label: "Service Tier",
+        type: "select",
+        options: [
+          { id: "default", label: "Standard", isDefault: true },
+          { id: "fast", label: "Fast" },
+          { id: "ultrafast", label: "Ultrafast", description: "Even faster, more expensive" },
+        ],
+      },
+    ],
+    initialOptions: [{ id: "reasoningEffort", value: "xhigh" }, { id: "serviceTier", value: "default" }],
+  });
+  renderFn = activeDriver.resetRender("gpt-6.2-sol", "codex");
+
+  // 5a) Standard state: outline single bolt, no inline pill bolt, 3 explicit radio options with Standard checked
+  let speedTree = renderFn();
+  let speedBtn = speedBtnOf(speedTree);
+  assert.equal(speedBtn.props["data-active"], "false");
+  assert.equal(speedBtn.props["data-speed-tier"], "standard");
+  assert.match(String(speedBtn.props["aria-label"] || ""), /Standard/);
+  let boltSvg = renderIconEl(speedBtn.props.children);
+  assert.equal(boltPathsOf(boltSvg).length, 1);
+  assert.equal(boltSvg.props.fill, "none");
+  assert.equal(inlineBoltOf(speedTree), null, "Standard tier must not display inline fast bolt on composer trigger");
+  let radios = speedRadiosOf(speedTree);
+  assert.deepEqual(radios.map((r) => [r.props["data-speed-tier"], r.props["aria-checked"]]), [
+    ["standard", true],
+    ["fast", false],
+    ["ultrafast", false],
+  ]);
+
+  // 5b) Click 1 -> Fast: active blue single bolt (1 path, filled), inline pill shows Fast single bolt, radio Fast checked
+  speedBtn.props.onClick();
+  speedTree = renderFn();
+  speedBtn = speedBtnOf(speedTree);
+  assert.equal(speedBtn.props["data-active"], "true");
+  assert.equal(speedBtn.props["data-speed-tier"], "fast");
+  assert.match(String(speedBtn.props["aria-label"] || ""), /Speed: Fast/);
+  boltSvg = renderIconEl(speedBtn.props.children);
+  assert.equal(boltPathsOf(boltSvg).length, 1);
+  assert.equal(boltSvg.props.fill, "currentColor");
+  const fastInline = inlineBoltOf(speedTree);
+  assert(fastInline, "Fast tier must show inline bolt on composer trigger");
+  assert.equal(fastInline.props["data-speed-tier"], "fast");
+  assert.equal(boltPathsOf(fastInline.props.children).length, 1);
+  assert.match(String(triggerBtnOf(speedTree).props["aria-label"] || ""), /Fast/);
+  radios = speedRadiosOf(speedTree);
+  assert.deepEqual(radios.map((r) => [r.props["data-speed-tier"], r.props["aria-checked"]]), [
+    ["standard", false],
+    ["fast", true],
+    ["ultrafast", false],
+  ]);
+
+  // 5c) Click 2 -> Ultrafast: distinct purple double bolt (2 paths) + explicit Ultrafast tooltip & radio & inline double bolt
+  speedBtn.props.onClick();
+  speedTree = renderFn();
+  speedBtn = speedBtnOf(speedTree);
+  assert.equal(speedBtn.props["data-active"], "true");
+  assert.equal(speedBtn.props["data-speed-tier"], "ultrafast");
+  assert.match(String(speedBtn.props["aria-label"] || ""), /Speed: Ultrafast/);
+  boltSvg = renderIconEl(speedBtn.props.children);
+  assert.equal(boltPathsOf(boltSvg).length, 2, "Ultrafast icon must render distinct double lightning bolt");
+  assert.equal(boltSvg.props["data-bolt-tier"], "ultrafast");
+  const ultraInline = inlineBoltOf(speedTree);
+  assert(ultraInline, "Ultrafast tier must show inline bolt on composer trigger");
+  assert.equal(ultraInline.props["data-speed-tier"], "ultrafast");
+  assert.equal(boltPathsOf(ultraInline.props.children).length, 2, "Composer trigger must distinguish Ultrafast with double bolt");
+  assert.match(String(triggerBtnOf(speedTree).props["aria-label"] || ""), /Ultrafast/);
+  radios = speedRadiosOf(speedTree);
+  assert.deepEqual(radios.map((r) => [r.props["data-speed-tier"], r.props["aria-checked"]]), [
+    ["standard", false],
+    ["fast", false],
+    ["ultrafast", true],
+  ]);
+
+  // 5d) Click 3 -> cycles back to Standard; clicking radio option selects Ultrafast directly; Reset restores Standard
+  speedBtn.props.onClick();
+  speedTree = renderFn();
+  assert.equal(speedBtnOf(speedTree).props["data-speed-tier"], "standard");
+  speedRadiosOf(speedTree)[2].props.onClick();
+  speedTree = renderFn();
+  assert.equal(speedBtnOf(speedTree).props["data-speed-tier"], "ultrafast");
+  clickResetBtn(speedTree);
+  speedTree = renderFn();
+  speedTree = renderFn();
+  assert.equal(activeDriver.getOptions().find((o) => o.id === "reasoningEffort")?.value, "medium");
+  assert.equal(activeDriver.getOptions().find((o) => o.id === "serviceTier")?.value, "default");
+
+  // 5e) Models with only Standard / Fast (both select and boolean fastMode) must expose ONLY those 2 options
+  activeDriver = createStatefulTraitsDriver({
+    provider: "codex",
+    optionDescriptors: [
+      { id: "reasoningEffort", type: "select", role: "reasoning", options: [{ id: "medium", label: "Medium", isDefault: true }] },
+      { id: "serviceTier", label: "Service Tier", type: "select", options: [{ id: "default", label: "Standard", isDefault: true }, { id: "fast", label: "Fast" }] },
+    ],
+    initialOptions: [{ id: "reasoningEffort", value: "medium" }, { id: "serviceTier", value: "default" }],
+  });
+  renderFn = activeDriver.resetRender("gpt-6-two-tier", "codex");
+  speedTree = renderFn();
+  assert.deepEqual(speedRadiosOf(speedTree).map((r) => r.props["data-speed-tier"]), ["standard", "fast"]);
+
+  activeDriver = createStatefulTraitsDriver({
+    provider: "claudeAgent",
+    optionDescriptors: [
+      { id: "effort", type: "select", role: "reasoning", options: [{ id: "high", label: "High", isDefault: true }] },
+      { id: "fastMode", label: "Fast Mode", type: "boolean", currentValue: false },
+    ],
+    initialOptions: [{ id: "effort", value: "high" }, { id: "fastMode", value: false }],
+  });
+  renderFn = activeDriver.resetRender("claude-opus-4-6", "claude-1");
+  speedTree = renderFn();
+  assert.deepEqual(speedRadiosOf(speedTree).map((r) => r.props["data-speed-tier"]), ["standard", "fast"]);
+  speedRadiosOf(speedTree)[1].props.onClick();
+  speedTree = renderFn();
+  assert.equal(speedBtnOf(speedTree).props["data-speed-tier"], "fast");
+  assert.equal(activeDriver.getOptions().find((o) => o.id === "fastMode")?.value, true);
+
+  // 5f) Model without speed options renders no speed radiogroup and disables top speed button
+  activeDriver = createStatefulTraitsDriver({
+    provider: "antigravity",
+    optionDescriptors: [{ id: "reasoningEffort", type: "select", role: "reasoning", options: [{ id: "high", label: "High", isDefault: true }] }],
+    initialOptions: [{ id: "reasoningEffort", value: "high" }],
+  });
+  renderFn = activeDriver.resetRender("gemini-4-hydrogen", "ag-1");
+  speedTree = renderFn();
+  assert.equal(speedRadiosOf(speedTree).length, 0);
+  assert.equal(speedBtnOf(speedTree).props["aria-disabled"], "true");
 }
 
 function verifyLinuxSupport(patchedAsarPath) {
