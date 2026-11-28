@@ -13,6 +13,8 @@ const { ALL_PATCHES, selectPatches, applicablePatchesForArchive, inspectArchive,
 const { PACKS, PRESETS, resolveInstallPlan, parsePlatformArgs } = require("../lib/packs.cjs");
 const { withInstallDirectoryLock } = require("../lib/install-state.cjs");
 const { inspectCompatibleSource, inferRepairPlanOptions, getSavedPlanPath, readSavedInstallPlan } = require("../lib/engine.cjs");
+const { packRelease } = require("../scripts/pack-release.cjs");
+const { validateReleaseReadiness } = require("../scripts/publish-release.cjs");
 const noTelemetry = require("../lib/patches/no-telemetry.cjs");
 const desktopTray = require("../lib/patches/desktop-tray.cjs");
 const newChatLayout = require("../lib/patches/new-chat-layout.cjs");
@@ -5070,6 +5072,7 @@ try {
       console.log("   OK");
       console.log("18. Cross-platform (Windows dual-ASAR CLI transaction + Linux/macOS combined single-ASAR builds)...");
       verifyCrossPlatformArchivesAndTransactions(slimServer, slimDesktop);
+      verifyReleaseZipCommit();
       console.log("   OK");
     } finally {
       fs.rmSync(slimDir, { recursive: true, force: true });
@@ -5080,6 +5083,50 @@ try {
 } finally {
   if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
   if (tmpDesktopOut && fs.existsSync(tmpDesktopOut)) fs.unlinkSync(tmpDesktopOut);
+}
+
+function verifyReleaseZipCommit() {
+  const tempRepo = fs.mkdtempSync(path.join(os.tmpdir(), "t3e-release-commit-"));
+  const git = (...args) => execFileSync("git", [
+    "-c", "user.name=Release Test", "-c", "user.email=release-test@example.invalid",
+    "-c", "core.autocrlf=false", ...args,
+  ], { cwd: tempRepo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const edit = (file, content) => fs.writeFileSync(path.join(tempRepo, file), content);
+  const options = { skipPreflight: true, skipRemoteCheck: true };
+  try {
+    git("init", "-q", "-b", "main");
+    edit(".gitignore", "dist/\n");
+    for (const file of [".gitattributes", "install.sh", "install.cmd", "repair.cmd", "status.cmd", "uninstall.cmd", "使用教程.md"]) {
+      fs.copyFileSync(path.join(__dirname, "..", file), path.join(tempRepo, file));
+    }
+    edit("cli.cjs", 'console.log("old");\n');
+    git("add", "--all");
+    git("update-index", "--chmod=+x", "install.sh");
+    git("commit", "-qm", "Original package");
+
+    const packaged = packRelease(tempRepo, { skipVerify: true });
+    const notes = path.join("dist", `release-${packaged.tag}.md`);
+    edit(notes, `Release SHA-256: ${packaged.sha256}\n`);
+    const initial = validateReleaseReadiness(tempRepo, options);
+    assert(initial.ok, initial.errors.join("\n"));
+    assert.equal(initial.commit, git("rev-parse", "HEAD"));
+    assert(initial.plannedCommands.some((command) => command.startsWith(`git tag -a ${packaged.tag} ${initial.commit} `)));
+
+    edit("cli.cjs", 'console.log("new");\n');
+    git("add", "cli.cjs");
+    git("commit", "-qm", "Change CLI before release");
+    const stale = validateReleaseReadiness(tempRepo, options);
+    assert.equal(stale.ok, false, "A stale ZIP with matching release notes must be rejected");
+    assert(stale.errors.some((error) => /cli\.cjs.*不一致/.test(error)), stale.errors.join("\n"));
+
+    const rebuilt = packRelease(tempRepo, { skipVerify: true });
+    edit(notes, `Release SHA-256: ${rebuilt.sha256}\n`);
+    const rebuiltPlan = validateReleaseReadiness(tempRepo, options);
+    assert(rebuiltPlan.ok, rebuiltPlan.errors.join("\n"));
+    assert.equal(rebuiltPlan.commit, git("rev-parse", "HEAD"));
+  } finally {
+    fs.rmSync(tempRepo, { recursive: true, force: true });
+  }
 }
 
 function verifyCrossPlatformArchivesAndTransactions(serverBaseline, desktopBaseline) {
@@ -5178,13 +5225,19 @@ function verifyCrossPlatformArchivesAndTransactions(serverBaseline, desktopBasel
     console.log = () => {};
     try {
       linuxCli.install(null, { packs: ["workspace"], flags: new Set(["--no-desktop-tray"]) }, shrinkLinuxPaths);
+      linuxCli.repair(null, { flags: new Set(["--patch-only"]) }, shrinkLinuxPaths);
+      assert.deepEqual(readSavedInstallPlan(shrinkLinuxPaths.profileDirectory).packIds, ["workspace"]);
+      fs.truncateSync(shrinkAppAsar, 12);
       linuxCli.repair(null, {}, shrinkLinuxPaths);
     } finally {
       console.log = linuxOrigLog2;
     }
     const linuxAfterRepair = linuxCli.inspectInstall(shrinkLinuxPaths);
-    assert.equal(linuxAfterRepair.modules.find((m) => m.id === "desktop-tray").installed, false, "Linux bare repair must preserve --no-desktop-tray");
-    assert.equal(linuxAfterRepair.modules.find((m) => m.id === "new-chat-layout").installed, true);
+    assert.deepEqual(
+      linuxAfterRepair.modules.filter((m) => m.installed).map((m) => m.id),
+      shrinkWork.filter((p) => p.id !== "desktop-tray").map((p) => p.id),
+      "Linux repair must preserve the selected pack and exclusions when app.asar is unreadable"
+    );
     const linuxPreFailSha = digest(fs.readFileSync(shrinkAppAsar));
     const linuxBadXdg = path.join(tmpRoot, "shrink-xdg-bad");
     const linuxBadPaths = linuxCli.getLinuxPaths({ XDG_DATA_HOME: linuxBadXdg }, tmpRoot);
@@ -5257,6 +5310,22 @@ function verifyCrossPlatformArchivesAndTransactions(serverBaseline, desktopBasel
         // simulate corrupt app.asar + stale .tmp file -> repair recovers cleanly from backup while preserving clean preset
         const staleTmp = winApp + ".00000000-0000-0000-0000-000000000000.tmp";
         fs.writeFileSync(staleTmp, "stale");
+        const serverBackup = winServer + ".before-t3code-enhancer";
+        const staleServerBackup = path.join(tmpRoot, "wrong-version-server.asar");
+        const baselineManifest = serverBaseline.asar.byKey.get("package.json");
+        const wrongVersion = { ...JSON.parse(readEntryBuffer(serverBaseline.asar, baselineManifest)), version: "0.0.0" };
+        writePatchedAsar(serverBaseline.asar, [{ key: "package.json", replacement: Buffer.from(JSON.stringify(wrongVersion)) }], staleServerBackup);
+        const healthyServer = fs.readFileSync(winServer);
+        const healthyApp = fs.readFileSync(winApp);
+        fs.truncateSync(winServer, 12);
+        const truncatedServer = fs.readFileSync(winServer);
+        fs.copyFileSync(staleServerBackup, serverBackup);
+        assert.throws(() => cmdRepair(new Set(), null, { assertClosed: () => {} }), /找不到未修改的原版/);
+        assert.throws(() => cmdUninstall(new Set(), null, { assertClosed: () => {} }), /找不到未修改的原版/);
+        assert(fs.readFileSync(winServer).equals(truncatedServer), "Rejected old backups must leave the failed archive untouched");
+        assert(fs.readFileSync(winApp).equals(healthyApp), "Rejected old backups must leave the healthy sibling untouched");
+        fs.copyFileSync(serverBaseline.path, serverBackup);
+        fs.writeFileSync(winServer, healthyServer);
         fs.truncateSync(winApp, 12);
         cmdRepair(new Set(), null, { assertClosed: () => {} });
         assert(!fs.existsSync(staleTmp), "repair must clean up stale UUID .tmp staging files");
@@ -5314,6 +5383,10 @@ function verifyCrossPlatformArchivesAndTransactions(serverBaseline, desktopBasel
         assert(savedPlan && Array.isArray(savedPlan.packIds), "install must persist .t3code-enhancer-plan.json");
         assert.deepEqual([...savedPlan.packIds].sort(), ["composer", "privacy", "theme"]);
         assert(fs.existsSync(getSavedPlanPath(userdataPath)));
+        const savedPlanBytes = fs.readFileSync(getSavedPlanPath(userdataPath));
+        cmdInstall(new Set(["--theme-only"]), null);
+        cmdRepair(new Set(["--theme-only", "--official"]), null);
+        assert(fs.readFileSync(getSavedPlanPath(userdataPath)).equals(savedPlanBytes), "Theme-only commands must preserve the module recovery plan");
 
         // Simulate official overwrite-upgrade: both ASARs revert to pristine upstream binaries
         fs.copyFileSync(serverBaseline.path, winServer);
@@ -5326,6 +5399,14 @@ function verifyCrossPlatformArchivesAndTransactions(serverBaseline, desktopBasel
         assert.equal(afterOverwriteServer.find((m) => m.id === "new-chat-layout").installed, false, "Bare repair must NOT add unselected workspace pack");
         assert.equal(afterOverwriteApp.find((m) => m.id === "no-telemetry-desktop").installed, true, "Bare repair must restore desktop privacy patch");
         assert.equal(afterOverwriteApp.find((m) => m.id === "desktop-tray").installed, false, "Bare repair must keep unselected desktop-tray off");
+        const settingsPath = path.join(userdataPath, "settings.json");
+        const settingsBeforePatchRepair = fs.readFileSync(settingsPath);
+        cmdRepair(new Set(["--patch-only"]), null, { assertClosed: () => {} });
+        for (const [archive, before] of [[winServer, afterOverwriteServer], [winApp, afterOverwriteApp]]) {
+          const installedIds = (modules) => modules.filter((m) => m.installed).map((m) => m.id);
+          assert.deepEqual(installedIds(inspectArchive(archive).modules), installedIds(before), "--patch-only must preserve the selected modules");
+        }
+        assert(fs.readFileSync(settingsPath).equals(settingsBeforePatchRepair), "--patch-only must preserve theme settings");
 
         // Simulate legacy enhancer version already installed (marker downgraded to LEGACY_MARKERS) -> direct install overwrites cleanly
         const legacyServerPath = path.join(tmpRoot, "legacy-server.asar");

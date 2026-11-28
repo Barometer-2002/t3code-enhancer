@@ -17,9 +17,11 @@ const {
   resolvePristineBaseline,
   buildPatchedArchive,
   isLinuxAppRunning,
+  readSavedInstallPlan,
+  clearSavedInstallPlan,
 } = require("./lib/engine.cjs");
 const { digest, writeVerifiedAsarCopy } = require("./lib/asar.cjs");
-const { withInstallDirectoryLock, recoverPreviousInstall, replaceStagedInstall, cleanupStagingDirectories } = require("./lib/install-state.cjs");
+const { withInstallDirectoryLock, recoverPreviousInstall, replaceStagedInstall, cleanupStagingDirectories, prepareInstallStateTransaction } = require("./lib/install-state.cjs");
 const {
   resolveInstallPlan,
   parsePlatformArgs,
@@ -29,7 +31,6 @@ const {
   getThemeStatus,
   getUserdataDir: resolveUserdataDir,
   prepareProfileAt,
-  prepareThemeTransaction,
   formatThemeStatusText,
   uninstallTheme,
   reportThemeUninstall,
@@ -271,6 +272,7 @@ function install(input, options = {}, paths = getLinuxPaths()) {
         : requestedSharedData;
     assert(!requestedSharedData || sharedData, "切换为共用数据模式前，请先卸载增强版");
     const selectedPatches = plan.selectedPatches;
+    const stateTx = prepareInstallStateTransaction(plan, getUserdataDir(sharedData, paths), paths.profileDirectory);
 
     const archiveSelected = existing
       ? applicablePatchesForArchive(existing.asar, selectedPatches)
@@ -283,9 +285,7 @@ function install(input, options = {}, paths = getLinuxPaths()) {
           ? fs.readFileSync(path.join(paths.installDirectory, "launch.sh"), "utf8")
           : "")
     ) {
-      if (plan.includeTheme) {
-        prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
-      }
+      stateTx.commit();
       return status(paths);
     }
 
@@ -314,10 +314,6 @@ function install(input, options = {}, paths = getLinuxPaths()) {
       const stagingAsar = `${asarPath}.${randomUUID()}.tmp`;
       const asarRollback = `${asarPath}.${randomUUID()}.rollback`;
       const targetPatches = applicablePatchesForArchive(baseline.asar, selectedPatches);
-      const userdataDir = getUserdataDir(sharedData, paths);
-      const themeTx = plan.includeTheme
-        ? prepareThemeTransaction(userdataDir, { officialOnly: plan.officialOnly, createSettingsIfMissing: true })
-        : null;
       const launchPath = path.join(paths.installDirectory, "launch.sh");
       const managedPath = path.join(paths.installDirectory, MANAGED_FILE);
       const sharedMarkerPath = path.join(paths.installDirectory, SHARED_DATA_FILE);
@@ -358,17 +354,12 @@ function install(input, options = {}, paths = getLinuxPaths()) {
         assert(!isRunning(paths.installDirectory), "请先退出 Linux 增强版，再运行升级或修复命令");
         fs.renameSync(stagingAsar, asarPath);
         asarReplaced = true;
-        if (themeTx) {
-          const res = themeTx.commit();
-          if (!res.activated) {
-            console.warn("[提示] 主题已写入，但未能自动激活：请检查设置文件后手动切换主题");
-          }
-        }
+        stateTx.commit();
         writeLauncherFiles(paths.installDirectory, sharedData, { disableTelemetry: plan.telemetryDisabled });
       } catch (err) {
         if (asarReplaced) {
           const rollbackErrors = [];
-          try { themeTx?.rollback(); } catch (e) { rollbackErrors.push(`主题回滚（${e.message}）`); }
+          try { stateTx.rollback(); } catch (e) { rollbackErrors.push(`配置回滚（${e.message}）`); }
           try {
             if (launcherSnap.launch !== null) fs.writeFileSync(launchPath, launcherSnap.launch, { mode: 0o700 });
             if (launcherSnap.managed !== null) fs.writeFileSync(managedPath, launcherSnap.managed);
@@ -399,9 +390,6 @@ function install(input, options = {}, paths = getLinuxPaths()) {
     assert(fs.statSync(source).isFile(), "AppImage 路径必须是文件");
     fs.mkdirSync(paths.dataHome, { recursive: true });
     const staging = fs.mkdtempSync(path.join(paths.dataHome, ".t3code-enhancer-"));
-    const themeTx = plan.includeTheme
-      ? prepareThemeTransaction(getUserdataDir(sharedData, paths), { officialOnly: plan.officialOnly, createSettingsIfMissing: true })
-      : null;
     try {
       const image = path.join(staging, "T3-Code-x86_64.AppImage");
       fs.copyFileSync(source, image, fs.constants.COPYFILE_EXCL);
@@ -441,7 +429,10 @@ function install(input, options = {}, paths = getLinuxPaths()) {
       if (replacing) {
         assert(!isRunning(paths.installDirectory), "请先退出 Linux 增强版，再运行升级或修复命令");
       }
-      replaceStagedInstall(staging, paths.installDirectory, replacing ? paths.previousDirectory : null, themeTx ? { afterCommit: () => themeTx.commit(), onRollback: () => themeTx.rollback() } : undefined);
+      replaceStagedInstall(staging, paths.installDirectory, replacing ? paths.previousDirectory : null, {
+        afterCommit: stateTx.commit,
+        onRollback: stateTx.rollback,
+      });
     } finally {
       fs.rmSync(staging, { recursive: true, force: true });
     }
@@ -452,17 +443,22 @@ function install(input, options = {}, paths = getLinuxPaths()) {
 function repair(input, options = {}, paths = getLinuxPaths()) {
   const flags = new Set(options.flags || []);
   let effectiveOptions = { ...options, flags, repair: true };
-  if (!options.preset && !options.packs && !flags.has("--theme-only") && !flags.has("--patch-only")) {
+  if (!options.preset && !options.packs && !flags.has("--theme-only")) {
     let existing = null;
     const installDirectory = fs.lstatSync(paths.installDirectory, { throwIfNoEntry: false })
       ? paths.installDirectory : paths.previousDirectory;
     try { existing = inspectInstall({ ...paths, installDirectory }); } catch {}
-    if (existing) {
+    const saved = existing?.buildMeta?.plan ?? readSavedInstallPlan(paths.profileDirectory);
+    if (!existing && !saved && isManagedInstall(installDirectory)) {
+      throw new Error("无法读取原安装方案，请用 --preset 或 --packs 指定要恢复的模块。");
+    }
+    if (existing || saved) {
+      const sharedData = existing?.sharedData ?? usesSharedData(installDirectory);
       const inferred = inferRepairPlanOptions(
-        existing.modules,
-        existing.themeStatus,
+        existing?.modules ?? [],
+        existing?.themeStatus ?? getThemeStatus(getUserdataDir(sharedData, paths)),
         flags,
-        existing.buildMeta?.plan ? [existing.buildMeta.plan] : []
+        saved ? [saved] : []
       );
       if (inferred.officialOnly) flags.add("--official");
       if (inferred.patchOnly) flags.add("--patch-only");
@@ -494,6 +490,7 @@ function uninstall(flags = new Set(), paths = getLinuxPaths()) {
     const purgeProfile = flags.has("--purge-profile");
     if (!fs.lstatSync(installDirectory, { throwIfNoEntry: false })) {
       cleanupStaleStaging(paths);
+      clearSavedInstallPlan(profileDirectory);
       if (purgeProfile && fs.existsSync(profileDirectory)) {
         fs.rmSync(profileDirectory, { recursive: true, force: true });
         console.log(`已清理独立配置目录：${profileDirectory}`);
@@ -507,6 +504,7 @@ function uninstall(flags = new Set(), paths = getLinuxPaths()) {
       uninstallTheme(getUserdataDir(sharedData, paths));
     }
     fs.rmSync(installDirectory, { recursive: true, force: true });
+    clearSavedInstallPlan(profileDirectory);
     cleanupStaleStaging(paths);
     if (purgeProfile && !sharedData && fs.existsSync(profileDirectory)) {
       fs.rmSync(profileDirectory, { recursive: true, force: true });

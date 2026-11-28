@@ -338,7 +338,34 @@ function buildZipEntries(repoRoot, versionTag, { includeUntracked = false } = {}
   return { rootPrefix, fileCount: files.length, entries: allItems };
 }
 
-function verifyPackagedZip(zipPath, versionTag, { runUnitTests = true } = {}) {
+function verifyReleaseFiles(entries, rootPrefix, { repoRoot, commit }) {
+  const archive = spawnSync("git", ["archive", "--format=zip", `--prefix=${rootPrefix}/`, commit], {
+    cwd: repoRoot,
+    windowsHide: true,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (archive.error) throw archive.error;
+  assert.equal(archive.status, 0, `无法读取提交 ${commit} 的文件：${archive.stderr.toString().trim()}`);
+
+  const expected = new Map();
+  for (const entry of readZipEntries(archive.stdout)) {
+    const rel = entry.name.slice(rootPrefix.length + 1);
+    if (entry.isDir || isExcludedPath(rel)) continue;
+    const data = CMD_FILES.has(rel)
+      ? Buffer.from(entry.data.toString("utf8").replace(/\r?\n/g, "\r\n"))
+      : entry.data;
+    expected.set(entry.name, data);
+  }
+  for (const entry of entries) {
+    if (entry.isDir) continue;
+    const data = expected.get(entry.name);
+    assert(data?.equals(entry.data), `ZIP 内的 ${entry.name} 与提交 ${commit} 不一致，请重新打包。`);
+    expected.delete(entry.name);
+  }
+  assert(expected.size === 0, `ZIP 缺少提交 ${commit} 的文件：${[...expected.keys()].join("、")}`);
+}
+
+function verifyPackagedZip(zipPath, versionTag, { runUnitTests = true, source = null } = {}) {
   const zipBuf = fs.readFileSync(zipPath);
   const rootPrefix = `t3code-enhancer-${versionTag}`;
   const entries = readZipEntries(zipBuf);
@@ -360,6 +387,7 @@ function verifyPackagedZip(zipPath, versionTag, { runUnitTests = true } = {}) {
     entries.some((e) => e.name === `${rootPrefix}/使用教程.md`),
     `ZIP 缺少 UTF-8 中文文档 ${rootPrefix}/使用教程.md`
   );
+  if (source) verifyReleaseFiles(entries, rootPrefix, source);
 
   if (runUnitTests) {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "t3e-zip-verify-"));

@@ -17,9 +17,11 @@ const {
   inspectArchive,
   summarizeModuleStates,
   buildPatchedArchive,
+  readSavedInstallPlan,
+  clearSavedInstallPlan,
 } = require("./lib/engine.cjs");
 const { digest, readAsar } = require("./lib/asar.cjs");
-const { withInstallDirectoryLock, recoverPreviousInstall, replaceStagedInstall, cleanupStagingDirectories } = require("./lib/install-state.cjs");
+const { withInstallDirectoryLock, recoverPreviousInstall, replaceStagedInstall, cleanupStagingDirectories, prepareInstallStateTransaction } = require("./lib/install-state.cjs");
 const {
   resolveInstallPlan,
   parsePlatformArgs,
@@ -325,6 +327,7 @@ function install(input, options = {}, paths = getMacosPaths()) {
         : requestedSharedData;
     assert(!requestedSharedData || sharedData, "切换为共用数据模式前，请先卸载增强版");
     const selectedPatches = selectMacosPatches(plan, sharedData);
+    const stateTx = prepareInstallStateTransaction(plan, getUserdataDir(sharedData, paths), paths.profileDirectory);
 
     const expectedEnv = buildInfoPlistEnv(existing?.currentEnv, sharedData, paths, { disableTelemetry: plan.telemetryDisabled });
     const defaultSourceVersion = !input && fs.existsSync(path.join(DEFAULT_SOURCE, INFO_PLIST))
@@ -338,9 +341,7 @@ function install(input, options = {}, paths = getMacosPaths()) {
       matchesSelectedPatches(existing.modules, selectedPatches) &&
       !envNeedsUpdate(existing.currentEnv, expectedEnv)
     ) {
-      if (plan.includeTheme) {
-        prepareProfile(sharedData, { officialOnly: plan.officialOnly }, paths);
-      }
+      stateTx.commit();
       return status(inspectInstall(paths), paths);
     }
 
@@ -355,12 +356,6 @@ function install(input, options = {}, paths = getMacosPaths()) {
     const sourceVersion = readPlist(source, "CFBundleShortVersionString");
     assert(sourceVersion, `无法读取官方应用版本：${source}`);
     const staging = fs.mkdtempSync(path.join(paths.applicationsDirectory, ".t3code-enhancer-"));
-    const themeTx = plan.includeTheme
-      ? require("./lib/theme-manager.cjs").prepareThemeTransaction(getUserdataDir(sharedData, paths), {
-          officialOnly: plan.officialOnly,
-          createSettingsIfMissing: true,
-        })
-      : null;
     try {
       const app = path.join(staging, `${DISPLAY_NAME}.app`);
       execFileSync("ditto", [source, app]);
@@ -417,15 +412,10 @@ function install(input, options = {}, paths = getMacosPaths()) {
       if (replacing) {
         assert(!isRunning(paths, { allowMissing: existingCorrupt }), "请先退出 macOS 增强版，再运行升级或修复命令");
       }
-      replaceStagedInstall(app, paths.installDirectory, replacing ? paths.previousApp : null, themeTx ? {
-        afterCommit: () => {
-          const res = themeTx.commit();
-          if (!res.activated) {
-            console.warn("[提示] 主题已写入，但未能自动激活：请检查设置文件后手动切换主题");
-          }
-        },
-        onRollback: () => themeTx.rollback(),
-      } : undefined);
+      replaceStagedInstall(app, paths.installDirectory, replacing ? paths.previousApp : null, {
+        afterCommit: stateTx.commit,
+        onRollback: stateTx.rollback,
+      });
     } finally {
       fs.rmSync(staging, { recursive: true, force: true });
     }
@@ -436,18 +426,23 @@ function install(input, options = {}, paths = getMacosPaths()) {
 function repair(input = DEFAULT_SOURCE, options = {}, paths = getMacosPaths()) {
   const flags = new Set(options.flags || []);
   let effectiveOptions = { ...options, flags, repair: true };
-  if (!options.preset && !options.packs && !flags.has("--theme-only") && !flags.has("--patch-only")) {
+  if (!options.preset && !options.packs && !flags.has("--theme-only")) {
     let existing = null;
     const installDirectory = fs.lstatSync(paths.installDirectory, { throwIfNoEntry: false })
       ? paths.installDirectory : paths.previousApp;
     try { existing = inspectInstall({ ...paths, installDirectory }); } catch {}
-    if (existing) {
-      const coreModules = existing.modules.filter((m) => m.id !== "macos-user-data");
+    const saved = existing?.buildMeta?.plan ?? readSavedInstallPlan(paths.profileDirectory);
+    if (!existing && !saved && isManagedInstall(installDirectory)) {
+      throw new Error("无法读取原安装方案，请用 --preset 或 --packs 指定要恢复的模块。");
+    }
+    if (existing || saved) {
+      const sharedData = existing?.sharedData ?? usesSharedData(installDirectory);
+      const coreModules = existing?.modules.filter((m) => m.id !== "macos-user-data") ?? [];
       const inferred = inferRepairPlanOptions(
         coreModules,
-        existing.themeStatus,
+        existing?.themeStatus ?? getThemeStatus(getUserdataDir(sharedData, paths)),
         flags,
-        existing.buildMeta?.plan ? [existing.buildMeta.plan] : []
+        saved ? [saved] : []
       );
       if (inferred.officialOnly) flags.add("--official");
       if (inferred.patchOnly) flags.add("--patch-only");
@@ -479,6 +474,7 @@ function uninstall(flags = new Set(), paths = getMacosPaths()) {
     const purgeProfile = flags.has("--purge-profile");
     if (!fs.lstatSync(installDirectory, { throwIfNoEntry: false })) {
       cleanupStagingDirectories(paths.applicationsDirectory);
+      clearSavedInstallPlan(profileDirectory);
       if (purgeProfile && fs.existsSync(profileDirectory)) {
         fs.rmSync(profileDirectory, { recursive: true, force: true });
         console.log(`已清理独立配置目录：${profileDirectory}`);
@@ -492,6 +488,7 @@ function uninstall(flags = new Set(), paths = getMacosPaths()) {
       uninstallTheme(getUserdataDir(sharedData, paths));
     }
     fs.rmSync(installDirectory, { recursive: true, force: true });
+    clearSavedInstallPlan(profileDirectory);
     cleanupStagingDirectories(paths.applicationsDirectory);
     if (purgeProfile && !sharedData && fs.existsSync(profileDirectory)) {
       fs.rmSync(profileDirectory, { recursive: true, force: true });

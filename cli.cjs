@@ -5,7 +5,7 @@ const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { writeVerifiedAsarCopy } = require("./lib/asar.cjs");
+const { getAsarAppVersion, readAsar, readVerifiedEntry, writeVerifiedAsarCopy } = require("./lib/asar.cjs");
 const {
   ENHANCER_VERSION,
   ENHANCER_TAG,
@@ -121,9 +121,9 @@ function cmdStatus(asarOverride) {
   }
 }
 
-function stageAsarPlan(plan, paths, staging, appliedPatchIds = null) {
+function stageAsarPlan(plan, paths, staging, appliedPatchIds, expectedAppVersion) {
   const asarName = path.basename(paths.source);
-  const baseline = resolvePristineBaseline(paths, plan.selectedPatches);
+  const baseline = resolvePristineBaseline(paths, plan.selectedPatches, expectedAppVersion);
   const targetPatches = applicablePatchesForArchive(baseline.asar, plan.selectedPatches);
   for (const p of targetPatches) appliedPatchIds?.add(p.id);
   const versionStr = baseline.appVersion ? `v${baseline.appVersion}` : "未知版本";
@@ -151,7 +151,31 @@ function stageAsarPlan(plan, paths, staging, appliedPatchIds = null) {
   return () => console.log(`[补丁] 已还原纯净原版 ${asarName} [${versionStr}]（来源：${baseline.path}）`);
 }
 
-function runAsarTransaction(targetPaths, stage, { cleanup = false, assertClosed = assertT3Closed, afterCommit = null, onRollback = null } = {}) {
+function getPairedArchiveVersion(targetPaths) {
+  if (targetPaths.length < 2) return null;
+  const versions = new Set();
+  for (const { source } of targetPaths) {
+    let version = null;
+    try {
+      const archive = readAsar(source);
+      const manifest = archive.byKey.get("package.json");
+      if (manifest) {
+        readVerifiedEntry(archive, manifest, "ASAR package.json");
+        version = getAsarAppVersion(archive);
+      }
+    } catch (error) {
+      if (error.code && !["ENOENT", "ERR_ASSERTION", "ERR_ASAR_INTEGRITY", "ERR_OUT_OF_RANGE"].includes(error.code)) throw error;
+      if (!error.code && !(error instanceof SyntaxError)) throw error;
+    }
+    if (version) versions.add(version);
+  }
+  assert.equal(versions.size, 1, versions.size === 0
+    ? "无法确认当前双档的 T3 Code 版本，请用同一官方安装包恢复客户端后重试。"
+    : `当前双档的 T3 Code 版本不一致（${[...versions].join(" / ")}），请用同一官方安装包恢复客户端后重试。`);
+  return versions.values().next().value;
+}
+
+function runAsarTransaction(targetPaths, stage, { cleanup = false, assertClosed = assertT3Closed, afterCommit = null, onRollback = null, verifyPairVersion = false } = {}) {
   assertSafeAsarTargets(targetPaths);
   const lock = path.join(path.dirname(targetPaths[0].source), ".t3code-enhancer-asar.lock");
   try {
@@ -166,10 +190,11 @@ function runAsarTransaction(targetPaths, stage, { cleanup = false, assertClosed 
   });
   let txResult;
   try {
+    for (const { paths } of files) assertClosed(paths.source);
+    const expectedAppVersion = verifyPairVersion ? getPairedArchiveVersion(targetPaths) : null;
     for (const file of files) {
-      assertClosed(file.paths.source);
       if (cleanup) cleanupStaleAsarStaging(file.paths.source);
-      file.report = stage(file.paths, file.staging);
+      file.report = stage(file.paths, file.staging, expectedAppVersion);
     }
     const replacements = files.filter((file) => fs.existsSync(file.staging));
     for (const { paths: { source }, snapshot, staging } of replacements) {
@@ -290,12 +315,13 @@ function applyAsarPlan(plan, asarOverride, options = {}) {
   const appliedPatchIds = new Set();
   const afterResult = runAsarTransaction(
     targetPaths,
-    (paths, staging) => stageAsarPlan(plan, paths, staging, appliedPatchIds),
+    (paths, staging, expectedAppVersion) => stageAsarPlan(plan, paths, staging, appliedPatchIds, expectedAppVersion),
     {
       cleanup: options.repair,
       assertClosed: options.assertClosed,
       afterCommit: options.afterCommit,
       onRollback: options.onRollback,
+      verifyPairVersion: true,
     }
   );
   return { appliedPatchIds, afterResult };
@@ -365,7 +391,7 @@ function cmdInstall(flags, asarOverride, planOptions = {}) {
 
 function resolveRepairPlan(flags, asarOverride, planOptions = {}) {
   const explicitSelection = Boolean(
-    planOptions.preset || planOptions.packs || flags.has("--theme-only") || flags.has("--patch-only")
+    planOptions.preset || planOptions.packs || flags.has("--theme-only")
   );
   if (explicitSelection) {
     return resolveInstallPlan(ALL_PATCHES, {
@@ -465,12 +491,14 @@ function cmdUninstall(flags, asarOverride, options = {}) {
   if (!themeOnly) {
     const targetPaths = getArchiveTargetPaths(asarOverride);
     assertSafeAsarTargets(targetPaths);
-    runAsarTransaction(targetPaths, (paths, staging) => {
+    runAsarTransaction(targetPaths, (paths, staging, expectedAppVersion) => {
       const asarName = path.basename(paths.source);
       const current = inspectCompatibleSource(paths.source);
-      const alreadyPristine = Boolean(current && !current.unreadable && current.modules.every((module) => module.pristine));
+      const alreadyPristine = Boolean(current && !current.unreadable &&
+        (!expectedAppVersion || current.appVersion === expectedAppVersion) &&
+        current.modules.every((module) => module.pristine));
       if (!alreadyPristine) {
-        const original = resolvePristineBaseline(paths);
+        const original = resolvePristineBaseline(paths, ALL_PATCHES, expectedAppVersion);
         assert(original.path !== paths.source, `未找到原版 ${asarName} 备份文件，无法自动还原。`);
         writeVerifiedAsarCopy(original.path, staging, {
           expectedArchive: original.asar.archive,
@@ -487,7 +515,7 @@ function cmdUninstall(flags, asarOverride, options = {}) {
           }
         }
       };
-    }, { cleanup: true, assertClosed: options.assertClosed });
+    }, { cleanup: true, assertClosed: options.assertClosed, verifyPairVersion: true });
   }
 
   if (!keepTheme) reportThemeUninstall();

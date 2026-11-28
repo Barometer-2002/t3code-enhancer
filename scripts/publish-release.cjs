@@ -1,7 +1,10 @@
 "use strict";
 
+const assert = require("node:assert/strict");
 const { spawnSync } = require("node:child_process");
+const { createHash } = require("node:crypto");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const {
@@ -88,9 +91,14 @@ function validateReleaseReadiness(repoRoot = DEFAULT_REPO_ROOT, options = {}) {
   }
 
   const statusRes = runCmd("git", ["status", "--porcelain"], repoRoot);
-  if (statusRes.ok && statusRes.stdout.trim()) {
+  if (!statusRes.ok) {
+    errors.push(`无法检查工作区状态：${statusRes.stderr.trim()}`);
+  } else if (statusRes.stdout.trim()) {
     errors.push(`工作区存在未提交改动，请先提交或清理：\n${statusRes.stdout.trim()}`);
   }
+  const commitRes = runCmd("git", ["rev-parse", "--verify", "HEAD^{commit}"], repoRoot);
+  const commit = commitRes.ok ? commitRes.stdout.trim() : "";
+  if (!commit) errors.push("无法确认要发布的 Git 提交。");
 
   // Immutable tag guard (local + remote)
   const localTag = runCmd("git", ["rev-parse", "-q", "--verify", `refs/tags/${tag}`], repoRoot);
@@ -120,19 +128,22 @@ function validateReleaseReadiness(repoRoot = DEFAULT_REPO_ROOT, options = {}) {
   let zipInfo = null;
   if (!fs.existsSync(zipPath)) {
     errors.push(`缺少发行包 ${zipPath}，请先运行 npm run release:pack`);
-  } else {
+  } else if (commit) {
     try {
-      zipInfo = verifyPackagedZip(zipPath, tag, { runUnitTests: false });
+      zipInfo = verifyPackagedZip(zipPath, tag, { runUnitTests: false, source: { repoRoot, commit } });
     } catch (err) {
       errors.push(`发行包校验失败：${err.message}`);
     }
   }
 
   // Verify release notes exist, have no TODO placeholders, and match ZIP SHA-256
+  let notesSha256 = null;
   if (!fs.existsSync(notesPath)) {
     errors.push(`缺少发版说明 ${notesPath}（可先运行 npm run release:pack -- --write-notes 生成模板并填写）`);
   } else {
-    const notes = fs.readFileSync(notesPath, "utf8");
+    const notesBytes = fs.readFileSync(notesPath);
+    const notes = notesBytes.toString("utf8");
+    notesSha256 = createHash("sha256").update(notesBytes).digest("hex");
     if (!notes.trim()) errors.push(`发版说明 ${notesPath} 为空`);
     if (/\bTODO:/i.test(notes)) {
       errors.push(`发版说明 ${notesPath} 仍包含未填写的 TODO: 占位符`);
@@ -165,10 +176,12 @@ function validateReleaseReadiness(repoRoot = DEFAULT_REPO_ROOT, options = {}) {
     "create",
     tag,
     zipPath,
+    "--verify-tag",
     "--title",
     tag,
     "--notes-file",
     notesPath,
+    notesSha256,
   ];
   if (ENHANCER_VERSION_INFO.isPrerelease) ghReleaseArgs.push("--prerelease");
   if (!options.publish) ghReleaseArgs.push("--draft");
@@ -182,12 +195,13 @@ function validateReleaseReadiness(repoRoot = DEFAULT_REPO_ROOT, options = {}) {
     tag,
     baselineVersion: T3_BASELINE_VERSION,
     branch,
+    commit,
     zipPath,
     notesPath,
     zipInfo,
     plannedCommands: [
-      `git push origin ${branch || "main"}`,
-      `git tag -a ${tag} -m "Release ${tag}"`,
+      `git push origin ${commit}:refs/heads/${branch || "main"}`,
+      `git tag -a ${tag} ${commit} -m "Release ${tag}"`,
       `git push origin ${tag}`,
       `gh ${ghReleaseArgs.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(" ")}`,
     ],
@@ -198,21 +212,38 @@ function validateReleaseReadiness(repoRoot = DEFAULT_REPO_ROOT, options = {}) {
 }
 
 function executeRelease(repoRoot, plan) {
-  const steps = [
-    { cmd: "git", args: ["push", "origin", plan.branch] },
-    { cmd: "git", args: ["tag", "-a", plan.tag, "-m", `Release ${plan.tag}`] },
-    { cmd: "git", args: ["push", "origin", plan.tag] },
-    { cmd: "gh", args: plan.ghReleaseArgs },
-  ];
-  const outputs = [];
-  for (const step of steps) {
-    const res = runCmd(step.cmd, step.args, repoRoot);
-    outputs.push({ command: `${step.cmd} ${step.args.join(" ")}`, ok: res.ok, stdout: res.stdout.trim(), stderr: res.stderr.trim() });
-    if (!res.ok) {
-      throw new Error(`执行失败：${step.cmd} ${step.args.join(" ")}\n${res.stderr || res.stdout}`);
+  const staging = fs.mkdtempSync(path.join(os.tmpdir(), "t3e-publish-"));
+  try {
+    const stagedFiles = new Map();
+    for (const [file, expectedHash] of [[plan.zipPath, plan.zipInfo.sha256], [plan.notesPath, plan.notesSha256]]) {
+      const bytes = fs.readFileSync(file);
+      assert.equal(
+        createHash("sha256").update(bytes).digest("hex"),
+        expectedHash,
+        `校验后文件发生变更，请重新运行发版校验：${file}`
+      );
+      const stagedFile = path.join(staging, path.basename(file));
+      fs.writeFileSync(stagedFile, bytes, { flag: "wx" });
+      stagedFiles.set(file, stagedFile);
     }
+    const steps = [
+      { cmd: "git", args: ["push", "origin", `${plan.commit}:refs/heads/${plan.branch}`] },
+      { cmd: "git", args: ["tag", "-a", plan.tag, plan.commit, "-m", `Release ${plan.tag}`] },
+      { cmd: "git", args: ["push", "origin", plan.tag] },
+      { cmd: "gh", args: plan.ghReleaseArgs.map((arg) => stagedFiles.get(arg) ?? arg) },
+    ];
+    const outputs = [];
+    for (const step of steps) {
+      const res = runCmd(step.cmd, step.args, repoRoot);
+      outputs.push({ command: `${step.cmd} ${step.args.join(" ")}`, ok: res.ok, stdout: res.stdout.trim(), stderr: res.stderr.trim() });
+      if (!res.ok) {
+        throw new Error(`执行失败：${step.cmd} ${step.args.join(" ")}\n${res.stderr || res.stdout}`);
+      }
+    }
+    return outputs;
+  } finally {
+    fs.rmSync(staging, { recursive: true, force: true });
   }
-  return outputs;
 }
 
 if (require.main === module) {

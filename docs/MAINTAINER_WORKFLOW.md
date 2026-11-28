@@ -124,8 +124,8 @@
    npm run release:publish
    npm run release:publish -- --execute
    ```
-   - 校验分支、工作区干净、本地与远端无重名 tag、发版说明内 SHA-256 与 ZIP 一致；
-   - 推送 `main` 与 annotated tag `vX.Y.Z`，在 GitHub 创建 **Draft Release**（预览版自动带 `--prerelease`）；
+   - 校验分支、工作区、本地与远端 tag、发版说明中的 ZIP SHA-256，并逐文件核对 ZIP 与待发布 Git 提交的内容。打包后提交了源码变更时，重新打包并更新发版说明。
+   - 将已校验的提交推送至发版分支，给同一提交打 annotated tag `vX.Y.Z`，随后在 GitHub 创建 **Draft Release**（预览版自动带 `--prerelease`）。
    - **人工卡点**：在 GitHub Release 网页最后核对一遍附件、SHA-256 与正文，点击 **Publish release**。
 5. **本机实机更新验证**：
    - 彻底退出正在运行的 T3 Code（包含右下角系统托盘图标）；

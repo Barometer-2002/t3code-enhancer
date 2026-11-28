@@ -27,7 +27,7 @@
 | `--packs <a,b,c>` | `theme`, `privacy`, `composer`, `chat`, `workspace` | `install` / `repair` / `build` | 自由搭配模块（与 `--preset`、`--theme-only` 互斥） |
 | `--official` | — | `install` / `repair` | 主题仅装 Layer 1 官方稳定层（适合配合 `theme-only` / `clean`） |
 | `--theme-only` | — | `install` / `repair` / `uninstall` | 仅操作主题，不动客户端包（无需退出 T3 Code） |
-| `--patch-only` | — | `install` / `repair` | 仅操作代码补丁，不动主题配置 |
+| `--patch-only` | — | `install` / `repair` | 仅操作代码补丁。用于 `repair` 时沿用上次选择的模块和排除项，可用 `--preset` 或 `--packs` 改选。 |
 | `--no-<patch-id>` | 任意补丁 ID（如 `--no-desktop-tray`） | `install` / `repair` / `build` | 排除指定原子补丁 |
 
 ### 预设包含矩阵
@@ -68,6 +68,10 @@
 
 - **`T3CODE_ASAR`** — 等价于 `--asar <path>`
 - **`T3CODE_PORT`** — Linux AppImage 独立配置模式下的服务端口（默认 `3774`）
+
+Windows 双档恢复会核对两个归档的客户端版本。单档损坏时，以仍可读取的归档版本筛选备份。当前版本无法确认或双档版本不一致时，先用同一官方安装包恢复客户端。
+
+Linux AppImage 和 macOS 独立副本会把模块方案保存在增强版配置目录。早期安装的归档已经损坏、无法读取原方案时，用 `--preset` 或 `--packs` 指定希望恢复的模块。
 
 ## 常用命令直接复制
 
