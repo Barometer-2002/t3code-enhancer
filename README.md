@@ -7,9 +7,9 @@
 **让 T3 Code 更接近 ChatGPT 桌面版**<br/>
 更顺眼的整体界面 · 更干净的隐私去遥测 · 后台系统托盘 · 更顺手的对话与多浮窗工作区
 
-<p align="center"><a href="https://github.com/Barometer-2002/t3code-enhancer/releases/latest"><img src="https://img.shields.io/badge/version-v0.2.1-7c3aed?style=flat-square" alt="Version" /></a> <a href="https://github.com/pingdotgg/t3code/releases/tag/v0.1.13"><img src="https://img.shields.io/badge/T3_Code-0.1.13-0ea5e9?style=flat-square" alt="T3 Code" /></a> <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%E2%89%A5%2020-339933?style=flat-square" alt="Node.js" /></a> <a href="#核心体验"><img src="https://img.shields.io/badge/dependencies-0-22c55e?style=flat-square" alt="Zero Deps" /></a> <a href="#平台支持"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS*-64748b?style=flat-square" alt="Platforms" /></a> <a href="#说明与许可"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License" /></a></p>
+<p align="center"><a href="https://github.com/Barometer-2002/t3code-enhancer/releases/latest"><img src="https://img.shields.io/badge/version-v0.2.2-7c3aed?style=flat-square" alt="Version" /></a> <a href="https://github.com/pingdotgg/t3code/releases/tag/v0.1.13"><img src="https://img.shields.io/badge/T3_Code-0.1.13-0ea5e9?style=flat-square" alt="T3 Code" /></a> <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%E2%89%A5%2020-339933?style=flat-square" alt="Node.js" /></a> <a href="#核心体验"><img src="https://img.shields.io/badge/dependencies-0-22c55e?style=flat-square" alt="Zero Deps" /></a> <a href="#平台支持"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS*-64748b?style=flat-square" alt="Platforms" /></a> <a href="#说明与许可"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License" /></a></p>
 
-**[⬇ 下载 v0.2.1 最新正式版](https://github.com/Barometer-2002/t3code-enhancer/releases/latest)** · [实机演示](#实机演示) · [核心体验](#核心体验) · [快速开始](#快速开始) · [按需搭配](#按需搭配) · [AI 定制主题](#ai-一键安装与主题定制) · [文档导航](#文档导航)
+**[⬇ 下载最新正式版](https://github.com/Barometer-2002/t3code-enhancer/releases/latest)** · [实机演示](#实机演示) · [核心体验](#核心体验) · [快速开始](#快速开始) · [按需搭配](#按需搭配) · [AI 定制主题](#ai-一键安装与主题定制) · [文档导航](#文档导航)
 
 <sub>纯本地运行 · 零外部依赖 · 自动保留原版备份，随时一键还原</sub>
 
@@ -64,7 +64,7 @@
 
 ## 快速开始
 
-准备 **Node.js 20+**，前往 **[最新正式版下载页（Releases Latest）](https://github.com/Barometer-2002/t3code-enhancer/releases/latest)** 下载压缩包并解压（当前为 **`v0.2.1`**，无需 `npm install`；历史版本见 [全部 Releases](https://github.com/Barometer-2002/t3code-enhancer/releases)）：
+准备 **Node.js 20+**，前往 **[最新正式版下载页（Releases Latest）](https://github.com/Barometer-2002/t3code-enhancer/releases/latest)** 下载压缩包并解压（无需 `npm install`，历史版本见 [全部 Releases](https://github.com/Barometer-2002/t3code-enhancer/releases)）：
 
 **Windows**
 1. 退出 T3 Code（若在托盘运行，右键右下角图标点击退出）。
@@ -143,7 +143,7 @@ node cli.cjs uninstall                                # 一键还原官方原版
 
 ## 版本号规范与客户端适配规则
 
-本项目遵循语义化版本（SemVer 2.0.0），由 [lib/version.cjs](lib/version.cjs) 与 [package.json](package.json) 统一管理（执行 `node cli.cjs --version` 查看；当前正式版为 **`v0.2.1`**）：
+本项目遵循语义化版本（SemVer 2.0.0），由 [lib/version.cjs](lib/version.cjs) 与 [package.json](package.json) 统一管理。当前源码版本为 **`v0.2.2`**，执行 `node cli.cjs --version` 可查看本地版本。
 
 - **小版本（`0.x.y`，如 `v0.2.1`）**：包含自身缺陷修复、样式/跨主题调整、文档修订，以及**对 T3 Code 客户端的常规小版本适配**（仅刷新基线哈希与少量定位锚点，不改模块架构与补丁集）。
 - **中版本（`0.x.0`，如 `v0.2.0`、`v0.3.0`）**：新增或重构功能模块（`PACKS` / `PRESETS` 变化）、重构外置运行时，或适配导致多补丁重写、不再兼容上一代架构的 T3 Code 大改版。
